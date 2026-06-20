@@ -1,0 +1,24 @@
+[package]
+name = "fpv-viewer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A real-time cross-SDR viewer for analog FPV drone video signals"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+fpv-drone-analog-rs = { path = "../orecchiette/deps/fpv-drone-analog-rs" }
+sdr-source-rs = { git = "https://github.com/isaacbentley/sdr-source-rs.git", branch = "main" }
+sdr-usrp-rs = { git = "https://github.com/isaacbentley/sdr-usrp-rs.git", branch = "main" }
+sdr-hackrf-rs = { git = "https://github.com/isaacbentley/sdr-hackrf-rs.git", branch = "main" }
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", branch = "main", features = ["native-sdk"] }
+
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+num-complex = "0.4"
+minifb = "0.27"
+bytemuck = "1.0"
+image = "0.24"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1.0"
