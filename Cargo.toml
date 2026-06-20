@@ -7,7 +7,7 @@ description = "A real-time cross-SDR viewer for analog FPV drone video signals"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-fpv-drone-analog-rs = { path = "../orecchiette/deps/fpv-drone-analog-rs" }
+fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/fpv-drone-analog-rs.git", branch = "main" }
 sdr-source-rs = { git = "https://github.com/isaacbentley/sdr-source-rs.git", branch = "main" }
 sdr-usrp-rs = { git = "https://github.com/isaacbentley/sdr-usrp-rs.git", branch = "main" }
 sdr-hackrf-rs = { git = "https://github.com/isaacbentley/sdr-hackrf-rs.git", branch = "main" }
