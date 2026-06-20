@@ -1,0 +1,62 @@
+name: Mutation testing
+
+# Mutation testing with cargo-mutants. Runs on a weekly cron plus
+# manual dispatch. Advisory only — never gates merges — because:
+#   1. Mutation runs take 30–60 minutes per module; PR latency would
+#      balloon if it gated.
+#   2. Some mutations are equivalent (no observable behaviour change),
+#      so a perfect kill rate isn't actually achievable.
+#   3. The signal we care about is "what dropped this release vs.
+#      last release" — a per-PR signal is noise.
+#
+# The output uploads as a workflow artifact for human review.
+
+on:
+  schedule:
+    # 04:00 UTC every Monday.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  mutants:
+    name: cargo mutants (advisory)
+    runs-on: ubuntu-latest
+    # Each module can take 30+ minutes; cap so a runaway doesn't burn
+    # all the action minutes for the month.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      # --no-shuffle  — deterministic order, easier to diff between runs.
+      # --in-place=false — don't touch the working tree; build mutants
+      #                    in a scratch dir.
+      # --timeout=180 — kill any single mutant after 3 min (prevents
+      #                  infinite-loop mutations from stalling the run).
+      # --jobs=2 — limit parallelism so we stay under runner memory.
+      # `continue-on-error: true` because mutation testing is reported,
+      # not gated.
+      - name: cargo mutants
+        run: cargo mutants --no-shuffle --in-place=false --timeout=180 --jobs=2
+        continue-on-error: true
+
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report-${{ github.run_id }}
+          path: |
+            mutants.out/
+            mutants.out.old/
+          if-no-files-found: ignore
+          retention-days: 30

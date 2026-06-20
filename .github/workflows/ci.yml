@@ -1,0 +1,170 @@
+name: CI
+
+# Six-job pipeline for the standalone aaronia-rs crate. Designed to
+# move cleanly when the crate is extracted from the orecchiette
+# monorepo: this workflow stays alongside `Cargo.toml`, so a
+# `git subtree split` or directory copy carries it intact.
+#
+# Job overview:
+#   test         — cargo test on Linux/macOS/Windows × stable
+#   clippy_fmt   — clippy -D warnings + fmt --check on Linux stable
+#   msrv         — cargo build only, pinned to the documented MSRV
+#   miri         — cargo miri test on the FFI-free modules (Linux nightly)
+#   coverage     — cargo llvm-cov, uploaded to Codecov (Linux stable)
+#
+# `workflow_dispatch` is enabled so the user can manually rebuild any
+# job without pushing.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Property tests run 256 cases by default. Bump in nightly/manual runs
+  # via `gh workflow run ci.yml -f proptest_cases=4096` once dispatch
+  # inputs are wired up. For now the default is fine for PRs.
+  PROPTEST_CASES: "256"
+
+jobs:
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The 4.4 MB / 183 MB RTSA fixtures live in LFS. The test
+          # suite skips them gracefully via `rtsa_fixture_missing`,
+          # so CI doesn't need to fetch them on every run.
+          lfs: false
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --all-features
+
+  clippy_fmt:
+    name: Clippy + Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+
+      # MSRV is build-only: proptest et al. occasionally tighten their
+      # MSRV past ours, so `cargo test` on 1.85 can break even when
+      # `cargo build` is clean. Keep this job as "is our public API
+      # still buildable on the documented MSRV?".
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --all-features
+
+  miri:
+    name: Miri (decompression + http_streaming + utils)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Allowlist of modules that don't touch FFI / mmap / syscalls.
+      # Miri refuses to interpret FFI calls, so the native_sdk / file_source
+      # paths are intentionally excluded.
+      - name: cargo miri test (allowlisted modules)
+        run: |
+          cargo +nightly miri test --lib decompression
+          cargo +nightly miri test --lib http_streaming
+          cargo +nightly miri test --lib utils
+
+  coverage:
+    name: Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false  # coverage drop != broken build
