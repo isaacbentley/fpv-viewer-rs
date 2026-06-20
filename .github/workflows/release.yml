@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: fpv-viewer-linux-x86_64
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: fpv-viewer-windows-x86_64.exe
+            ext: ".exe"
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: fpv-viewer-macos-x86_64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # For Windows and Linux, just upload the binary
+      - name: Upload Binary (Windows/Linux)
+        if: runner.os != 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/fpv-viewer${{ matrix.ext }}
+
+      # For macOS, package as DMG to follow global preference
+      - name: Create DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p FPVViewer
+          cp target/${{ matrix.target }}/release/fpv-viewer FPVViewer/
+          hdiutil create -volname "FPVViewer" -srcfolder FPVViewer -ov -format UDZO fpv-viewer-macos-x86_64.dmg
+
+      - name: Upload DMG (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpv-viewer-macos-x86_64.dmg
+          path: fpv-viewer-macos-x86_64.dmg
