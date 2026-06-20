@@ -14,8 +14,8 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: fpv-viewer-linux-x86_64
+            target: aarch64-unknown-linux-gnu
+            artifact_name: fpv-viewer-linux-rpi5
             ext: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -29,11 +29,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux Dependencies
+      - name: Install Cross-Compilation Dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo dpkg --add-architecture arm64
+          # Remove some conflicting apt sources if necessary, but standard ubuntu-latest is usually clean
           sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config
+          # Install the arm64 versions of our SDR and UI dependencies
+          sudo apt-get install -y libuhd-dev:arm64 libasound2-dev:arm64 libiio-dev:arm64 libfontconfig1-dev:arm64
+          
+          # Tell cargo which linker to use for aarch64
+          mkdir -p .cargo
+          cat <<EOF > .cargo/config.toml
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+          
+          # Point pkg-config to the arm64 sysroot
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_DIR=" >> $GITHUB_ENV
+          echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_SYSROOT_DIR=/" >> $GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
         with:
