@@ -16,7 +16,7 @@ sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", b
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 num-complex = "0.4"
-minifb = "0.27"
+minifb = "0.28"
 bytemuck = "1.0"
 image = "0.24"
 tracing = "0.1"
