@@ -9,6 +9,12 @@ A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 - **Live Video Rendering**: Real-time monochrome frame display using `minifb`.
 - **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
 
+## Supported Platforms
+
+- **Linux**: Full support for all SDRs and offline files.
+- **Windows**: Full support for all SDRs and offline files.
+- **macOS**: Full support for HackRF, USRP, and offline files. (Native Aaronia hardware drivers are currently unsupported on macOS).
+
 ## Installation
 
 Ensure you have the required SDR drivers installed on your system (e.g., UHD for USRP, `hackrf` for HackRF One). If using Aaronia Spectran V6 devices, ensure the RTSA-Suite PRO or AARTSAAPI is installed.
@@ -17,6 +23,25 @@ Ensure you have the required SDR drivers installed on your system (e.g., UHD for
 git clone https://github.com/isaacbentley/fpv-viewer-rs.git
 cd fpv-viewer-rs
 cargo build --release
+```
+
+## Command Line Help
+
+```text
+Real-time Analog FPV Viewer
+
+Usage: fpv-viewer <COMMAND>
+
+Commands:
+  file     Replay a SigMF or raw IQ file
+  usrp     Live capture from an Ettus USRP B2xx
+  hackrf   Live capture from a HackRF One
+  aaronia  Live capture from an Aaronia Spectran V6
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
 ```
 
 ## Usage
