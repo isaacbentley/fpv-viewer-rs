@@ -64,7 +64,7 @@ jobs:
       # For Windows and Linux, just upload the binary
       - name: Upload Binary (Windows/Linux)
         if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: target/${{ matrix.target }}/release/fpv-viewer${{ matrix.ext }}
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload DMG (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fpv-viewer-macos-x86_64.dmg
           path: fpv-viewer-macos-x86_64.dmg
