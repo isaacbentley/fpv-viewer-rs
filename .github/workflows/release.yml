@@ -27,7 +27,7 @@ jobs:
             ext: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Cross-Compilation Dependencies (Linux)
         if: runner.os == 'Linux'
