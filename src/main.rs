@@ -286,8 +286,8 @@ const LUMA_HEADROOM_HZ: f32 = 2_000_000.0;
 /// Default centre of the 5.8 GHz FPV band for wideband scanning.
 const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 
-/// Default Aaronia span when no --sample-rate is given (V6 nominal RTBW).
-const AARONIA_DEFAULT_SPAN: f64 = 92_000_000.0;
+/// Default Aaronia span when no --sample-rate is given (max complex span for 92.16 MHz clock).
+const AARONIA_DEFAULT_SPAN: f64 = 61_440_000.0;
 
 // ── No-op dwell advice (single-channel, no hopping) ────────────────
 
