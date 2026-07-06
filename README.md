@@ -1,5 +1,8 @@
 # fpv-viewer-rs
 
+[![CI](https://github.com/isaacbentley/fpv-viewer-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/fpv-viewer-rs/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/fpv-viewer-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
+
 A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 
 ## Features
@@ -7,7 +10,7 @@ A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 - **Offline Playback**: Supports replaying `.sigmf` datasets and compressed `.rtsa` offline files.
 - **Wideband Sweeping**: Automatically scans entire frequency bands (e.g., 5.8 GHz, 1.2 GHz) to find and lock onto active analog FPV signals.
 - **Live Video Rendering**: Real-time monochrome frame display using `minifb`.
-- **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
+- **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `orecchiette-fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
 
 ## Supported Platforms
 
