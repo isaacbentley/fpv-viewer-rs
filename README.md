@@ -3,7 +3,7 @@
 A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 
 ## Features
-- **Cross-Platform SDR Support**: Natively interfaces with Ettus USRP, HackRF One, and Aaronia Spectran V6 devices via `sdr-source-rs`.
+- **Cross-Platform SDR Support**: Natively interfaces with Ettus USRP, HackRF One, and Aaronia Spectran V6 devices via `orecchiette-sdr-source-rs`.
 - **Offline Playback**: Supports replaying `.sigmf` datasets and compressed `.rtsa` offline files.
 - **Wideband Sweeping**: Automatically scans entire frequency bands (e.g., 5.8 GHz, 1.2 GHz) to find and lock onto active analog FPV signals.
 - **Live Video Rendering**: Real-time monochrome frame display using `minifb`.

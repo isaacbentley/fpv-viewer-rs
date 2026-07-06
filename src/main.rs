@@ -1,13 +1,13 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use fpv_drone_analog_rs::ddc::StreamingDDC;
-use fpv_drone_analog_rs::demod::fm_demod;
-use fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
-use fpv_drone_analog_rs::lookup_channel_by_name;
-use fpv_drone_analog_rs::types::SignalType;
-use fpv_drone_analog_rs::video::FrameReconstructor;
 use minifb::{Key, Window, WindowOptions};
 use num_complex::Complex;
-use sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
+use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
+use orecchiette_fpv_drone_analog_rs::demod::fm_demod;
+use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
+use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
+use orecchiette_fpv_drone_analog_rs::types::SignalType;
+use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
+use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -494,7 +494,8 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                         let pairs: &[[f32; 2]] = bytemuck::cast_slice(&buf[..samples_read * 8]);
                         let iq_vec: Vec<Complex<f32>> =
                             pairs.iter().map(|&[re, im]| Complex::new(re, im)).collect();
-                        let pooled = sdr_source_rs::PooledIqBuffer::new_unpooled(iq_vec);
+                        let pooled =
+                            orecchiette_sdr_source_rs::PooledIqBuffer::new_unpooled(iq_vec);
                         let arc_chunk = Arc::new(pooled);
                         active_txs.retain(|tx| tx.send(Arc::clone(&arc_chunk)).is_ok());
                     }
@@ -577,7 +578,7 @@ enum ChannelInputState {
 }
 
 fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
-    use sdr_usrp_rs::UsrpSource;
+    use orecchiette_sdr_usrp_rs::UsrpSource;
 
     let initial_sample_rate = if let Some(sr) = args.live.sample_rate {
         println!("Using user-specified sample rate: {:.2} MSPS", sr / 1e6);
@@ -971,7 +972,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
 // ═══════════════════════════════════════════════════════════════════
 
 fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
-    use sdr_hackrf_rs::{HACKRF_MAX_SAMPLE_RATE_HZ, HackRfSource};
+    use orecchiette_sdr_hackrf_rs::{HACKRF_MAX_SAMPLE_RATE_HZ, HackRfSource};
 
     // HackRF One is USB 2.0: default to its ~20 MSPS ceiling (just enough
     // for analog FPV's ~20 MHz FM) and clamp any larger request to it.
@@ -1081,7 +1082,7 @@ fn hackrf_scan_for_channel(
     sample_rate: f64,
     skipped_freqs: &std::collections::HashSet<u64>,
 ) -> anyhow::Result<Option<f64>> {
-    use sdr_hackrf_rs::HackRfSource;
+    use orecchiette_sdr_hackrf_rs::HackRfSource;
 
     let hop_freqs = build_scan_hops(args.live.scan_mode, sample_rate);
     println!(
@@ -1176,6 +1177,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 center_frequency_hz: center_freq,
                 reference_level_dbm: h.ref_level,
                 block_size: 65_536,
+                stream_format: None,
             });
             (
                 source as Box<dyn SdrSource>,
@@ -1198,6 +1200,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 center_frequency_hz: center_freq,
                 reference_level_dbm: s.ref_level,
                 block_size: 65_536,
+                stream_format: None,
             });
             (
                 source as Box<dyn SdrSource>,
@@ -1498,7 +1501,7 @@ fn run_viewer_pipeline<F>(
 ) -> anyhow::Result<RunLiveResult>
 where
     F: FnOnce(
-            Vec<mpsc::SyncSender<Arc<sdr_source_rs::PooledIqBuffer>>>,
+            Vec<mpsc::SyncSender<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>>,
             Arc<std::sync::atomic::AtomicU8>,
         ) + Send
         + 'static,
@@ -1510,7 +1513,8 @@ where
     let mut display_buffers = Vec::new();
 
     for (sig_type, freq_offset, bandwidth_hz) in resolved_channels {
-        let (iq_tx, iq_rx) = mpsc::sync_channel::<Arc<sdr_source_rs::PooledIqBuffer>>(10);
+        let (iq_tx, iq_rx) =
+            mpsc::sync_channel::<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>(10);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u32>>(2);
         // Frame-buffer recycle pool: the UI hands spent frame buffers
         // back here so the decode worker can refill them in place
@@ -2031,7 +2035,7 @@ fn get_fpv_channel_name(freq_mhz: f64) -> Option<&'static str> {
 /// same ~70-entry list and could drift out of sync.
 ///
 /// Note: this list is a superset of
-/// `fpv_drone_analog_rs::bands::get_all_channels()`. The overlapping
+/// `orecchiette_fpv_drone_analog_rs::bands::get_all_channels()`. The overlapping
 /// bands (A/B/E/F/R and L) now use identical anchor frequencies in
 /// both places — `bands.rs::LOWBAND_FREQS` was reconciled onto this
 /// table's standard 48-channel "L" spec so `--channel L1` and the
