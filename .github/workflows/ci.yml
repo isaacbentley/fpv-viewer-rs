@@ -31,8 +31,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Default features only: the `aaronia` feature links against the
+      # native AARTSAAPI SDK, which CI runners don't have.
       - name: cargo test
-        run: cargo test --all-features
+        run: cargo test
 
   clippy_fmt:
     name: Clippy + Rustfmt
@@ -54,5 +56,6 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      # Default features only — see the note on the test job.
       - name: cargo clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings

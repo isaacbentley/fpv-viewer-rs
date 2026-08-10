@@ -1,6 +1,6 @@
 [package]
 name = "fpv-viewer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
@@ -11,7 +11,14 @@ orecchiette-fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/orecc
 orecchiette-sdr-source-rs = "0.1.0"
 orecchiette-sdr-usrp-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-usrp-rs.git", branch = "main" }
 orecchiette-sdr-hackrf-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-hackrf-rs.git", branch = "main" }
-sdr-aaronia-rs = { path = "../sdr-aaronia-rs", features = ["native-sdk"] }
+# Optional: links against the native AARTSAAPI SDK, which most build
+# hosts (and CI) don't have — enable with `--features aaronia`. For
+# local co-development against a sibling checkout, add:
+#   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
+#   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", branch = "main", features = [
+    "native-sdk",
+], optional = true }
 
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -22,3 +29,9 @@ image = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0"
+
+[features]
+default = []
+# Aaronia Spectran V6 backend (`aaronia` subcommand). Off by default so
+# a fresh clone / CI runner builds without the Aaronia native SDK.
+aaronia = ["dep:sdr-aaronia-rs"]

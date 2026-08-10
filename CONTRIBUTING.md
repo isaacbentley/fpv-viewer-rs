@@ -10,9 +10,19 @@ cd fpv-viewer-rs
 
 # Run the standard validation suite
 cargo test
-cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
+
+### The `aaronia` feature
+
+The Aaronia Spectran V6 backend is behind the off-by-default `aaronia`
+cargo feature because it links against the native AARTSAAPI SDK, which
+most machines (and CI) don't have. If you're working on that backend,
+install the RTSA-Suite PRO / AARTSAAPI SDK and build with
+`cargo build --features aaronia`. To co-develop against a local
+checkout of `sdr-aaronia-rs`, uncomment the `[patch]` block described
+in `Cargo.toml`.
 
 ## Adding Features or Fixing Bugs
 

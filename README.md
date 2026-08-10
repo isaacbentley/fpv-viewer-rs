@@ -6,8 +6,8 @@
 A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 
 ## Features
-- **Cross-Platform SDR Support**: Natively interfaces with Ettus USRP, HackRF One, and Aaronia Spectran V6 devices via `orecchiette-sdr-source-rs`.
-- **Offline Playback**: Supports replaying `.sigmf` datasets and compressed `.rtsa` offline files.
+- **Cross-Platform SDR Support**: Natively interfaces with Ettus USRP, HackRF One, and (behind the `aaronia` feature) Aaronia Spectran V6 devices via `orecchiette-sdr-source-rs`.
+- **Offline Playback**: Supports replaying SigMF (`.sigmf-meta`/`.sigmf-data`) datasets and raw interleaved-cf32 IQ files.
 - **Wideband Sweeping**: Automatically scans entire frequency bands (e.g., 5.8 GHz, 1.2 GHz) to find and lock onto active analog FPV signals.
 - **Live Video Rendering**: Real-time monochrome frame display using `minifb`.
 - **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `orecchiette-fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
@@ -20,12 +20,20 @@ A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 
 ## Installation
 
-Ensure you have the required SDR drivers installed on your system (e.g., UHD for USRP, `hackrf` for HackRF One). If using Aaronia Spectran V6 devices, ensure the RTSA-Suite PRO or AARTSAAPI is installed.
+Ensure you have the required SDR drivers installed on your system (e.g., UHD for USRP, `hackrf` for HackRF One).
 
 ```bash
 git clone https://github.com/isaacbentley/fpv-viewer-rs.git
 cd fpv-viewer-rs
 cargo build --release
+```
+
+The Aaronia Spectran V6 backend is behind the off-by-default `aaronia`
+cargo feature because it links against the native AARTSAAPI SDK. If you
+have the RTSA-Suite PRO / AARTSAAPI SDK installed, build with:
+
+```bash
+cargo build --release --features aaronia
 ```
 
 ## Command Line Help
@@ -47,6 +55,9 @@ Options:
   -V, --version  Print version
 ```
 
+The `aaronia` subcommand only exists in binaries built with
+`--features aaronia`; a default build's `--help` will not list it.
+
 ## Usage
 
 ### Auto-Scan Mode
@@ -64,10 +75,11 @@ cargo run --release -- hackrf --channel R8
 ```
 
 ### Aaronia Spectran V6 Streaming
-Stream directly using the native Aaronia SDK:
+Stream directly using the native Aaronia SDK (needs the `aaronia`
+feature and the AARTSAAPI SDK installed):
 
 ```bash
-cargo run --release -- aaronia sdk --channel E4
+cargo run --release --features aaronia -- aaronia sdk --channel E4
 ```
 
 ### Offline Playback
