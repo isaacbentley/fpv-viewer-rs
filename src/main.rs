@@ -2,8 +2,12 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use minifb::{Key, Window, WindowOptions};
 use num_complex::Complex;
 use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
-use orecchiette_fpv_drone_analog_rs::demod::fm_demod;
-use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
+use orecchiette_fpv_drone_analog_rs::demod::{
+    DEFAULT_DEEMPHASIS_TAU_S, Deemphasis, fm_demod, fm_demod_into,
+};
+use orecchiette_fpv_drone_analog_rs::detector::{
+    AnalogFpvDetector, FpvDetector, SpectralIntegrator,
+};
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
 use orecchiette_fpv_drone_analog_rs::types::SignalType;
 use orecchiette_fpv_drone_analog_rs::video::{FrameReconstructor, detect_video_standard};
@@ -49,6 +53,12 @@ struct FileArgs {
     sample_rate: Option<u32>,
     #[arg(long)]
     fm_deviation: Option<f32>,
+    /// Video deemphasis time constant in seconds, undoing the VTX's
+    /// pre-emphasis (which otherwise leaves high-frequency noise
+    /// emphasized in the picture). 0 disables. Default 0.75 µs is
+    /// common for analog FPV VTXs.
+    #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
+    deemphasis_tau: f32,
     #[arg(long)]
     debug: bool,
     /// Number of fields kept in the temporal denoise / dropout-repair
@@ -81,6 +91,12 @@ struct LiveArgs {
     /// FM deviation (Hz). Defaults to 5 MHz for live SDR.
     #[arg(long, default_value_t = 5_000_000.0)]
     fm_deviation: f32,
+    /// Video deemphasis time constant in seconds, undoing the VTX's
+    /// pre-emphasis (which otherwise leaves high-frequency noise
+    /// emphasized in the picture). 0 disables. Default 0.75 µs is
+    /// common for analog FPV VTXs.
+    #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
+    deemphasis_tau: f32,
     /// Enable debug mode: saves startup frames 1-3 and steady-state
     /// frames 30-32 as PNGs, prints periodic metrics, and keeps
     /// running until quit (Q / Ctrl-C).
@@ -544,6 +560,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         resolved_channels,
         sample_rate,
         fm_deviation,
+        args.deemphasis_tau,
         rf_center_freq,
         args.debug,
         args.temporal_window,
@@ -681,6 +698,12 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
     // Cleared only when the user exits entirely.
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
+    // Cross-sweep spectral integration: persists across rescans so a
+    // weak signal accumulates sensitivity sweep over sweep (~+5 dB
+    // after 4 visits to the same hop). Buckets self-reset if the
+    // sample rate steps down.
+    let mut scan_integrator = SpectralIntegrator::new(4);
+
     let mut explicit_freq = if let Some(ref ch) = args.live.channel {
         Some(resolve_channel(ch)?)
     } else {
@@ -771,10 +794,11 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
 
                         seen_freqs.insert(center);
 
-                        let results = detector.detect_from_iq(
+                        let results = detector.detect_from_iq_integrated(
                             &packet.samples,
                             center,
                             current_sample_rate as u32,
+                            &mut scan_integrator,
                         );
                         for res in results {
                             let ch_name = get_fpv_channel_name(res.frequency_hz as f64 / 1e6)
@@ -997,6 +1021,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             source,
             current_sample_rate,
             fm_deviation,
+            args.live.deemphasis_tau,
             center_freq,
             target_mode,
             args.live.standard,
@@ -1108,6 +1133,8 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
     let fm_deviation = args.live.fm_deviation;
     let auto_scan = args.live.channel.is_none();
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Cross-sweep spectral integration (see the USRP path's note).
+    let mut scan_integrator = SpectralIntegrator::new(4);
     let mut explicit_freq = match args.live.channel {
         Some(ref ch) => Some(resolve_channel(ch)?),
         None => None,
@@ -1116,7 +1143,12 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
     loop {
         let center_freq = match explicit_freq {
             Some(f) => f,
-            None => match hackrf_scan_for_channel(&args, sample_rate, &skipped_freqs)? {
+            None => match hackrf_scan_for_channel(
+                &args,
+                sample_rate,
+                &skipped_freqs,
+                &mut scan_integrator,
+            )? {
                 // Used directly as this iteration's centre; in auto-scan
                 // mode the RunLiveResult handling below decides whether to
                 // re-scan, so we don't need to stash it in `explicit_freq`.
@@ -1144,6 +1176,7 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             source,
             sample_rate,
             fm_deviation,
+            args.live.deemphasis_tau,
             center_freq,
             ViewerMode::SingleChannel,
             args.live.standard,
@@ -1197,6 +1230,7 @@ fn hackrf_scan_for_channel(
     args: &HackrfArgs,
     sample_rate: f64,
     skipped_freqs: &std::collections::HashSet<u64>,
+    scan_integrator: &mut SpectralIntegrator,
 ) -> anyhow::Result<Option<f64>> {
     use orecchiette_sdr_hackrf_rs::HackRfSource;
 
@@ -1238,7 +1272,12 @@ fn hackrf_scan_for_channel(
                 last_freq = center;
                 seen.insert(center);
 
-                for res in detector.detect_from_iq(&packet.samples, center, sample_rate as u32) {
+                for res in detector.detect_from_iq_integrated(
+                    &packet.samples,
+                    center,
+                    sample_rate as u32,
+                    scan_integrator,
+                ) {
                     let snapped = snap_to_nearest_fpv_channel(res.frequency_hz as f64);
                     if skipped_freqs.contains(&(snapped.round() as u64)) {
                         continue;
@@ -1364,6 +1403,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             make_source(center_freq),
             sample_rate,
             fm_deviation,
+            live.deemphasis_tau,
             center_freq,
             mode,
             live.standard,
@@ -1420,6 +1460,7 @@ fn run_live(
     source: Box<dyn SdrSource>,
     sample_rate: f64,
     fm_deviation: f32,
+    deemphasis_tau: f32,
     center_freq: f64,
     mode: ViewerMode,
     forced_standard: Option<SignalType>,
@@ -1472,8 +1513,34 @@ fn run_live(
             } else {
                 println!("Auto-detecting video standard...");
                 let detector = AnalogFpvDetector::default();
-                let (detected, confidence) =
-                    detector.detect_sync_pulses(&first_packet.samples, sample_rate_u32);
+                let mut integ = SpectralIntegrator::new(4);
+                let (mut detected, mut confidence) = detector.detect_sync_pulses_integrated(
+                    &first_packet.samples,
+                    sample_rate_u32,
+                    actual_center as i64,
+                    &mut integ,
+                );
+                // Weak-signal patience: accumulate up to 3 more chunks
+                // before settling for an ambiguous or empty answer.
+                let mut attempts = 1;
+                while !matches!(
+                    detected,
+                    SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
+                ) && attempts < 4
+                {
+                    match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
+                        Ok(p) => {
+                            (detected, confidence) = detector.detect_sync_pulses_integrated(
+                                &p.samples,
+                                sample_rate_u32,
+                                actual_center as i64,
+                                &mut integ,
+                            );
+                        }
+                        Err(_) => break,
+                    }
+                    attempts += 1;
+                }
                 match detected {
                     SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => {
                         println!(
@@ -1525,11 +1592,31 @@ fn run_live(
         ViewerMode::Scan => {
             println!("Scanning for analog FPV signals...");
             let detector = AnalogFpvDetector::default();
-            let results = detector.detect_from_iq(
+            let mut integ = SpectralIntegrator::new(4);
+            let mut results = detector.detect_from_iq_integrated(
                 &first_packet.samples,
                 actual_center as u64,
                 sample_rate_u32,
+                &mut integ,
             );
+            // Weak-signal patience: integrate a few more chunks before
+            // declaring the band empty — several dB of sensitivity for
+            // a fraction of a second of startup latency.
+            let mut attempts = 1;
+            while results.is_empty() && attempts < 4 {
+                match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
+                    Ok(p) => {
+                        results = detector.detect_from_iq_integrated(
+                            &p.samples,
+                            actual_center as u64,
+                            sample_rate_u32,
+                            &mut integ,
+                        );
+                    }
+                    Err(_) => break,
+                }
+                attempts += 1;
+            }
             if results.is_empty() {
                 println!("No analog FPV signals detected in the capture bandwidth.");
                 println!("Try specifying a channel with --channel A1");
@@ -1594,6 +1681,7 @@ fn run_live(
         resolved_channels,
         sample_rate_u32,
         fm_deviation,
+        deemphasis_tau,
         rf_center_freq,
         debug,
         temporal_window,
@@ -1706,6 +1794,7 @@ fn run_viewer_pipeline<F>(
     resolved_channels: Vec<(SignalType, f32, f32)>,
     sample_rate: u32,
     fm_deviation: f32,
+    deemphasis_tau: f32,
     rf_center_freq: f64,
     debug: bool,
     temporal_window: usize,
@@ -1794,6 +1883,15 @@ where
             // slip). Seeding each chunk with the previous chunk's final
             // sample makes the demod stream gapless.
             let mut iq_carry: Option<Complex<f32>> = None;
+            // Reused per-chunk demod scratch (fm_demod_into) — a fresh
+            // ~256 KB Vec per chunk was pure allocator churn.
+            let mut demod_scratch: Vec<f32> = Vec::new();
+            // Stream-side deemphasis, applied exactly once per sample,
+            // before anything enters the persistent demod buffer — the
+            // placement the library documents (a stateful filter inside
+            // the reconstructor would re-filter the re-read tail).
+            let mut deemph = (deemphasis_tau.is_finite() && deemphasis_tau > 0.0)
+                .then(|| Deemphasis::new(sample_rate, deemphasis_tau));
             let mut demod_buffer: Vec<f32> = Vec::new();
             // Cursor into `demod_buffer`: live (unconsumed) samples are
             // `demod_buffer[demod_start..]`. Advancing a cursor instead
@@ -1818,12 +1916,18 @@ where
                 }
                 ddc.process_into(&iq_chunk, &mut shifted_iq);
                 iq_carry = shifted_iq.last().copied();
-                let mut new_demod = fm_demod(&shifted_iq);
+                fm_demod_into(&shifted_iq, &mut demod_scratch);
+                if let Some(d) = deemph.as_mut() {
+                    d.process_in_place(&mut demod_scratch);
+                }
 
-                if debug && is_pal && !pal_debug_done && !new_demod.is_empty() {
-                    let min = new_demod.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = new_demod.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mean = new_demod.iter().sum::<f32>() / new_demod.len() as f32;
+                if debug && is_pal && !pal_debug_done && !demod_scratch.is_empty() {
+                    let min = demod_scratch.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = demod_scratch
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let mean = demod_scratch.iter().sum::<f32>() / demod_scratch.len() as f32;
                     eprintln!(
                         "[PAL DEBUG] first demod chunk: min={:.4} max={:.4} mean={:.4}",
                         min, max, mean
@@ -1831,7 +1935,7 @@ where
                     pal_debug_done = true;
                 }
 
-                demod_buffer.append(&mut new_demod);
+                demod_buffer.extend_from_slice(&demod_scratch);
 
                 // None ends the loop (no full field buffered yet);
                 // `frame_buf` is left untouched on the None paths (they
