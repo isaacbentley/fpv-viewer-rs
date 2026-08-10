@@ -11,6 +11,9 @@ jobs:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # Ship whatever platforms succeed: one target's toolchain hiccup
+      # shouldn't cancel the other release artifacts.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -33,7 +36,19 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo dpkg --add-architecture arm64
-          # Remove some conflicting apt sources if necessary, but standard ubuntu-latest is usually clean
+          # The default archive/security.ubuntu.com mirrors host amd64
+          # only; fetching arm64 indexes from them 404s and fails
+          # `apt-get update`. Restrict the stock sources to amd64 and
+          # add ports.ubuntu.com (the arm64 mirror) for arm64 packages.
+          sudo sed -i 's/^Signed-By:/Architectures: amd64\nSigned-By:/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo tee /etc/apt/sources.list.d/arm64-ports.sources > /dev/null <<'SRC'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main universe restricted multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SRC
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config
           # Install the arm64 versions of our SDR and UI dependencies
