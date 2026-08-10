@@ -16,8 +16,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # No Windows job: the USRP backend links libuhd via pkg-config and
+      # the Windows runners have no unattended UHD install, so the build
+      # can never link there. Windows users build from source with UHD
+      # installed (see README).
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -26,6 +30,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+
+      - name: Install macOS Dependencies
+        if: runner.os == 'macOS'
+        run: brew install uhd
 
       - uses: dtolnay/rust-toolchain@stable
 
