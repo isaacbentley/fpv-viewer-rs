@@ -14,19 +14,22 @@ jobs:
       # Ship whatever platforms succeed: one target's toolchain hiccup
       # shouldn't cancel the other release artifacts.
       fail-fast: false
+      # No Windows target: the USRP backend links libuhd via pkg-config,
+      # and there is no workable unattended UHD install on the Windows
+      # runners today. Windows users build from source with UHD
+      # installed (see README) until the USRP backend is feature-gated
+      # or a UHD install step exists.
       matrix:
         include:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact_name: fpv-viewer-linux-rpi5
             ext: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: fpv-viewer-windows-x86_64.exe
-            ext: ".exe"
+          # Native Apple Silicon. An x86_64 cross-target can't link
+          # against Homebrew's arm64 libuhd on the arm64 runners.
           - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: fpv-viewer-macos-x86_64
+            target: aarch64-apple-darwin
+            artifact_name: fpv-viewer-macos-arm64
             ext: ""
 
     steps:
@@ -51,8 +54,11 @@ jobs:
           SRC
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config
-          # Install the arm64 versions of our SDR and UI dependencies
-          sudo apt-get install -y libuhd-dev:arm64 libasound2-dev:arm64 libiio-dev:arm64 libfontconfig1-dev:arm64
+          # Install the arm64 versions of our SDR and UI dependencies.
+          # libboost-system-dev: libuhd's link line carries
+          # -lboost_system, and only the -dev package provides the
+          # unversioned .so symlink the linker resolves it from.
+          sudo apt-get install -y libuhd-dev:arm64 libboost-system-dev:arm64 libasound2-dev:arm64 libiio-dev:arm64 libfontconfig1-dev:arm64
           
           # Tell cargo which linker to use for aarch64
           mkdir -p .cargo
@@ -68,6 +74,10 @@ jobs:
             echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
             echo "PKG_CONFIG_SYSROOT_DIR=/"
           } >> "$GITHUB_ENV"
+
+      - name: Install UHD (macOS)
+        if: runner.os == 'macOS'
+        run: brew install uhd
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -92,11 +102,11 @@ jobs:
         run: |
           mkdir -p FPVViewer
           cp target/${{ matrix.target }}/release/fpv-viewer FPVViewer/
-          hdiutil create -volname "FPVViewer" -srcfolder FPVViewer -ov -format UDZO fpv-viewer-macos-x86_64.dmg
+          hdiutil create -volname "FPVViewer" -srcfolder FPVViewer -ov -format UDZO "${{ matrix.artifact_name }}.dmg"
 
       - name: Upload DMG (macOS)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
-          name: fpv-viewer-macos-x86_64.dmg
-          path: fpv-viewer-macos-x86_64.dmg
+          name: ${{ matrix.artifact_name }}.dmg
+          path: ${{ matrix.artifact_name }}.dmg

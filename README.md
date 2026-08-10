@@ -14,9 +14,9 @@ A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 
 ## Supported Platforms
 
-- **Linux**: Full support for all SDRs and offline files.
-- **Windows**: Full support for all SDRs and offline files.
-- **macOS**: Full support for HackRF, USRP, and offline files. (Native Aaronia hardware drivers are currently unsupported on macOS).
+- **Linux**: Full support for all SDRs and offline files. Prebuilt release binaries target aarch64 (Raspberry Pi 5-class).
+- **Windows**: Builds from source with UHD installed (no prebuilt binaries — CI has no unattended UHD install for Windows yet).
+- **macOS**: Full support for HackRF, USRP, and offline files; prebuilt release DMGs target Apple Silicon. (Native Aaronia hardware drivers are currently unsupported on macOS).
 
 ## Installation
 
