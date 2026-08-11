@@ -11,7 +11,7 @@ A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 - **Wideband Sweeping**: Automatically scans entire frequency bands (e.g., 5.8 GHz, 1.2 GHz) to find and lock onto active analog FPV signals.
 - **Live Video Rendering**: Real-time monochrome frame display using `minifb`.
 - **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `orecchiette-fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
-- **Weak-Signal Detection**: scan and standard-detection paths accumulate spectra across batches (`SpectralIntegrator`) for several dB of extra sensitivity, and video deemphasis is applied by default (`--deemphasis-tau`, 0 to disable) so VTX pre-emphasis doesn't leave HF noise emphasized in the picture.
+- **Weak-Signal Detection**: scan and standard-detection paths accumulate spectra across batches (`SpectralIntegrator`) for several dB of extra sensitivity, and video deemphasis is applied by default (`--deemphasis-tau`, 0 to disable) so VTX pre-emphasis doesn't leave HF noise emphasized in the picture. At ≥ 25 MSPS decode rates, `--demod pll` swaps in a PLL demodulator measured to keep sync a full noise-step deeper than the discriminator (keep the default `disc` at lower rates).
 
 ## Supported Platforms
 

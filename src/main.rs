@@ -3,11 +3,12 @@ use minifb::{Key, Window, WindowOptions};
 use num_complex::Complex;
 use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
 use orecchiette_fpv_drone_analog_rs::demod::{
-    DEFAULT_DEEMPHASIS_TAU_S, Deemphasis, fm_demod, fm_demod_into,
+    DEFAULT_DEEMPHASIS_TAU_S, Deemphasis, PllFmDemod, fm_demod, fm_demod_into,
 };
 use orecchiette_fpv_drone_analog_rs::detector::{
     AnalogFpvDetector, FpvDetector, SpectralIntegrator,
 };
+use orecchiette_fpv_drone_analog_rs::levels::estimate_cnr_db;
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
 use orecchiette_fpv_drone_analog_rs::types::SignalType;
 use orecchiette_fpv_drone_analog_rs::video::{FrameReconstructor, detect_video_standard};
@@ -59,6 +60,12 @@ struct FileArgs {
     /// common for analog FPV VTXs.
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
+    /// FM demodulator. 'auto' (default) picks the PLL at or above
+    /// ~25 MSPS and the discriminator below it, matching where each is
+    /// actually measured to win. Run with `--help` (long form, not
+    /// `-h`) to see per-value details.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
+    demod: DemodKind,
     #[arg(long)]
     debug: bool,
     /// Number of fields kept in the temporal denoise / dropout-repair
@@ -97,16 +104,17 @@ struct LiveArgs {
     /// common for analog FPV VTXs.
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
+    /// FM demodulator. 'auto' (default) picks the PLL at or above
+    /// ~25 MSPS and the discriminator below it, matching where each is
+    /// actually measured to win. Run with `--help` (long form, not
+    /// `-h`) to see per-value details.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
+    demod: DemodKind,
     /// Enable debug mode: saves startup frames 1-3 and steady-state
     /// frames 30-32 as PNGs, prints periodic metrics, and keeps
     /// running until quit (Q / Ctrl-C).
     #[arg(long)]
     debug: bool,
-    /// Scan mode when auto-scanning (no --channel).
-    ///   58  = 5.8 GHz band only (default, fast)
-    ///   ua  = Ukraine theatre: 1.2 GHz + 3.3 GHz + 5.3–5.9 GHz + 6–7 GHz
-    #[arg(long, value_parser = parse_scan_mode, default_value = "58")]
-    scan_mode: ScanMode,
     /// Number of fields kept in the temporal denoise / dropout-repair
     /// history (Phase A-E). 5 (default) gives ≈ +7 dB SNR on static
     /// scenes with ~83 ms latency; 1 disables temporal processing.
@@ -116,6 +124,48 @@ struct LiveArgs {
     temporal_window: usize,
 }
 
+/// Sample rate at/above which `DemodKind::Auto` selects the PLL, and
+/// below which it selects the discriminator — the measured ~25 MSPS
+/// crossover documented on [`DemodKind::Pll`] and in the library's
+/// `weak_signal_sweep` example (below it the loop can't track a
+/// typical ~5 MHz FPV deviation).
+const PLL_AUTO_MIN_SAMPLE_RATE_HZ: u32 = 25_000_000;
+
+/// Which FM demodulator the decode worker runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum DemodKind {
+    /// Automatically choose the discriminator or the PLL based on the
+    /// decode sample rate (see `PLL_AUTO_MIN_SAMPLE_RATE_HZ`) — the
+    /// default.
+    Auto,
+    /// Per-sample quadrature discriminator (`fm_demod`) — robust at
+    /// every sample rate.
+    #[value(name = "disc", alias = "discriminator")]
+    Discriminator,
+    /// PLL demodulator (`PllFmDemod`, 1 MHz loop): measured +6-17 dB
+    /// demod SNR and ~one sigma-step deeper sync survival at ~25 MSPS
+    /// decode rates and up, but UNUSABLE below ~20 MSPS (the loop
+    /// can't track a 5 MHz deviation there).
+    Pll,
+}
+
+impl DemodKind {
+    /// Resolve to a concrete choice for the given decode `sample_rate`
+    /// (Hz) — `true` selects the PLL.
+    fn use_pll(self, sample_rate: u32) -> bool {
+        match self {
+            DemodKind::Discriminator => false,
+            DemodKind::Pll => true,
+            DemodKind::Auto => sample_rate >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
+        }
+    }
+}
+
+// `--standard` stays a hand-written `value_parser` rather than
+// `clap::ValueEnum`: `SignalType` is a foreign, `#[non_exhaustive]`
+// type from `orecchiette_fpv_drone_analog_rs`, so the orphan rule
+// blocks implementing `ValueEnum` for it here — unlike `DemodKind`,
+// which is a local type and derives it directly above.
 fn parse_standard(s: &str) -> Result<SignalType, String> {
     match s.to_lowercase().as_str() {
         "pal" => Ok(SignalType::AnalogVideoPal),
@@ -127,81 +177,20 @@ fn parse_standard(s: &str) -> Result<SignalType, String> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ScanMode {
-    /// Standard 5.8 GHz FPV band only (5.6–5.95 GHz).
-    Band58,
-    /// Ukraine theatre: 1.2 GHz, 3.3 GHz, LowBand/5.8 GHz, and 6–7 GHz.
-    Ua,
-}
-
-fn parse_scan_mode(s: &str) -> Result<ScanMode, String> {
-    match s.to_lowercase().as_str() {
-        "58" | "5.8" | "5800" => Ok(ScanMode::Band58),
-        "ua" | "ukraine" => Ok(ScanMode::Ua),
-        _ => Err(format!(
-            "unknown scan mode '{}'; expected '58' (5.8 GHz only) or 'ua' (Ukraine full-spectrum)",
-            s
-        )),
-    }
-}
-
-/// Build the hop frequency list for the scan loop based on the
-/// selected scan mode and the SDR's instantaneous bandwidth.
+/// Build the hop frequency list for the auto-scan loop across the
+/// standard 5.8 GHz FPV band (5.645-5.945 GHz), sized to the SDR's
+/// instantaneous bandwidth.
 ///
 /// The list is ordered low→high so the USRP retunes monotonically
 /// (minimises PLL re-lock time on most synthesisers).
-///
-/// **UA mode** covers every confirmed analog video TX band observed
-/// in the Ukraine theatre (2024-2025), modelled after the Chuyka 3.0
-/// detector's coverage plus the newer 6-7 GHz evasion band:
-///
-/// | Band           | Range (MHz)     | Notes                                              |
-/// |----------------|----------------|----------------------------------------------------|
-/// | 1.2 GHz        | 1080 – 1360    | Long-range analog FPV, 1240-1300 amateur segment   |
-/// | 3.3 GHz        | 2870 – 4080    | Mid-range alternative, Chuyka Band 2               |
-/// | 5.3 GHz Low    | 5300 – 5640    | LowBand (L1-L8) + Boscam D (D1-D8) FPV channels    |
-/// | 5.8 GHz        | 5645 – 5945    | Standard FPV (A/B/E/F/R bands)                     |
-/// | 6-7 GHz        | 6100 – 7300    | New evasion band (PEAK THOR T67 VTX, 6.1-7.2 GHz)  |
-fn build_scan_hops(mode: ScanMode, sample_rate: f64) -> Vec<f64> {
+fn build_scan_hops(sample_rate: f64) -> Vec<f64> {
     let step = sample_rate * 0.8; // 80% of BW per hop to avoid filter rolloff edges
     let mut hops = Vec::new();
-
-    let mut sweep = |start: f64, end: f64| {
-        let mut f = start;
-        while f <= end {
-            hops.push(f);
-            f += step;
-        }
-    };
-
-    match mode {
-        ScanMode::Band58 => {
-            // Standard 5.8 GHz FPV: 5.645 – 5.945 GHz
-            sweep(5_645_000_000.0, 5_945_000_000.0);
-        }
-        ScanMode::Ua => {
-            // ── 1.2 GHz (long-range analog FPV, very common in UA) ──
-            // Standard 1.2 GHz VTX range plus amateur 1240-1300 MHz.
-            sweep(1_080_000_000.0, 1_360_000_000.0);
-
-            // ── 3.3 GHz (mid-range FPV video, Chuyka Band 2) ──
-            // Covers 2870-4080 MHz per Chuyka 3.0 spec.
-            sweep(2_870_000_000.0, 4_080_000_000.0);
-
-            // ── 5.3 GHz LowBand (L-band FPV: 5.333–5.613 GHz) ──
-            sweep(5_300_000_000.0, 5_640_000_000.0);
-
-            // ── 5.8 GHz (standard FPV: A/B/E/F/R bands) ──
-            sweep(5_645_000_000.0, 5_945_000_000.0);
-
-            // ── 6-7 GHz (new evasion band, PEAK THOR T67 VTX) ──
-            // 6.1-7.2 GHz; Ukraine forces shifted here in 2024-2025
-            // to bypass Russian EW tuned to ≤6 GHz.
-            sweep(6_100_000_000.0, 7_300_000_000.0);
-        }
+    let mut f = 5_645_000_000.0f64;
+    while f <= 5_945_000_000.0 {
+        hops.push(f);
+        f += step;
     }
-
     hops
 }
 
@@ -561,6 +550,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         sample_rate,
         fm_deviation,
         args.deemphasis_tau,
+        args.demod,
         rf_center_freq,
         args.debug,
         args.temporal_window,
@@ -729,14 +719,9 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 (freq, ViewerMode::SingleChannel)
             }
             ViewerMode::Scan => {
-                let hop_freqs = build_scan_hops(args.live.scan_mode, current_sample_rate);
-                let mode_label = match args.live.scan_mode {
-                    ScanMode::Band58 => "5.8 GHz",
-                    ScanMode::Ua => "UA (1.2 + 3.3 + 5.3-5.9 + 6-7 GHz)",
-                };
+                let hop_freqs = build_scan_hops(current_sample_rate);
                 println!(
-                    "Wideband scan requested [{}]. {} hops at {:.1} MHz step...",
-                    mode_label,
+                    "Wideband scan requested [5.8 GHz]. {} hops at {:.1} MHz step...",
                     hop_freqs.len(),
                     current_sample_rate * 0.8 / 1e6
                 );
@@ -1022,6 +1007,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             current_sample_rate,
             fm_deviation,
             args.live.deemphasis_tau,
+            args.live.demod,
             center_freq,
             target_mode,
             args.live.standard,
@@ -1177,6 +1163,7 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             sample_rate,
             fm_deviation,
             args.live.deemphasis_tau,
+            args.live.demod,
             center_freq,
             ViewerMode::SingleChannel,
             args.live.standard,
@@ -1234,7 +1221,7 @@ fn hackrf_scan_for_channel(
 ) -> anyhow::Result<Option<f64>> {
     use orecchiette_sdr_hackrf_rs::HackRfSource;
 
-    let hop_freqs = build_scan_hops(args.live.scan_mode, sample_rate);
+    let hop_freqs = build_scan_hops(sample_rate);
     println!(
         "HackRF wideband scan: {} hops at {:.1} MHz step...",
         hop_freqs.len(),
@@ -1404,6 +1391,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             sample_rate,
             fm_deviation,
             live.deemphasis_tau,
+            live.demod,
             center_freq,
             mode,
             live.standard,
@@ -1461,6 +1449,7 @@ fn run_live(
     sample_rate: f64,
     fm_deviation: f32,
     deemphasis_tau: f32,
+    demod_kind: DemodKind,
     center_freq: f64,
     mode: ViewerMode,
     forced_standard: Option<SignalType>,
@@ -1682,6 +1671,7 @@ fn run_live(
         sample_rate_u32,
         fm_deviation,
         deemphasis_tau,
+        demod_kind,
         rf_center_freq,
         debug,
         temporal_window,
@@ -1795,6 +1785,7 @@ fn run_viewer_pipeline<F>(
     sample_rate: u32,
     fm_deviation: f32,
     deemphasis_tau: f32,
+    demod_kind: DemodKind,
     rf_center_freq: f64,
     debug: bool,
     temporal_window: usize,
@@ -1892,6 +1883,17 @@ where
             // the reconstructor would re-filter the re-read tail).
             let mut deemph = (deemphasis_tau.is_finite() && deemphasis_tau > 0.0)
                 .then(|| Deemphasis::new(sample_rate, deemphasis_tau));
+            // PLL demodulator (--demod pll, or auto's >= 25 MSPS
+            // crossover): threshold extension — see DemodKind's doc
+            // for the measured numbers and the low-rate caveat. 1 MHz
+            // loop bandwidth per the weak_signal_sweep tuning.
+            let use_pll = demod_kind.use_pll(sample_rate);
+            println!(
+                "  → Demodulator: {} ({:.2} MSPS)",
+                if use_pll { "PLL" } else { "discriminator" },
+                sample_rate as f64 / 1e6
+            );
+            let mut pll = use_pll.then(|| PllFmDemod::new(sample_rate, 1.0e6, fm_deviation * 1.2));
             let mut demod_buffer: Vec<f32> = Vec::new();
             // Cursor into `demod_buffer`: live (unconsumed) samples are
             // `demod_buffer[demod_start..]`. Advancing a cursor instead
@@ -1911,12 +1913,21 @@ where
 
             while let Ok(iq_chunk) = iq_rx.recv() {
                 shifted_iq.clear();
-                if let Some(prev) = iq_carry {
+                // The carry sample only serves the stateless
+                // discriminator; the PLL's loop state already spans
+                // chunk boundaries, and a duplicated sample would be a
+                // phase glitch to it.
+                if pll.is_none()
+                    && let Some(prev) = iq_carry
+                {
                     shifted_iq.push(prev);
                 }
                 ddc.process_into(&iq_chunk, &mut shifted_iq);
                 iq_carry = shifted_iq.last().copied();
-                fm_demod_into(&shifted_iq, &mut demod_scratch);
+                match pll.as_mut() {
+                    Some(p) => p.process_into(&shifted_iq, &mut demod_scratch),
+                    None => fm_demod_into(&shifted_iq, &mut demod_scratch),
+                }
                 if let Some(d) = deemph.as_mut() {
                     d.process_in_place(&mut demod_scratch);
                 }
@@ -1959,6 +1970,20 @@ where
                     // when you've seen enough.
                     let metrics_due = debug && (frame_count <= 3 || frame_count % 30 == 0);
                     if metrics_due {
+                        // Envelope CNR (link-quality meter) + PLL lock
+                        // telemetry when applicable. Measured on the
+                        // DDC-filtered channel (`shifted_iq`), not the
+                        // raw capture — a wideband chunk's envelope
+                        // reflects the whole band's floor, not this
+                        // channel's link.
+                        let cnr = estimate_cnr_db(&shifted_iq)
+                            .map(|v| format!("{v:.1} dB"))
+                            .unwrap_or_else(|| "n/a".into());
+                        let lock = pll
+                            .as_ref()
+                            .map(|p| format!(" | PLLerr: {:.2} rad", p.phase_error_rms()))
+                            .unwrap_or_default();
+                        println!("[DEBUG LINK] CNRest: {cnr}{lock}");
                         // New v0.4.37 telemetry fields:
                         //  - SyncQ : per-field MAD-rejection-pass
                         //    rate. 1.00 = perfect; <0.5 = dropout
