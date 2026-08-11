@@ -8,8 +8,9 @@ A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
 ## Features
 - **Cross-Platform SDR Support**: Natively interfaces with Ettus USRP, HackRF One, and (behind the `aaronia` feature) Aaronia Spectran V6 devices via `orecchiette-sdr-source-rs`.
 - **Offline Playback**: Supports replaying SigMF (`.sigmf-meta`/`.sigmf-data`) datasets and raw interleaved-cf32 IQ files.
-- **Wideband Sweeping**: Automatically scans entire frequency bands (e.g., 5.8 GHz, 1.2 GHz) to find and lock onto active analog FPV signals.
+- **Wideband Sweeping**: Automatically scans the 5.8 GHz FPV band (5.645–5.945 GHz) to find and lock onto active analog FPV signals.
 - **Live Video Rendering**: Real-time monochrome frame display using `minifb`.
+- **Weak-Signal Reconstruction**: The decode path uses `orecchiette-fpv-drone-analog-rs` 0.3's phase-1 recovery pipeline — matched-filter sync acquisition, robust OLS line-locked-clock TBC (straight verticals), and spatial+temporal SmartDOC dropout concealment — all active by default.
 - **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `orecchiette-fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
 - **Weak-Signal Detection**: scan and standard-detection paths accumulate spectra across batches (`SpectralIntegrator`) for several dB of extra sensitivity, and video deemphasis is applied by default (`--deemphasis-tau`, 0 to disable) so VTX pre-emphasis doesn't leave HF noise emphasized in the picture. At ≥ 25 MSPS decode rates, `--demod pll` swaps in a PLL demodulator measured to keep sync a full noise-step deeper than the discriminator (keep the default `disc` at lower rates).
 
