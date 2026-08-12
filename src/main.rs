@@ -66,6 +66,13 @@ struct FileArgs {
     /// `-h`) to see per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
+    /// Start with the neural temporal denoiser enabled (requires a
+    /// build with `--features neural-vsr`). Toggle it live with `D`.
+    #[arg(long)]
+    denoise: bool,
+    /// Path to the denoiser ONNX model.
+    #[arg(long, default_value = "models/temporal_denoiser.onnx")]
+    denoise_model: String,
     #[arg(long)]
     debug: bool,
     /// Number of fields kept in the temporal denoise / dropout-repair
@@ -110,6 +117,15 @@ struct LiveArgs {
     /// `-h`) to see per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
+    /// Start with the neural temporal denoiser enabled (requires a
+    /// build with `--features neural-vsr`). Toggle it live with `D`.
+    /// It is a clear win on impaired links — dropouts especially — and
+    /// a small cost on a clean signal, so it starts off by default.
+    #[arg(long)]
+    denoise: bool,
+    /// Path to the denoiser ONNX model.
+    #[arg(long, default_value = "models/temporal_denoiser.onnx")]
+    denoise_model: String,
     /// Enable debug mode: saves startup frames 1-3 and steady-state
     /// frames 30-32 as PNGs, prints periodic metrics, and keeps
     /// running until quit (Q / Ctrl-C).
@@ -551,6 +567,8 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         fm_deviation,
         args.deemphasis_tau,
         args.demod,
+        args.denoise,
+        args.denoise_model.clone(),
         rf_center_freq,
         args.debug,
         args.temporal_window,
@@ -1008,6 +1026,8 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             fm_deviation,
             args.live.deemphasis_tau,
             args.live.demod,
+            args.live.denoise,
+            args.live.denoise_model.clone(),
             center_freq,
             target_mode,
             args.live.standard,
@@ -1164,6 +1184,8 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             fm_deviation,
             args.live.deemphasis_tau,
             args.live.demod,
+            args.live.denoise,
+            args.live.denoise_model.clone(),
             center_freq,
             ViewerMode::SingleChannel,
             args.live.standard,
@@ -1400,6 +1422,8 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             fm_deviation,
             live.deemphasis_tau,
             live.demod,
+            live.denoise,
+            live.denoise_model.clone(),
             center_freq,
             mode,
             live.standard,
@@ -1458,6 +1482,8 @@ fn run_live(
     fm_deviation: f32,
     deemphasis_tau: f32,
     demod_kind: DemodKind,
+    denoise: bool,
+    denoise_model: String,
     center_freq: f64,
     mode: ViewerMode,
     forced_standard: Option<SignalType>,
@@ -1680,6 +1706,8 @@ fn run_live(
         fm_deviation,
         deemphasis_tau,
         demod_kind,
+        denoise,
+        denoise_model,
         rf_center_freq,
         debug,
         temporal_window,
@@ -1794,6 +1822,8 @@ fn run_viewer_pipeline<F>(
     fm_deviation: f32,
     deemphasis_tau: f32,
     demod_kind: DemodKind,
+    denoise: bool,
+    denoise_model: String,
     rf_center_freq: f64,
     debug: bool,
     temporal_window: usize,
@@ -1814,7 +1844,19 @@ where
     let mut windows = Vec::new();
     let mut display_buffers = Vec::new();
 
+    // Live denoiser toggle, shared UI thread → every decode worker. The
+    // reconstructors live in per-channel threads, so the `D` hotkey flips
+    // this flag and each worker picks it up on its next field rather than
+    // the UI reaching into another thread's state.
+    let denoise_on = Arc::new(std::sync::atomic::AtomicBool::new(denoise));
+
     for (sig_type, freq_offset, bandwidth_hz) in resolved_channels {
+        // Both are only read by the `neural-vsr` code paths; without that
+        // feature the worker has no denoiser to toggle.
+        #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
+        let denoise_on = Arc::clone(&denoise_on);
+        #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
+        let denoise_model = denoise_model.clone();
         let (iq_tx, iq_rx) =
             mpsc::sync_channel::<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>(10);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u32>>(2);
@@ -1828,8 +1870,28 @@ where
 
         let is_pal = sig_type == SignalType::AnalogVideoPal;
 
+        #[allow(unused_mut)]
         let mut reconstructor = FrameReconstructor::new(sample_rate, is_pal, fm_deviation, debug)
             .with_temporal_window(temporal_window);
+        // Load the denoiser once per channel (opening an ONNX session is
+        // expensive, and the `D` hotkey must toggle instantly). It is
+        // parked in `stashed_restorer` while disabled and moved back into
+        // the reconstructor when enabled, so no reload happens on toggle.
+        #[cfg(feature = "neural-vsr")]
+        let mut stashed_restorer = {
+            reconstructor = reconstructor.with_neural_restorer(&denoise_model, true);
+            if reconstructor.neural_restorer.is_none() {
+                eprintln!(
+                    "Denoiser unavailable: could not load {denoise_model} — continuing without it."
+                );
+            }
+            // Start parked unless the operator asked for it up front.
+            if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
+                None
+            } else {
+                reconstructor.neural_restorer.take()
+            }
+        };
         let width = reconstructor.width;
         let height = reconstructor.height;
 
@@ -1938,6 +2000,30 @@ where
                 }
                 if let Some(d) = deemph.as_mut() {
                     d.process_in_place(&mut demod_scratch);
+                }
+
+                // Live denoiser toggle + link-quality conditioning. The
+                // CNR is measured on the DDC-filtered channel, not the
+                // raw wideband chunk, so it reflects THIS signal's link
+                // rather than the whole capture's noise floor.
+                #[cfg(feature = "neural-vsr")]
+                {
+                    let want = denoise_on.load(std::sync::atomic::Ordering::Relaxed);
+                    let have = reconstructor.neural_restorer.is_some();
+                    if want && !have {
+                        reconstructor.neural_restorer = stashed_restorer.take();
+                        // Drop temporal context accumulated before the
+                        // gap — blending across a disabled period would
+                        // mix in stale fields.
+                        reconstructor.hidden_state = None;
+                    } else if !want && have {
+                        stashed_restorer = reconstructor.neural_restorer.take();
+                    }
+                    if reconstructor.neural_restorer.is_some()
+                        && let Some(cnr) = estimate_cnr_db(&shifted_iq)
+                    {
+                        reconstructor.set_neural_noise_level(cnr);
+                    }
                 }
 
                 if debug && is_pal && !pal_debug_done && !demod_scratch.is_empty() {
@@ -2122,6 +2208,23 @@ where
                 break;
             }
 
+            // D → toggle the neural denoiser live. Edge-triggered off
+            // `pressed` so holding the key doesn't flap the flag every
+            // 5 ms UI iteration. Workers pick the change up on their next
+            // field; the model stays loaded either way, so this is
+            // instant.
+            if idle && pressed.contains(&Key::D) {
+                let now = !denoise_on.load(std::sync::atomic::Ordering::Relaxed);
+                denoise_on.store(now, std::sync::atomic::Ordering::Relaxed);
+                if cfg!(feature = "neural-vsr") {
+                    println!("Denoiser {}", if now { "ON" } else { "OFF" });
+                } else {
+                    println!(
+                        "Denoiser unavailable: rebuild with `--features neural-vsr` to enable it."
+                    );
+                }
+            }
+
             // N → find next channel (resume scanning without blacklisting)
             if matches!(ch_input, ChannelInputState::Idle) && window.is_key_down(Key::N) {
                 exit_reason.store(4, std::sync::atomic::Ordering::Relaxed);
@@ -2198,10 +2301,17 @@ where
 
                     let format_str = if *is_pal { "PAL" } else { "NTSC" };
                     let channel_name = get_fpv_channel_name(*absolute_freq_mhz);
-                    let display_text = if let Some(ch) = channel_name {
-                        format!("{} · Channel {} [BW]", format_str, ch)
+                    // Show the denoiser state so the operator can see what
+                    // `D` did without hunting the console.
+                    let dn = if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
+                        " DN"
                     } else {
-                        format!("{} · {:.2} MHz [BW]", format_str, absolute_freq_mhz)
+                        ""
+                    };
+                    let display_text = if let Some(ch) = channel_name {
+                        format!("{} · Channel {} [BW]{}", format_str, ch, dn)
+                    } else {
+                        format!("{} · {:.2} MHz [BW]{}", format_str, absolute_freq_mhz, dn)
                     };
 
                     draw_text_with_bg(
@@ -2223,7 +2333,7 @@ where
                         *height,
                         10,
                         hint_y,
-                        "Q:Quit  S:Skip  N:Next  C:Channel",
+                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise",
                         0xffaaaaaa,
                         0x80000000,
                     );

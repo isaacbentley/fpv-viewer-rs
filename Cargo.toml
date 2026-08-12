@@ -16,7 +16,7 @@ orecchiette-sdr-hackrf-rs = { git = "https://github.com/isaacbentley/orecchiette
 # local co-development against a sibling checkout, add:
 #   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
 #   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
-sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.6.1", features = [
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.6.2", features = [
     "native-sdk",
 ], optional = true }
 
@@ -35,3 +35,8 @@ default = []
 # Aaronia Spectran V6 backend (`aaronia` subcommand). Off by default so
 # a fresh clone / CI runner builds without the Aaronia native SDK.
 aaronia = ["dep:sdr-aaronia-rs"]
+# Neural temporal denoiser (`--denoise`, toggled live with `D`). Off by
+# default: it pulls in ONNX Runtime, and the denoiser is a win under
+# impairment but a small cost on a clean signal — see the analog crate's
+# DESIGN.md §12 for the measured A/B.
+neural-vsr = ["orecchiette-fpv-drone-analog-rs/neural-vsr"]
