@@ -2162,6 +2162,7 @@ where
     thread::spawn(move || reader_fn(channel_txs, thread_exit_flag));
     // Main UI Loop
     let mut ch_input = ChannelInputState::Idle;
+    let mut denoise_toggle_requested = false;
     let mut ch_input_flash_until: Option<std::time::Instant> = None;
     let mut ch_input_flash_msg = String::new();
     while !windows.is_empty() {
@@ -2208,21 +2209,13 @@ where
                 break;
             }
 
-            // D → toggle the neural denoiser live. Edge-triggered off
-            // `pressed` so holding the key doesn't flap the flag every
-            // 5 ms UI iteration. Workers pick the change up on their next
-            // field; the model stays loaded either way, so this is
-            // instant.
+            // D → toggle the neural denoiser. Only *record* the request
+            // here: this block runs once per open window, so acting on it
+            // inline would toggle N times for one keypress — with two
+            // windows that is a silent no-op. Applied once after the
+            // per-window loop.
             if idle && pressed.contains(&Key::D) {
-                let now = !denoise_on.load(std::sync::atomic::Ordering::Relaxed);
-                denoise_on.store(now, std::sync::atomic::Ordering::Relaxed);
-                if cfg!(feature = "neural-vsr") {
-                    println!("Denoiser {}", if now { "ON" } else { "OFF" });
-                } else {
-                    println!(
-                        "Denoiser unavailable: rebuild with `--features neural-vsr` to enable it."
-                    );
-                }
+                denoise_toggle_requested = true;
             }
 
             // N → find next channel (resume scanning without blacklisting)
@@ -2400,6 +2393,23 @@ where
 
             i += 1;
         }
+
+        // One keypress → one toggle, regardless of how many windows are
+        // open. Workers pick the new state up on their next field; the
+        // model stays loaded either way, so the switch is instant.
+        if denoise_toggle_requested {
+            denoise_toggle_requested = false;
+            let now = !denoise_on.load(std::sync::atomic::Ordering::Relaxed);
+            denoise_on.store(now, std::sync::atomic::Ordering::Relaxed);
+            if cfg!(feature = "neural-vsr") {
+                println!("Denoiser {}", if now { "ON" } else { "OFF" });
+            } else {
+                println!(
+                    "Denoiser unavailable: rebuild with `--features neural-vsr` to enable it."
+                );
+            }
+        }
+
         thread::sleep(Duration::from_millis(5));
     }
 

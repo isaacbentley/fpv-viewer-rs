@@ -3,26 +3,56 @@
 [![CI](https://github.com/isaacbentley/fpv-viewer-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/fpv-viewer-rs/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/fpv-viewer-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-A real-time, cross-SDR desktop viewer for analog FPV drone video signals.
+A real-time desktop viewer for analog FPV drone video, supporting live
+capture from USRP, HackRF, and Aaronia hardware as well as offline
+playback of recorded files.
+
+Signal processing is provided by
+[orecchiette-fpv-drone-analog-rs](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs);
+this repository is the application around it.
 
 ## Features
-- **Cross-Platform SDR Support**: Natively interfaces with Ettus USRP, HackRF One, and (behind the `aaronia` feature) Aaronia Spectran V6 devices via `orecchiette-sdr-source-rs`.
-- **Offline Playback**: Supports replaying SigMF (`.sigmf-meta`/`.sigmf-data`) datasets and raw interleaved-cf32 IQ files.
-- **Wideband Sweeping**: Automatically scans the 5.8 GHz FPV band (5.645–5.945 GHz) to find and lock onto active analog FPV signals.
-- **Live Video Rendering**: Real-time monochrome frame display using `minifb`.
-- **Weak-Signal Reconstruction**: The decode path uses `orecchiette-fpv-drone-analog-rs` 0.3's phase-1 recovery pipeline — matched-filter sync acquisition, robust OLS line-locked-clock TBC (straight verticals), and spatial+temporal SmartDOC dropout concealment — all active by default.
-- **Temporal Noise Reduction**: Leverages the multi-field ring buffer from `orecchiette-fpv-drone-analog-rs` for robust motion-weighted denoising of noisy analog signals.
-- **Weak-Signal Detection**: scan and standard-detection paths accumulate spectra across batches (`SpectralIntegrator`) for several dB of extra sensitivity, and video deemphasis is applied by default (`--deemphasis-tau`, 0 to disable) so VTX pre-emphasis doesn't leave HF noise emphasized in the picture. At ≥ 25 MSPS decode rates, `--demod pll` swaps in a PLL demodulator measured to keep sync a full noise-step deeper than the discriminator (keep the default `disc` at lower rates).
 
-## Supported Platforms
+- **Multiple SDR backends.** Ettus USRP, HackRF One, and — behind the
+  `aaronia` feature — the Aaronia Spectran V6.
+- **Offline playback.** SigMF datasets (`.sigmf-meta` and `.sigmf-data`)
+  and raw interleaved cf32 I/Q files.
+- **Automatic band sweep.** Scans the 5.8 GHz FPV band
+  (5,645–5,945 MHz), locks onto active signals, and displays them.
+- **Live monochrome rendering** in a desktop window.
+- **Weak-signal decoding**, enabled by default:
+  - Matched-filter sync acquisition, a line-locked clock for straight
+    vertical edges, and dropout concealment combining spatial and
+    temporal sources.
+  - Multi-field noise reduction weighted by local motion, so static
+    regions are cleaned without smearing movement.
+  - Spectra accumulated across batches during scanning for additional
+    sensitivity.
+  - Video deemphasis, inverting the transmitter's pre-emphasis so
+    high-frequency noise is not left emphasized in the picture
+    (`--deemphasis-tau`, `0` to disable).
+- **Optional PLL demodulator.** At 25 MSPS and above, `--demod pll` holds
+  sync approximately one noise step deeper than the discriminator. The
+  discriminator remains preferable at lower rates.
+- **Optional neural denoiser.** Built with `--features neural-vsr`,
+  `--denoise` starts with it enabled and **`D`** toggles it during
+  playback. It improves a degraded signal and costs a small amount of
+  detail on a clean one, so live toggling is useful.
 
-- **Linux**: Full support for all SDRs and offline files. Prebuilt release binaries target aarch64 (Raspberry Pi 5-class).
-- **Windows**: Builds from source with UHD installed (no prebuilt binaries — CI has no unattended UHD install for Windows yet).
-- **macOS**: Full support for HackRF, USRP, and offline files; prebuilt release DMGs target Apple Silicon. (Native Aaronia hardware drivers are currently unsupported on macOS).
+## Platform support
+
+- **Linux** — all SDRs and offline playback. Prebuilt release binaries
+  target aarch64 (Raspberry Pi 5 class).
+- **macOS** — HackRF, USRP, and offline playback. Prebuilt release DMGs
+  target Apple Silicon. Aaronia's native drivers are unavailable on
+  macOS.
+- **Windows** — builds from source with UHD installed. No prebuilt
+  binaries, as CI has no unattended UHD installation for Windows.
 
 ## Installation
 
-Ensure you have the required SDR drivers installed on your system (e.g., UHD for USRP, `hackrf` for HackRF One).
+Install the relevant SDR drivers first, such as UHD for USRP or `hackrf`
+for HackRF One.
 
 ```bash
 git clone https://github.com/isaacbentley/fpv-viewer-rs.git
@@ -30,19 +60,54 @@ cd fpv-viewer-rs
 cargo build --release
 ```
 
-The Aaronia Spectran V6 backend is behind the off-by-default `aaronia`
-cargo feature because it links against the native AARTSAAPI SDK. If you
-have the RTSA-Suite PRO / AARTSAAPI SDK installed, build with:
+Two optional features are available:
 
 ```bash
-cargo build --release --features aaronia
+cargo build --release --features aaronia      # Aaronia Spectran V6
+cargo build --release --features neural-vsr   # neural denoiser
 ```
 
-## Command Line Help
+`aaronia` is disabled by default because it links against the native
+AARTSAAPI SDK, which requires RTSA-Suite PRO or the AARTSAAPI SDK to be
+installed. `neural-vsr` is disabled by default because it introduces a
+dependency on ONNX Runtime.
+
+## Usage
+
+Sweep the band with a USRP and tune to the strongest detected signal:
+
+```bash
+cargo run --release -- usrp
+```
+
+Tune a HackRF directly to channel R8 (5,917 MHz):
+
+```bash
+cargo run --release -- hackrf --channel R8
+```
+
+Replay a capture, reading the `.sigmf-meta` sidecar automatically when
+present:
+
+```bash
+cargo run --release -- file /path/to/capture.sigmf-data
+```
+
+Stream from an Aaronia Spectran V6:
+
+```bash
+cargo run --release --features aaronia -- aaronia sdk --channel E4
+```
+
+Replay a file with the neural denoiser enabled from the start:
+
+```bash
+cargo run --release --features neural-vsr -- file --denoise /path/to/capture.sigmf-data
+```
+
+## Commands and options
 
 ```text
-Real-time Analog FPV Viewer
-
 Usage: fpv-viewer <COMMAND>
 
 Commands:
@@ -50,54 +115,57 @@ Commands:
   usrp     Live capture from an Ettus USRP B2xx
   hackrf   Live capture from a HackRF One
   aaronia  Live capture from an Aaronia Spectran V6
-  help     Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
 ```
 
-The `aaronia` subcommand only exists in binaries built with
-`--features aaronia`; a default build's `--help` will not list it.
+The `aaronia` subcommand is present only in builds made with
+`--features aaronia`.
 
-## Usage
+Frequently used options, with the full set available from `--help` on any
+subcommand:
 
-### Auto-Scan Mode
-Sweep the 5.8 GHz band using a USRP and auto-tune to the strongest FPV signal:
+| Option | Description |
+| :--- | :--- |
+| `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below. |
+| `--deemphasis-tau <s>` | Video deemphasis time constant. Default 0.75 µs; `0` disables. |
+| `--denoise` | Start with the neural denoiser enabled (requires `--features neural-vsr`). |
+| `--denoise-model <path>` | ONNX model to load. Defaults to `models/temporal_denoiser.onnx`. |
+| `--temporal-window <n>` | Fields retained for temporal denoising and dropout repair. Default 5, giving roughly +7 dB on static scenes at about 83 ms latency; `1` disables temporal processing. |
+| `--debug` | Print per-frame decode metrics and save frames 1–3 and 30–32 as PNG files. |
+
+## Keyboard shortcuts
+
+| Key | Action |
+| :--- | :--- |
+| **`N`** | Next channel. Abandons the current lock and resumes sweeping. |
+| **`S`** | Skip and blacklist the current frequency. |
+| **`D`** | Toggle the neural denoiser. |
+| **`C`** then band and channel | Direct tune. For R8, press `C`, then `R`, then `8`. |
+| **`Esc`** or **`Q`** | Quit. |
+
+## Verifying a decode
+
+To determine whether a decoding problem originates in a capture or in the
+decoder, generate a reference file that is correct by construction and
+replay that instead:
 
 ```bash
-cargo run --release -- usrp
+cd ../orecchiette-fpv-drone-analog-rs
+cargo run --release --example make_reference_capture -- --standard pal
+cargo run --release --example make_reference_capture -- --standard ntsc
 ```
 
-### Direct Channel Tuning
-Tune a HackRF directly to FPV channel R8 (5917 MHz):
+Replayed with `--debug`, these should report the expected standard and
+geometry with `SyncQ` near 1.00 on every frame; the reference PAL and
+NTSC files decode at 0.99 and 1.00 respectively with no interpolated
+rows. If the reference files decode correctly and a real capture does
+not, the fault lies in the capture.
 
-```bash
-cargo run --release -- hackrf --channel R8
-```
-
-### Aaronia Spectran V6 Streaming
-Stream directly using the native Aaronia SDK (needs the `aaronia`
-feature and the AARTSAAPI SDK installed):
-
-```bash
-cargo run --release --features aaronia -- aaronia sdk --channel E4
-```
-
-### Offline Playback
-Replay an I/Q file (will automatically read the `.sigmf-meta` if present):
-
-```bash
-cargo run --release -- file /path/to/capture.sigmf-data
-```
-
-## Shortcuts
-
-While the viewer is running:
-- **`N`**: Next channel (when in auto-scan mode, abandons current lock and resumes sweeping).
-- **`S`**: Skip/Blacklist current frequency.
-- **`C` + `[Band][Chan]`**: Direct tune (e.g., press `C`, then `R`, then `8` to tune to R8).
+The reference files carry no transmitter pre-emphasis, so
+`--deemphasis-tau 0` reproduces the generated waveform exactly and
+appears sharper. The default of 0.75 µs also decodes them correctly but
+with softer edges, as there is no pre-emphasis to invert. Against a real
+transmitter the default is correct.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later).
+GNU General Public License v3.0 or later (GPL-3.0-or-later).
