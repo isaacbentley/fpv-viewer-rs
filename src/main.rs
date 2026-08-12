@@ -1303,24 +1303,6 @@ fn hackrf_scan_for_channel(
 // ═══════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "aaronia")]
-/// Snap a requested sample rate to one the Aaronia hardware can run.
-///
-/// The device samples at 61.44 MHz divided by a power of two and nothing
-/// in between. Given any other rate it picks its own and streams that,
-/// so continuing to use the requested number puts every derived
-/// frequency, and the FM demodulation that depends on it, off by the
-/// ratio between the two. Returns the lowest rate whose alias-free
-/// bandwidth (0.8 of the rate) still covers what was asked for.
-fn aaronia_snap_sample_rate(requested_hz: f64) -> f64 {
-    const CLOCK_HZ: f64 = 61_440_000.0;
-    const USABLE: f64 = 0.8;
-    let needed = requested_hz / USABLE;
-    (0..10)
-        .map(|n| CLOCK_HZ / f64::from(1u32 << n))
-        .filter(|rate| *rate >= needed)
-        .fold(CLOCK_HZ, f64::min)
-}
-
 fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
     use sdr_aaronia_rs::{AaroniaBackend, AaroniaSdrSource};
 
@@ -1383,7 +1365,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
     };
 
     let requested_rate = live.sample_rate.unwrap_or(AARONIA_DEFAULT_SPAN);
-    let sample_rate = aaronia_snap_sample_rate(requested_rate);
+    let sample_rate = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(requested_rate);
     if (sample_rate - requested_rate).abs() > 1.0 {
         tracing::warn!(
             requested_hz = requested_rate,

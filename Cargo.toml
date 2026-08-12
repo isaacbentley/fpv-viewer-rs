@@ -16,7 +16,7 @@ orecchiette-sdr-hackrf-rs = { git = "https://github.com/isaacbentley/orecchiette
 # local co-development against a sibling checkout, add:
 #   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
 #   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
-sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", branch = "main", features = [
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.6.1", features = [
     "native-sdk",
 ], optional = true }
 
