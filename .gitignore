@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Frame dumps written by --debug into the working directory
 fpv_frame_*.png

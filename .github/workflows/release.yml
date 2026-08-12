@@ -86,7 +86,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build Release Binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       # For Windows and Linux, just upload the binary
       - name: Upload Binary (Windows/Linux)
