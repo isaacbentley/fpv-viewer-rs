@@ -19,6 +19,11 @@ this repository is the application around it.
   and raw interleaved cf32 I/Q files.
 - **Automatic band sweep.** Scans the 5.8 GHz FPV band
   (5,645–5,945 MHz), locks onto active signals, and displays them.
+  `--scan-bands all` extends this to every band in the channel table,
+  1.24–5.945 GHz. Tune centres are planned against the real channel list
+  rather than stepped uniformly, so the sweep spends tunes only where
+  channels are: 6 tunes for the 40 channels of the 5.8 GHz band at
+  61.44 MSPS, or 45 for all 128 channels.
 - **Live monochrome rendering** in a desktop window.
 - **Weak-signal decoding**, enabled by default:
   - Matched-filter sync acquisition, a line-locked clock for straight
@@ -125,6 +130,7 @@ subcommand:
 
 | Option | Description |
 | :--- | :--- |
+| `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` adds the 5.3 GHz L/D bands and 1.2 GHz, at proportionally more tunes per sweep. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant. Default 0.75 µs; `0` disables. |
 | `--denoise` | Start with the neural denoiser enabled (requires `--features neural-vsr`). |

@@ -102,6 +102,11 @@ struct LiveArgs {
     /// HackRF 20 MSPS (its USB 2.0 ceiling), Aaronia 61.44 MHz span.
     #[arg(long)]
     sample_rate: Option<f64>,
+    /// Which bands the auto-scan sweeps. '5.8' (default) covers
+    /// 5.645-5.945 GHz; 'all' adds the 5.3 GHz L/D bands and 1.2 GHz,
+    /// at proportionally more tunes per sweep. Ignored with --channel.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = ScanBands::Band58)]
+    scan_bands: ScanBands,
     /// FM deviation (Hz). Defaults to 5 MHz for live SDR.
     #[arg(long, default_value_t = 5_000_000.0)]
     fm_deviation: f32,
@@ -193,21 +198,147 @@ fn parse_standard(s: &str) -> Result<SignalType, String> {
     }
 }
 
-/// Build the hop frequency list for the auto-scan loop across the
-/// standard 5.8 GHz FPV band (5.645-5.945 GHz), sized to the SDR's
-/// instantaneous bandwidth.
-///
-/// The list is ordered low→high so the USRP retunes monotonically
-/// (minimises PLL re-lock time on most synthesisers).
-fn build_scan_hops(sample_rate: f64) -> Vec<f64> {
-    let step = sample_rate * 0.8; // 80% of BW per hop to avoid filter rolloff edges
-    let mut hops = Vec::new();
-    let mut f = 5_645_000_000.0f64;
-    while f <= 5_945_000_000.0 {
-        hops.push(f);
-        f += step;
+/// Which FPV bands the auto-scan covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ScanBands {
+    /// The 5.8 GHz band only (5.645–5.945 GHz) — A/B/E/F/R. The default,
+    /// and what the scan covered before it could do anything else.
+    #[value(name = "5.8", alias = "58")]
+    Band58,
+    /// Every band in the channel table, 1.24–5.945 GHz: 5.8 GHz plus the
+    /// 5.3 GHz L/D bands and 1.2 GHz. Costs more tunes per sweep, so the
+    /// revisit interval on any one channel goes up proportionally.
+    All,
+}
+
+impl ScanBands {
+    /// Short human-readable name for startup logging.
+    fn label(self) -> &'static str {
+        match self {
+            ScanBands::Band58 => "5.8 GHz",
+            ScanBands::All => "all bands",
+        }
     }
-    hops
+
+    /// Channel centre frequencies this setting covers, in Hz.
+    fn channel_freqs_hz(self) -> Vec<f64> {
+        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
+            .iter()
+            .map(|c| c.frequency_hz as f64)
+            .filter(|f| match self {
+                ScanBands::Band58 => (5_645e6..=5_945e6).contains(f),
+                ScanBands::All => true,
+            })
+            .collect()
+    }
+}
+
+/// Fraction of the sample rate across which the detector still places a
+/// carrier accurately, so a channel centred anywhere inside it is both
+/// found and reported at the right frequency.
+///
+/// Measured against the sliding-DDC sweep rather than assumed from the
+/// anti-alias filter. Feeding the viewer's real scan path (65,536-sample
+/// packets through `detect_from_iq_integrated`) a clean synthetic NTSC
+/// carrier at increasing offsets from the tuned centre, at 61.44 MSPS:
+///
+/// ```text
+///   offset  +0    +5    +10   +15   +20   +25   +30 MHz
+///   error  -0.7  -0.7  -0.7  -0.7  -0.7  -0.7  -55.7
+/// ```
+///
+/// The constant −0.7 MHz is probe-grid quantisation, absorbed downstream
+/// by `CHANNEL_SNAP_TOLERANCE_MHZ`. Localisation holds all the way to
+/// ±25 MHz (0.81 × the ±30.72 MHz capture half-width) and only collapses
+/// at the very edge. Detection *rate* starts thinning around the same
+/// point — at 25 MSPS a carrier at 0.8 × half-width scored 7/12 sweeps
+/// against 10–12/12 further in. 0.8 keeps planning inside the region
+/// where both hold.
+const USABLE_SPAN_FRACTION: f64 = 0.8;
+
+/// Plan the fewest tune centres that put every channel in `channels_hz`
+/// inside some capture window of width `span_hz`.
+///
+/// Greedy interval cover, the same shape as `orecchiette`'s
+/// `plan_tune_centers`: walk the sorted channels, anchor on the leftmost
+/// one not yet covered, absorb every channel within `span_hz` of it, and
+/// emit the **midpoint of the group actually absorbed** rather than the
+/// anchor. Re-centring costs nothing and buys margin — it moves the
+/// absorbed channels as far from the window edges, where localisation
+/// degrades, as that group allows. Anchoring left and taking as much as
+/// fits is optimal in the number of windows for covering points on a
+/// line with a fixed width.
+///
+/// The coverage test is on channel *centres*, not whole channel widths.
+/// `orecchiette` subtracts a 20 MHz allowance from the reach because it
+/// needs a whole DJI channel inside one window to demodulate it. Here the
+/// window only has to be good enough to *detect and localise* a carrier,
+/// which the measurements behind [`USABLE_SPAN_FRACTION`] show needs the
+/// carrier centre inside the span and nothing more. Charging every narrow
+/// analog channel a 20 MHz guard would roughly halve the reach at
+/// 25 MSPS for no gain.
+fn plan_tune_centers(channels_hz: &[f64], span_hz: f64) -> Vec<f64> {
+    let mut sorted: Vec<f64> = channels_hz
+        .iter()
+        .copied()
+        .filter(|f| f.is_finite())
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.dedup();
+
+    let reach = span_hz.max(0.0);
+    let mut centers = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let first = sorted[i];
+        let mut last = first;
+        let mut j = i;
+        while j < sorted.len() && sorted[j] - first <= reach {
+            last = sorted[j];
+            j += 1;
+        }
+        // `j > i` always holds: the anchor itself satisfies the window
+        // test (distance 0), so the inner loop advances at least once and
+        // the outer loop cannot spin. Belt-and-braces for a NaN-poisoned
+        // comparison ordering that slipped past the filter above.
+        if j == i {
+            j = i + 1;
+        }
+        centers.push((first + last) * 0.5);
+        i = j;
+    }
+    centers
+}
+
+/// Build the hop list for the auto-scan loop, covering every channel in
+/// `bands` with as few tunes as the SDR's instantaneous bandwidth allows.
+///
+/// This used to step uniformly across 5.645–5.945 GHz at 0.8 × the
+/// sample rate. Planning against the real channel list spends tunes only
+/// where channels actually are, which is fewer even on the band the
+/// uniform sweep was built for:
+///
+/// ```text
+///   5.8 GHz (40 channels)      uniform   planned
+///     20.00 MSPS                    19        16
+///     25.00 MSPS                    16        11
+///     40.00 MSPS                    10         8
+///     61.44 MSPS                     7         6
+/// ```
+///
+/// The larger difference is that it can cover the rest of the table at
+/// all. All 128 channels, 1.24–5.945 GHz, take 45 tunes at 61.44 MSPS;
+/// stepping uniformly across that range would need ~96, nearly all of
+/// them on empty spectrum between bands.
+///
+/// Revisit interval is `tunes × (retune + dwell)`, so those tune counts
+/// are directly how long a signal can hide between looks.
+///
+/// Ordered low→high so synthesisers retune monotonically, which minimises
+/// PLL re-lock time on most parts.
+fn build_scan_hops(sample_rate: f64, bands: ScanBands) -> Vec<f64> {
+    let channels: Vec<f64> = bands.channel_freqs_hz();
+    plan_tune_centers(&channels, sample_rate * USABLE_SPAN_FRACTION)
 }
 
 /// Resolve --channel to a centre frequency in Hz.
@@ -737,11 +868,13 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 (freq, ViewerMode::SingleChannel)
             }
             ViewerMode::Scan => {
-                let hop_freqs = build_scan_hops(current_sample_rate);
+                let hop_freqs = build_scan_hops(current_sample_rate, args.live.scan_bands);
                 println!(
-                    "Wideband scan requested [5.8 GHz]. {} hops at {:.1} MHz step...",
+                    "Wideband scan requested [{}]. {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
+                    args.live.scan_bands.label(),
+                    args.live.scan_bands.channel_freqs_hz().len(),
                     hop_freqs.len(),
-                    current_sample_rate * 0.8 / 1e6
+                    current_sample_rate * USABLE_SPAN_FRACTION / 1e6
                 );
 
                 let config = SourceConfig {
@@ -1243,11 +1376,13 @@ fn hackrf_scan_for_channel(
 ) -> anyhow::Result<Option<f64>> {
     use orecchiette_sdr_hackrf_rs::HackRfSource;
 
-    let hop_freqs = build_scan_hops(sample_rate);
+    let hop_freqs = build_scan_hops(sample_rate, args.live.scan_bands);
     println!(
-        "HackRF wideband scan: {} hops at {:.1} MHz step...",
+        "HackRF wideband scan [{}]: {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
+        args.live.scan_bands.label(),
+        args.live.scan_bands.channel_freqs_hz().len(),
         hop_freqs.len(),
-        sample_rate * 0.8 / 1e6
+        sample_rate * USABLE_SPAN_FRACTION / 1e6
     );
     let config = SourceConfig {
         sample_rate_hz: sample_rate,
@@ -2742,4 +2877,108 @@ fn draw_text_with_bg(
     let h = 12;
     draw_rect(buffer, width, height, x, y, w, h, bg_color);
     draw_string(buffer, width, height, x + 2, y + 2, text, text_color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every channel must sit inside some planned window. This is the
+    /// property the whole planner exists for — a channel nobody tunes
+    /// close enough to is a drone the scan cannot see.
+    fn assert_covers(channels: &[f64], centers: &[f64], span: f64) {
+        for ch in channels {
+            let covered = centers.iter().any(|c| (ch - c).abs() <= span / 2.0 + 1.0);
+            assert!(
+                covered,
+                "channel {:.3} MHz not covered by any of {} tunes at {:.1} MHz span",
+                ch / 1e6,
+                centers.len(),
+                span / 1e6
+            );
+        }
+    }
+
+    #[test]
+    fn tune_planner_covers_every_channel_at_every_plausible_rate() {
+        for bands in [ScanBands::Band58, ScanBands::All] {
+            let channels = bands.channel_freqs_hz();
+            assert!(!channels.is_empty(), "{:?} yielded no channels", bands);
+            for rate in [15.36e6f64, 20e6, 25e6, 30.72e6, 40e6, 50e6, 61.44e6] {
+                let span = rate * USABLE_SPAN_FRACTION;
+                let hops = build_scan_hops(rate, bands);
+                assert_covers(&channels, &hops, span);
+                assert!(
+                    hops.len() <= channels.len(),
+                    "{:?} at {:.2} MSPS planned {} tunes for {} channels — never worse than one each",
+                    bands,
+                    rate / 1e6,
+                    hops.len(),
+                    channels.len()
+                );
+            }
+        }
+    }
+
+    /// A wide capture must actually collapse the table, otherwise the
+    /// planner is buying nothing over tuning each channel in turn.
+    #[test]
+    fn tune_planner_collapses_the_table_when_the_capture_is_wide() {
+        let channels = ScanBands::Band58.channel_freqs_hz();
+        let hops = build_scan_hops(61.44e6, ScanBands::Band58);
+        assert!(
+            hops.len() * 4 < channels.len(),
+            "61.44 MSPS should cover {} channels in far fewer than {} tunes, got {}",
+            channels.len(),
+            channels.len() / 4,
+            hops.len()
+        );
+    }
+
+    /// Hops ascend so synthesisers retune monotonically.
+    #[test]
+    fn tune_planner_emits_ascending_hops() {
+        let hops = build_scan_hops(25e6, ScanBands::All);
+        assert!(
+            hops.windows(2).all(|w| w[0] < w[1]),
+            "hop list must be strictly ascending, got {hops:?}"
+        );
+    }
+
+    /// A span too narrow to group anything must degrade to one tune per
+    /// channel rather than silently dropping channels — and must not
+    /// spin forever doing it.
+    #[test]
+    fn tune_planner_degrades_to_one_tune_per_channel_when_span_is_zero() {
+        let channels = vec![5_658e6, 5_695e6, 5_732e6];
+        let hops = plan_tune_centers(&channels, 0.0);
+        assert_eq!(hops, channels);
+    }
+
+    #[test]
+    fn tune_planner_handles_degenerate_input() {
+        assert!(plan_tune_centers(&[], 50e6).is_empty());
+        // Duplicates collapse rather than each claiming a tune.
+        assert_eq!(
+            plan_tune_centers(&[5_800e6, 5_800e6, 5_800e6], 0.0).len(),
+            1
+        );
+        // A non-finite entry must not poison the sort into an infinite loop.
+        let hops = plan_tune_centers(&[5_800e6, f64::NAN, 5_810e6], 50e6);
+        assert_eq!(hops.len(), 1);
+    }
+
+    /// Scanning everything must be a strict superset of scanning 5.8,
+    /// and must cost more tunes — that trade is the point of the flag.
+    #[test]
+    fn all_bands_is_a_superset_of_the_58_band() {
+        let band58 = ScanBands::Band58.channel_freqs_hz();
+        let all = ScanBands::All.channel_freqs_hz();
+        assert!(band58.iter().all(|f| all.contains(f)));
+        assert!(all.len() > band58.len());
+        assert!(
+            build_scan_hops(61.44e6, ScanBands::All).len()
+                > build_scan_hops(61.44e6, ScanBands::Band58).len()
+        );
+    }
 }
