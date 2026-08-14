@@ -198,6 +198,34 @@ fn parse_standard(s: &str) -> Result<SignalType, String> {
     }
 }
 
+/// How many capture packets per hop get fed to the detector before the
+/// rest of the dwell is drained.
+///
+/// One is not enough. `detect_from_iq_integrated` accumulates magnitude
+/// spectra per frequency, and a single 65,536-sample packet is below the
+/// length at which the sweep detects anything at all — so with one packet
+/// per hop the first sweep finds nothing and detection only lands on the
+/// *second* visit, once the integrator holds two batches. Feeding
+/// consecutive packets from one hop shows exactly where it turns over
+/// (`--` = no detection, otherwise confidence):
+///
+/// ```text
+///   25.00 MSPS  packets 1..8:  --  0.80 0.80 0.80 0.80 0.80  --  0.80
+///   61.44 MSPS  packets 1..8:  --  0.80 0.80 0.80 0.80 0.80 0.80 0.80
+/// ```
+///
+/// Two makes first-visit detection the normal case instead of relying on
+/// a second pass over the whole band. Beyond two buys nothing measurable:
+/// confidence plateaus at 0.80 and never promotes, and on weak signals a
+/// longer look does not help either — the σ cliff sits between 1.0 and
+/// 1.5 and does not move with 12× the dwell, which is why the adaptive
+/// dwell this crate's `DwellController` offers is left switched off.
+///
+/// The cost is CPU, not time on air: two packets is ~5.2 ms of signal at
+/// 25 MSPS but ~18 ms of detection work, so a hop becomes CPU-bound
+/// rather than dwell-bound.
+const DETECT_PACKETS_PER_HOP: usize = 2;
+
 /// Which FPV bands the auto-scan covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ScanBands {
@@ -880,10 +908,25 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 let config = SourceConfig {
                     sample_rate_hz: current_sample_rate,
                     channels_hz: hop_freqs.clone(),
-                    // Only need one 2.6ms chunk per hop for detection;
-                    // 10ms allows for retune settling + one full capture.
-                    dwell_min: Duration::from_millis(10),
-                    dwell_max: Duration::from_millis(10),
+                    // Long enough to actually deliver
+                    // `DETECT_PACKETS_PER_HOP` captures plus retune
+                    // settling. Two 65,536-sample packets is 5.2 ms of
+                    // signal at 25 MSPS and 6.6 ms at 20 MSPS, so 20 ms
+                    // leaves comfortable margin at every rate the scan
+                    // runs at. It costs nothing in practice: two
+                    // detection passes are ~18 ms of CPU, so the hop is
+                    // bound by that rather than by the dwell.
+                    //
+                    // `dwell_max == dwell_min` deliberately leaves the
+                    // source crate's adaptive dwell off. Measured, a
+                    // longer look neither promotes confidence on a strong
+                    // signal (it plateaus at 0.80 from the second packet)
+                    // nor recovers a weak one (the sigma cliff sits
+                    // between 1.0 and 1.5 and does not move with 12x the
+                    // dwell) — it would extend dwell only on the channels
+                    // that already detected.
+                    dwell_min: Duration::from_millis(20),
+                    dwell_max: Duration::from_millis(20),
                     dwell_extension: Duration::ZERO,
                 };
                 let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
@@ -898,7 +941,10 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 let mut best_hit: Option<(f64, f32, SignalType)> = None;
                 let mut seen_freqs = std::collections::HashSet::new();
                 let mut sweeps_completed = 0;
+                let mut last_progress_msg = Instant::now();
                 let mut last_processed_freq = 0;
+                let mut packets_this_hop = 0usize;
+                let multi_hop = hop_freqs.len() > 1;
 
                 let found_freq = 'scan_loop: loop {
                     let packet = match handle.receiver.recv_timeout(Duration::from_millis(1000)) {
@@ -921,12 +967,32 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                     {
                         let center = packet.center_frequency_hz as u64;
 
-                        // We only need to run the expensive wideband sweep once per hop.
-                        // Drain any remaining packets from this dwell to prevent the SDR buffer from overflowing.
-                        if center == last_processed_freq {
-                            continue;
+                        // Feed the sweep `DETECT_PACKETS_PER_HOP` packets
+                        // per hop, then drain the rest of the dwell so the
+                        // SDR's buffer doesn't overflow.
+                        //
+                        // A change of centre frequency is the only signal
+                        // `IqPacket` carries that a new hop began, so the
+                        // budget resets on that. It is sound because
+                        // `plan_tune_centers` dedups and emits strictly
+                        // ascending centres — pinned by
+                        // `tune_planner_emits_ascending_hops` — so two
+                        // consecutive hops can never share one.
+                        //
+                        // With a single tune the source never retunes, so
+                        // there is no boundary to observe and no hop to
+                        // drain *for*. Enforcing the budget there would
+                        // drain every packet after the second forever;
+                        // process them all instead.
+                        if multi_hop && center == last_processed_freq {
+                            if packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                                continue;
+                            }
+                        } else if center != last_processed_freq {
+                            last_processed_freq = center;
+                            packets_this_hop = 0;
                         }
-                        last_processed_freq = center;
+                        packets_this_hop += 1;
 
                         seen_freqs.insert(center);
 
@@ -985,8 +1051,17 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                     Some((res.frequency_hz as f64, res.rssi_dbm, res.signal_type));
                             }
                         }
-                        // If we've seen all frequencies in the hop list at least once
-                        if seen_freqs.len() >= hop_freqs.len() {
+                        // Sweep is complete once every hop has been visited
+                        // *and* the current one has had its full packet
+                        // budget. Without the budget half of that test this
+                        // fires on the first packet of the last hop, which
+                        // both cuts that hop short of the two passes it
+                        // needs to detect anything and clears `seen_freqs`
+                        // mid-hop, sliding the sweep boundary one hop
+                        // earlier on every subsequent pass.
+                        if seen_freqs.len() >= hop_freqs.len()
+                            && packets_this_hop >= DETECT_PACKETS_PER_HOP
+                        {
                             if let Some((freq, _rssi, _sig_type)) = best_hit {
                                 // Found something, break out of the infinite scan loop
                                 (handle.stop)();
@@ -1133,10 +1208,23 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                 }
                             } else {
                                 sweeps_completed += 1;
-                                if sweeps_completed % 3 == 0 {
-                                    println!("Still sweeping... no signals found yet.");
+                                // Time-gated, not every Nth sweep. A sweep
+                                // is `tunes × dwell`, which ranges from
+                                // ~120 ms for six tunes to ~2 s for the
+                                // whole table — so a fixed sweep count
+                                // prints either far too often or barely at
+                                // all depending on --scan-bands and the
+                                // sample rate. It also bounds the
+                                // degenerate single-tune case, where a
+                                // "sweep" is one hop and completes on
+                                // every packet.
+                                if last_progress_msg.elapsed() >= Duration::from_secs(5) {
+                                    println!(
+                                        "Still sweeping ({sweeps_completed} passes)... no signals found yet."
+                                    );
+                                    last_progress_msg = Instant::now();
                                 }
-                                // Reset for the next sweep
+                                // Reset for the next sweep.
                                 seen_freqs.clear();
                             }
                         }
@@ -1387,8 +1475,12 @@ fn hackrf_scan_for_channel(
     let config = SourceConfig {
         sample_rate_hz: sample_rate,
         channels_hz: hop_freqs.clone(),
-        dwell_min: Duration::from_millis(15),
-        dwell_max: Duration::from_millis(15),
+        // See the USRP scan's dwell for why this is 20 ms and why
+        // adaptive dwell stays off. HackRF's 20 MSPS ceiling makes its
+        // packets the longest of any backend at 3.3 ms, so it needs the
+        // most room to land `DETECT_PACKETS_PER_HOP` of them.
+        dwell_min: Duration::from_millis(20),
+        dwell_max: Duration::from_millis(20),
         dwell_extension: Duration::ZERO,
     };
     let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
@@ -1404,16 +1496,27 @@ fn hackrf_scan_for_channel(
     let mut best_hit: Option<(f64, f32)> = None; // (raw freq Hz, rssi dBm)
     let mut seen = std::collections::HashSet::new();
     let mut last_freq = 0u64;
+    let mut packets_this_hop = 0usize;
 
     loop {
         match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
             Ok(packet) => {
                 let center = packet.center_frequency_hz as u64;
-                // One detection pass per hop; drain the rest of the dwell.
+                // `DETECT_PACKETS_PER_HOP` detection passes per hop, then
+                // drain the rest of the dwell. Unlike the USRP loop this
+                // one needs no single-tune escape: it *returns* once the
+                // sweep is complete rather than clearing `seen` and going
+                // round again, so a one-tune plan finishes on its first
+                // packet and can never sit draining.
                 if center == last_freq {
-                    continue;
+                    if packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                        continue;
+                    }
+                } else {
+                    last_freq = center;
+                    packets_this_hop = 0;
                 }
-                last_freq = center;
+                packets_this_hop += 1;
                 seen.insert(center);
 
                 for res in detector.detect_from_iq_integrated(
@@ -1440,7 +1543,13 @@ fn hackrf_scan_for_channel(
                     }
                 }
 
-                if seen.len() >= hop_freqs.len() {
+                // As in the USRP loop: the last hop must get its full
+                // packet budget before the sweep counts as done. Returning
+                // on its first packet left the highest frequency in every
+                // HackRF scan with a single detection pass — below the
+                // length at which the sweep finds anything — so that
+                // channel could never be reported.
+                if seen.len() >= hop_freqs.len() && packets_this_hop >= DETECT_PACKETS_PER_HOP {
                     (handle.stop)();
                     std::thread::sleep(Duration::from_millis(150));
                     return Ok(best_hit.map(|(f, _)| snap_to_nearest_fpv_channel(f)));
