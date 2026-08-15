@@ -630,7 +630,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -706,7 +706,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1913,8 +1913,8 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-sdr-hackrf-rs"
-version = "0.1.0"
-source = "git+https://github.com/isaacbentley/orecchiette-sdr-hackrf-rs.git?branch=main#532f107f5b05c5518b0103d215469e18f74c7b40"
+version = "0.1.5"
+source = "git+https://github.com/isaacbentley/orecchiette-sdr-hackrf-rs.git?branch=main#c0959dcf2b8be1cd774c0e0e92118294f9852a35"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -1938,8 +1938,8 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-sdr-usrp-rs"
-version = "0.1.0"
-source = "git+https://github.com/isaacbentley/orecchiette-sdr-usrp-rs.git?branch=main#7f3a62e54e50c960baa2e5930467b3deda003cec"
+version = "0.1.5"
+source = "git+https://github.com/isaacbentley/orecchiette-sdr-usrp-rs.git?branch=main#b2b50fb49f53bdddc8cb733e17a570ce3749fd28"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -2188,7 +2188,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2496,7 +2496,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2553,7 +2553,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2922,7 +2922,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3210,9 +3210,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "uhd"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70d2c98c51466ce4e9a41b73fc65f1943319918f56b74d1bfe48afcf7db89f64"
+checksum = "0ff3cb1dff789220e58f8054464f6b39aa9d911b6b8920e8e8a70c1af54310b9"
 dependencies = [
  "anyhow",
  "libc",
@@ -3609,7 +3609,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
