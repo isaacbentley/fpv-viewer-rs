@@ -148,6 +148,7 @@ subcommand:
 | Option | Description |
 | :--- | :--- |
 | `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` adds the 5.3 GHz L/D bands and 1.2 GHz, at proportionally more tunes per sweep. |
+| `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The HTTP default of 61.44 MSPS is about 246 MB/s in `f16`, more than gigabit Ethernet carries, and the RTSA server discards data once its outbound buffer passes 8 MB. Measured over Wi-Fi, even 15.36 MSPS (61 MB/s) fell a few percent short and dropped most packets; a wired link is the fix, and `--sample-rate 15360000` is the widest span worth trying on a marginal one. |
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant. Default 0.75 µs; `0` disables. |

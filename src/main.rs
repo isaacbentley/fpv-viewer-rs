@@ -102,7 +102,7 @@ struct LiveArgs {
     #[arg(long, value_parser = parse_standard)]
     standard: Option<SignalType>,
     /// Override sample rate (Hz). Defaults per backend: USRP 25 MSPS,
-    /// HackRF 20 MSPS (its USB 2.0 ceiling), Aaronia 61.44 MHz span.
+    /// HackRF 20 MSPS (its USB 2.0 ceiling), Aaronia 61.44 MSPS (it runs 61.44 MHz over powers of two, down to 120 kSPS).
     #[arg(long)]
     sample_rate: Option<f64>,
     /// Which bands the auto-scan sweeps. '5.8' (default) covers
@@ -530,7 +530,7 @@ const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 
 /// Default Aaronia span when no --sample-rate is given (max complex span for 92.16 MHz clock).
 #[cfg(feature = "aaronia")]
-const AARONIA_DEFAULT_SPAN: f64 = 61_440_000.0;
+const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
 
 // ── No-op dwell advice (single-channel, no hopping) ────────────────
 
@@ -997,7 +997,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 });
 
                 let handle = source.start(config, advice.clone())?;
-                let detector = AnalogFpvDetector::default();
+                let detector = viewer_detector();
                 let mut best_hit: Option<(f64, f32, SignalType)> = None;
                 let mut seen_freqs = std::collections::HashSet::new();
                 let mut sweeps_completed = 0;
@@ -1342,6 +1342,8 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             args.live.debug,
             args.live.temporal_window,
             Some(&sweep.band),
+            OverrunPolicy::StepDown,
+            Duration::ZERO,
         )? {
             RunLiveResult::UserExit => {
                 break;
@@ -1531,6 +1533,8 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             args.live.debug,
             args.live.temporal_window,
             Some(&sweep.band),
+            OverrunPolicy::StepDown,
+            Duration::ZERO,
         )? {
             RunLiveResult::UserExit => break,
             RunLiveResult::SignalLost | RunLiveResult::NextChannel => {
@@ -1587,6 +1591,56 @@ impl SweepState {
             ui: None,
         }
     }
+}
+
+/// What a backend wants done when the source flags an overrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrunPolicy {
+    /// The host cannot keep up with the hardware: give the channel up so
+    /// the caller can step the sample rate down (USRP over USB).
+    StepDown,
+    /// A gap in a network stream drops a few samples and glitches the
+    /// picture; it says nothing about the channel. Count it, keep going.
+    /// The RTSA HTTP server also leaves timestamp gaps around every
+    /// retune, which under `StepDown` ended a fresh lock within 200 ms.
+    #[cfg_attr(not(feature = "aaronia"), allow(dead_code))]
+    Tolerate,
+}
+
+/// How long the RTSA HTTP server keeps delivering samples from the
+/// previous centre after acknowledging a retune, over and above the
+/// driver's own 75 ms drain: measured at 150–300 ms. Packets inside this
+/// window belong to the old channel, whatever their label says.
+#[cfg(feature = "aaronia")]
+const AARONIA_HTTP_TUNE_SETTLE: Duration = Duration::from_millis(400);
+
+/// Length of contiguous signal the standard is decided on. PAL and NTSC
+/// line rates are 109 Hz apart, so the FFT separates them only past
+/// ~9.2 ms of record; one 65,536-sample packet is 1–4 ms at the live
+/// rates, and on that the library can only answer "analog video,
+/// standard unknown" — measured on a clean 20 dB NTSC link, which then
+/// decoded as PAL. 25 ms puts the two rates 2.6 bins apart.
+const STANDARD_DETECT_RECORD: Duration = Duration::from_millis(25);
+/// Give up waiting for a clean record after this long and decide on
+/// whatever was gathered.
+const STANDARD_DETECT_PATIENCE: Duration = Duration::from_millis(1500);
+
+/// Confidence floor for the sweep and the lock check. Both ask whether
+/// analog video is present, not which standard it is: the standard is
+/// settled afterwards on a long record (`STANDARD_DETECT_RECORD`). Their
+/// 1–4 ms packets cannot resolve PAL from NTSC, and the library reports
+/// that honestly as `AnalogVideoUnknown` at 0.6 — a hit that has passed
+/// the harmonic and cepstral gates — which the detector's default 0.7
+/// floor discarded. Measured on a 20 dB NTSC link at 15.36 MSPS: the
+/// sweep reported an empty band on every pass, and a decoder with
+/// perfect vertical sync "lost" its signal on every check.
+const VIEWER_MIN_CONFIDENCE: f32 = 0.55;
+
+/// The detector every live path uses, with the floor above.
+fn viewer_detector() -> AnalogFpvDetector {
+    let mut d = AnalogFpvDetector::default();
+    d.min_confidence = VIEWER_MIN_CONFIDENCE;
+    d
 }
 
 /// What a coarse sweep came back with.
@@ -1650,7 +1704,7 @@ fn scan_band_for_channel(
     };
     let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
     let handle = source.start(config, advice)?;
-    let detector = AnalogFpvDetector::default();
+    let detector = viewer_detector();
 
     // (raw freq Hz, rssi dBm, what the sweep classified it as)
     let mut best_hit: Option<(f64, f32, SignalType)> = None;
@@ -1815,13 +1869,19 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         }
     };
 
-    let requested_rate = live.sample_rate.unwrap_or(AARONIA_DEFAULT_SPAN);
-    let sample_rate = sdr_aaronia_rs::iq_sample_rate_for_bandwidth(requested_rate);
+    // `--sample-rate` is a rate, so it maps to the nearest rate the
+    // hardware runs (61.44 MHz over powers of two). It used to go
+    // through the driver's bandwidth-to-rate helper, which reads its
+    // argument as usable spectrum and answers with the lowest rate whose
+    // alias-free span covers it — so asking for 15.36 MSPS started a
+    // 30.72 MSPS stream, twice the bytes the operator had budgeted for.
+    let requested_rate = live.sample_rate.unwrap_or(AARONIA_DEFAULT_RATE_HZ);
+    let sample_rate = sdr_aaronia_rs::nearest_iq_sample_rate(requested_rate);
     if (sample_rate - requested_rate).abs() > 1.0 {
         tracing::warn!(
             requested_hz = requested_rate,
             using_hz = sample_rate,
-            "requested sample rate is not one the Aaronia hardware runs; using the nearest that covers it"
+            "requested sample rate is not one the Aaronia hardware runs; using the nearest"
         );
     }
     let fm_deviation = live.fm_deviation;
@@ -1904,15 +1964,23 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             live.debug,
             live.temporal_window,
             Some(&sweep.band),
+            OverrunPolicy::Tolerate,
+            AARONIA_HTTP_TUNE_SETTLE,
         )? {
             RunLiveResult::UserExit => break,
-            RunLiveResult::SignalLost
+            r @ (RunLiveResult::SignalLost
             | RunLiveResult::NextChannel
-            | RunLiveResult::TooManyOverruns => {
+            | RunLiveResult::TooManyOverruns) => {
+                let why = match r {
+                    RunLiveResult::SignalLost => "Signal lost",
+                    RunLiveResult::NextChannel => "Next channel requested",
+                    _ => "Too many stream overruns",
+                };
                 if auto_scan {
+                    println!("{why}. Resuming scan...");
                     explicit_freq = None;
                 } else {
-                    println!("Signal lost (explicit-channel mode). Exiting.");
+                    println!("{why} (explicit-channel mode). Exiting.");
                     break;
                 }
             }
@@ -1964,6 +2032,8 @@ fn run_live(
     debug: bool,
     temporal_window: usize,
     band: Option<&BandScan>,
+    overrun_policy: OverrunPolicy,
+    settle_after_tune: Duration,
 ) -> anyhow::Result<RunLiveResult> {
     let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
     let config = SourceConfig {
@@ -1979,10 +2049,25 @@ fn run_live(
 
     // Receive the first chunk for auto-detection
     println!("Waiting for first IQ chunk from SDR...");
-    let first_packet = handle
+    let mut first_packet = handle
         .receiver
         .recv()
         .map_err(|_| anyhow::anyhow!("SDR source closed before delivering any samples"))?;
+    // A source that keeps sending the previous centre's samples after the
+    // retune is acknowledged would have the standard auto-detected on the
+    // wrong channel (measured: a clean NTSC link read "ambiguous" and
+    // decoded as PAL). Discard until the backend's settle has passed and
+    // start from the freshest packet.
+    if !settle_after_tune.is_zero() {
+        let t0 = Instant::now();
+        while t0.elapsed() < settle_after_tune {
+            let left = settle_after_tune.saturating_sub(t0.elapsed());
+            match handle.receiver.recv_timeout(left) {
+                Ok(p) => first_packet = p,
+                Err(_) => break,
+            }
+        }
+    }
     let actual_sample_rate = first_packet.sample_rate_hz as u32;
     let actual_center = first_packet.center_frequency_hz;
     if actual_sample_rate != sample_rate_u32 {
@@ -2012,33 +2097,36 @@ fn run_live(
         } else {
             println!("Auto-detecting video standard...");
             let detector = AnalogFpvDetector::default();
-            let mut integ = SpectralIntegrator::new(4);
-            let (mut detected, mut confidence) = detector.detect_sync_pulses_integrated(
-                &first_packet.samples,
-                sample_rate_u32,
-                actual_center as i64,
-                &mut integ,
-            );
-            // Weak-signal patience: accumulate up to 3 more chunks
-            // before settling for an ambiguous or empty answer.
-            let mut attempts = 1;
-            while !matches!(
-                detected,
-                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
-            ) && attempts < 4
-            {
-                match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
+            // Decide on one contiguous record long enough for the FFT to
+            // tell the line rates apart (see `STANDARD_DETECT_RECORD`).
+            // A packet flagged overrun follows a gap in the stream, so
+            // the record restarts from it rather than splicing across
+            // the hole. The packets consumed here are not fed to the
+            // decoder; the pipeline starts from the last one.
+            let want = (sample_rate_u32 as f64 * STANDARD_DETECT_RECORD.as_secs_f64()) as usize;
+            let mut record: Vec<Complex<f32>> =
+                Vec::with_capacity(want + first_packet.samples.len());
+            record.extend_from_slice(&first_packet.samples);
+            let t0 = Instant::now();
+            while record.len() < want && t0.elapsed() < STANDARD_DETECT_PATIENCE {
+                let left = STANDARD_DETECT_PATIENCE.saturating_sub(t0.elapsed());
+                match handle.receiver.recv_timeout(left) {
                     Ok(p) => {
-                        (detected, confidence) = detector.detect_sync_pulses_integrated(
-                            &p.samples,
-                            sample_rate_u32,
-                            actual_center as i64,
-                            &mut integ,
-                        );
+                        if p.overrun {
+                            record.clear();
+                        }
+                        record.extend_from_slice(&p.samples);
+                        first_packet = p;
                     }
                     Err(_) => break,
                 }
-                attempts += 1;
+            }
+            let (detected, confidence) = detector.detect_sync_pulses(&record, sample_rate_u32);
+            if debug {
+                eprintln!(
+                    "[DEBUG] standard decided on {:.1} ms of signal: {detected:?} {confidence:.2}",
+                    record.len() as f64 / sample_rate_u32 as f64 * 1e3
+                );
             }
             match detected {
                 SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => {
@@ -2082,7 +2170,7 @@ fn run_live(
                     // uses, at 0 Hz offset (signal is at DC).
                     let mut probe_ddc =
                         StreamingDDC::new(0.0, sample_rate_u32, fm_deviation + LUMA_HEADROOM_HZ);
-                    let probe_iq = probe_ddc.process(&first_packet.samples);
+                    let probe_iq = probe_ddc.process(&record);
                     // Same fallback order as above: time-domain
                     // measurement first, then the sweep's verdict,
                     // then PAL.
@@ -2131,7 +2219,6 @@ fn run_live(
         tune_freq,
         move |channel_txs, exit_flag| {
             let mut active_txs = channel_txs;
-            let detector = AnalogFpvDetector::default();
             // The lock check must integrate for the same reason the scan
             // does: one 65,536-sample packet is ~1-3 ms of signal, below
             // the length at which a single-shot detection finds anything
@@ -2141,6 +2228,7 @@ fn run_live(
             // relocked in a loop — 44 times in four minutes on a live
             // Aaronia link before crashing.
             let mut lock_integ = SpectralIntegrator::new(4);
+            let detector = viewer_detector();
             // Check cadence in wall time, not packets: a fixed 400-packet
             // interval was 0.43 s at 61.44 MSPS but 1.3 s at HackRF's
             // 20 MSPS, and the integrator's 4-batch memory plus the miss
@@ -2179,7 +2267,12 @@ fn run_live(
                         // Check overruns
                         if packet.overrun {
                             overrun_count += 1;
-                            if overrun_count >= 2 {
+                            if debug {
+                                eprintln!(
+                                    "[DEBUG] overrun flagged on packet {packets} ({overrun_count} in the last minute)"
+                                );
+                            }
+                            if overrun_policy == OverrunPolicy::StepDown && overrun_count >= 2 {
                                 exit_flag.store(2, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -2214,6 +2307,23 @@ fn run_live(
                             // found nothing. Stacking a 4-check threshold
                             // on top made a dead channel linger for up to
                             // 8 checks.
+                            if debug {
+                                let best = hits
+                                    .iter()
+                                    .max_by(|a, b| a.confidence.total_cmp(&b.confidence));
+                                eprintln!(
+                                    "[DEBUG] lock check at packet {packets}: {} hit(s){}",
+                                    hits.len(),
+                                    best.map(|h| format!(
+                                        ", best {:?} conf {:.2} at {:.3} MHz rssi {:.1}",
+                                        h.signal_type,
+                                        h.confidence,
+                                        h.frequency_hz as f64 / 1e6,
+                                        h.rssi_dbm
+                                    ))
+                                    .unwrap_or_default()
+                                );
+                            }
                             if hits.is_empty() {
                                 consecutive_lost += 1;
                                 if consecutive_lost >= 2 {
