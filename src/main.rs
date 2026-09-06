@@ -447,6 +447,38 @@ struct AaroniaHttpArgs {
     /// Reference level (dBm).
     #[arg(long, default_value_t = -25.0)]
     ref_level: f64,
+    /// IQ wire format for the HTTP stream. f16 (default) halves the
+    /// network rate against f32 — 61.44 MSPS is ~246 MB/s in f16 versus
+    /// ~491 in f32, and the fatter stream is prone to stalling ("no
+    /// samples arrived within the read deadline"). Video tolerates the
+    /// precision loss: an 11-bit significand leaves ~66 dB of SNR
+    /// headroom, far beyond an analog FPV link.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = AaroniaStreamFormat::F16)]
+    stream_format: AaroniaStreamFormat,
+}
+
+/// IQ wire format for the RTSA HTTP stream (`--stream-format`).
+#[cfg(feature = "aaronia")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AaroniaStreamFormat {
+    /// IEEE half precision, 4 bytes per IQ pair.
+    F16,
+    /// Full single precision, 8 bytes per IQ pair.
+    F32,
+    /// 16-bit integers with a scale factor, 4 bytes per IQ pair.
+    Int16,
+}
+
+#[cfg(feature = "aaronia")]
+impl AaroniaStreamFormat {
+    fn to_driver(self) -> sdr_aaronia_rs::http_streaming::StreamFormat {
+        use sdr_aaronia_rs::http_streaming::StreamFormat;
+        match self {
+            AaroniaStreamFormat::F16 => StreamFormat::Float16,
+            AaroniaStreamFormat::F32 => StreamFormat::Float32,
+            AaroniaStreamFormat::Int16 => StreamFormat::Int16,
+        }
+    }
 }
 
 #[cfg(feature = "aaronia")]
@@ -880,7 +912,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
     let fm_deviation = args.live.fm_deviation;
 
     loop {
-        let (center_freq, target_mode) = match current_mode {
+        let center_freq = match current_mode {
             ViewerMode::SingleChannel => {
                 // Invariant: SingleChannel mode is only entered with a
                 // resolved frequency. Surface a clean error instead of
@@ -893,7 +925,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("{:.2} MHz", freq / 1e6));
                 println!("Single-channel mode: {} ({:.3} MHz)", ch_name, freq / 1e6);
-                (freq, ViewerMode::SingleChannel)
+                freq
             }
             ViewerMode::Scan => {
                 let hop_freqs = build_scan_hops(current_sample_rate, args.live.scan_bands);
@@ -1231,7 +1263,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                     }
                 };
                 explicit_freq = Some(found_freq);
-                (found_freq, ViewerMode::SingleChannel)
+                found_freq
             }
         };
 
@@ -1250,8 +1282,8 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             args.live.denoise,
             args.live.denoise_model.clone(),
             center_freq,
-            target_mode,
             args.live.standard,
+            None,
             args.live.debug,
             args.live.temporal_window,
         )? {
@@ -1367,19 +1399,46 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    // What the sweep classified the chosen signal as. Carried into the
+    // live decode so a concrete PAL/NTSC verdict from the scan is not
+    // re-derived (and possibly lost) by the single-channel re-detect:
+    // the sweep integrates several looks per hop, while the re-detect
+    // gets one centre and a fallback default — it measured NTSC on air
+    // and then decoded it as default-PAL geometry.
+    let mut scan_standard: Option<SignalType> = None;
     loop {
         let center_freq = match explicit_freq {
             Some(f) => f,
-            None => match hackrf_scan_for_channel(
-                &args,
+            None => match scan_band_for_channel(
+                Box::new(HackRfSource {
+                    lna_gain: args.lna_gain,
+                    vga_gain: args.vga_gain,
+                    amp_enable: args.amp,
+                    bias_tee: args.bias_tee,
+                }),
+                "HackRF",
                 sample_rate,
+                args.live.scan_bands,
+                // See the USRP scan's dwell for why 20 ms and why
+                // adaptive dwell stays off. HackRF retunes its
+                // synthesiser in well under a millisecond, and its
+                // 20 MSPS ceiling makes packets the longest of any
+                // backend at 3.3 ms — 20 ms lands the per-hop budget
+                // with margin.
+                Duration::from_millis(20),
                 &skipped_freqs,
                 &mut scan_integrator,
             )? {
                 // Used directly as this iteration's centre; in auto-scan
                 // mode the RunLiveResult handling below decides whether to
                 // re-scan, so we don't need to stash it in `explicit_freq`.
-                Some(f) => f,
+                Some((f, sig)) => {
+                    scan_standard = match sig {
+                        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => Some(sig),
+                        _ => None,
+                    };
+                    f
+                }
                 None => {
                     println!("No analog FPV signal found in the scan band. Retrying...");
                     continue;
@@ -1408,8 +1467,8 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             args.live.denoise,
             args.live.denoise_model.clone(),
             center_freq,
-            ViewerMode::SingleChannel,
             args.live.standard,
+            scan_standard,
             args.live.debug,
             args.live.temporal_window,
         )? {
@@ -1432,6 +1491,7 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             }
             RunLiveResult::TuneToChannel(freq) => {
                 explicit_freq = Some(freq);
+                scan_standard = None;
             }
             // HackRF doesn't surface hardware-overrun metadata, so this
             // variant isn't expected from its backend; handle it like a
@@ -1448,52 +1508,54 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Single-stage coarse scan for the HackRF: sweep the band, run the
-/// wideband detector on one chunk per hop, and snap the strongest
+/// Single-stage coarse scan shared by the hopping backends: sweep the
+/// planned tune centres, run the wideband detector on
+/// `DETECT_PACKETS_PER_HOP` chunks per hop, and snap the strongest
 /// (non-blacklisted) hit to the nearest FPV channel. Returns `None` if
 /// the band is empty.
 ///
 /// This is intentionally simpler than the USRP path's two-stage
 /// coarse-then-fine-tune sweep — the single coarse snap is enough to
-/// land on a channel; a HackRF fine-tune stage is a future addition.
-fn hackrf_scan_for_channel(
-    args: &HackrfArgs,
+/// land on a channel. The `source` decides what actually retunes:
+/// HackRF hops its synthesiser, while the Aaronia HTTP backend issues a
+/// capture-config update to the RTSA server per hop, whose latency is
+/// network-dependent — the per-hop packet budget doesn't care how long
+/// a retune took, only that fresh packets eventually arrive at the new
+/// centre.
+fn scan_band_for_channel(
+    source: Box<dyn SdrSource>,
+    backend_label: &str,
     sample_rate: f64,
+    scan_bands: ScanBands,
+    dwell: Duration,
     skipped_freqs: &std::collections::HashSet<u64>,
     scan_integrator: &mut SpectralIntegrator,
-) -> anyhow::Result<Option<f64>> {
-    use orecchiette_sdr_hackrf_rs::HackRfSource;
-
-    let hop_freqs = build_scan_hops(sample_rate, args.live.scan_bands);
+) -> anyhow::Result<Option<(f64, SignalType)>> {
+    let hop_freqs = build_scan_hops(sample_rate, scan_bands);
     println!(
-        "HackRF wideband scan [{}]: {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
-        args.live.scan_bands.label(),
-        args.live.scan_bands.channel_freqs_hz().len(),
+        "{backend_label} wideband scan [{}]: {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
+        scan_bands.label(),
+        scan_bands.channel_freqs_hz().len(),
         hop_freqs.len(),
         sample_rate * USABLE_SPAN_FRACTION / 1e6
     );
     let config = SourceConfig {
         sample_rate_hz: sample_rate,
         channels_hz: hop_freqs.clone(),
-        // See the USRP scan's dwell for why this is 20 ms and why
-        // adaptive dwell stays off. HackRF's 20 MSPS ceiling makes its
-        // packets the longest of any backend at 3.3 ms, so it needs the
-        // most room to land `DETECT_PACKETS_PER_HOP` of them.
-        dwell_min: Duration::from_millis(20),
-        dwell_max: Duration::from_millis(20),
+        // Caller-chosen: the dwell must cover the backend's real retune
+        // latency, or packets from one centre arrive tagged with the
+        // next hop's frequency and every detection is reported at the
+        // wrong absolute frequency. See the call sites.
+        dwell_min: dwell,
+        dwell_max: dwell,
         dwell_extension: Duration::ZERO,
     };
     let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
-    let source = Box::new(HackRfSource {
-        lna_gain: args.lna_gain,
-        vga_gain: args.vga_gain,
-        amp_enable: args.amp,
-        bias_tee: args.bias_tee,
-    });
     let handle = source.start(config, advice)?;
     let detector = AnalogFpvDetector::default();
 
-    let mut best_hit: Option<(f64, f32)> = None; // (raw freq Hz, rssi dBm)
+    // (raw freq Hz, rssi dBm, what the sweep classified it as)
+    let mut best_hit: Option<(f64, f32, SignalType)> = None;
     let mut seen = std::collections::HashSet::new();
     let mut last_freq = 0u64;
     let mut packets_this_hop = 0usize;
@@ -1529,9 +1591,9 @@ fn hackrf_scan_for_channel(
                     if skipped_freqs.contains(&(snapped.round() as u64)) {
                         continue;
                     }
-                    let better = best_hit.map(|(_, r)| res.rssi_dbm > r).unwrap_or(true);
+                    let better = best_hit.map(|(_, r, _)| res.rssi_dbm > r).unwrap_or(true);
                     if better {
-                        best_hit = Some((res.frequency_hz as f64, res.rssi_dbm));
+                        best_hit = Some((res.frequency_hz as f64, res.rssi_dbm, res.signal_type));
                         println!(
                             "  → {:?} at {:.3} MHz ({}), rssi {:.1} dBm",
                             res.signal_type,
@@ -1552,13 +1614,13 @@ fn hackrf_scan_for_channel(
                 if seen.len() >= hop_freqs.len() && packets_this_hop >= DETECT_PACKETS_PER_HOP {
                     (handle.stop)();
                     std::thread::sleep(Duration::from_millis(150));
-                    return Ok(best_hit.map(|(f, _)| snap_to_nearest_fpv_channel(f)));
+                    return Ok(best_hit.map(|(f, _, sig)| (snap_to_nearest_fpv_channel(f), sig)));
                 }
             }
             Err(_) => {
                 // SDR went quiet — return whatever we found this sweep.
                 (handle.stop)();
-                return Ok(best_hit.map(|(f, _)| snap_to_nearest_fpv_channel(f)));
+                return Ok(best_hit.map(|(f, _, sig)| (snap_to_nearest_fpv_channel(f), sig)));
             }
         }
     }
@@ -1582,6 +1644,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         Http {
             url: String,
             ref_level: f64,
+            stream_format: sdr_aaronia_rs::http_streaming::StreamFormat,
         },
         Sdk {
             serial: Option<String>,
@@ -1595,6 +1658,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 Backend::Http {
                     url: h.url,
                     ref_level: h.ref_level,
+                    stream_format: h.stream_format.to_driver(),
                 },
                 h.live,
                 label,
@@ -1611,12 +1675,16 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
     };
     let make_source = |center_freq: f64| -> Box<dyn SdrSource> {
         match &backend {
-            Backend::Http { url, ref_level } => Box::new(AaroniaSdrSource {
+            Backend::Http {
+                url,
+                ref_level,
+                stream_format,
+            } => Box::new(AaroniaSdrSource {
                 backend: AaroniaBackend::Http(url.clone()),
                 center_frequency_hz: center_freq,
                 reference_level_dbm: *ref_level,
                 block_size: 65_536,
-                stream_format: None,
+                stream_format: Some(*stream_format),
             }),
             Backend::Sdk { serial, ref_level } => Box::new(AaroniaSdrSource {
                 backend: AaroniaBackend::Sdk {
@@ -1641,24 +1709,66 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
     }
     let fm_deviation = live.fm_deviation;
     let auto_scan = live.channel.is_none();
-    let mut center_freq = live
+    let mut explicit_freq = live
         .channel
         .as_ref()
         .map(|ch| resolve_channel(ch))
-        .transpose()?
-        .unwrap_or(SCAN_CENTER_HZ);
-    let mut mode = if auto_scan {
-        ViewerMode::Scan
-    } else {
-        ViewerMode::SingleChannel
-    };
+        .transpose()?;
+
+    let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut scan_integrator = SpectralIntegrator::new(4);
+    // See the HackRF caller for why the sweep's PAL/NTSC verdict rides
+    // along instead of being re-derived at the tuned centre.
+    let mut scan_standard: Option<SignalType> = None;
 
     loop {
+        let center_freq = match explicit_freq {
+            Some(f) => f,
+            // The sweeping source is built at the band centre, but that
+            // choice is cosmetic — the hop list in the scan's
+            // SourceConfig retunes it before the first packet arrives.
+            None => match scan_band_for_channel(
+                make_source(SCAN_CENTER_HZ),
+                &label,
+                sample_rate,
+                live.scan_bands,
+                // An RTSA HTTP retune is a config PUT plus a stream
+                // settle, measured at 150-300 ms — an order of magnitude
+                // above a synthesiser hop. With a dwell below that, the
+                // sweep detects real signals in stale samples and
+                // reports them at hop_centre - 25.72 MHz (the first
+                // probe position): a VTX on A1 was reported as NTSC at
+                // 5915.28 MHz on every sweep, the viewer tuned to empty
+                // spectrum, lost it, and rescanned in a loop. 500 ms
+                // keeps every packet attributable to its claimed centre
+                // at the cost of a ~3 s sweep.
+                Duration::from_millis(500),
+                &skipped_freqs,
+                &mut scan_integrator,
+            )? {
+                Some((f, sig)) => {
+                    scan_standard = match sig {
+                        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => Some(sig),
+                        _ => None,
+                    };
+                    f
+                }
+                None => {
+                    println!("No analog FPV signal found in the scan band. Retrying...");
+                    continue;
+                }
+            },
+        };
+
+        let ch_name = get_fpv_channel_name(center_freq / 1e6)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{:.2} MHz", center_freq / 1e6));
         println!(
-            "{}: {:.2} MSPS at {:.3} MHz",
+            "{}: {} ({:.3} MHz) at {:.2} MSPS",
             label,
-            sample_rate / 1e6,
-            center_freq / 1e6
+            ch_name,
+            center_freq / 1e6,
+            sample_rate / 1e6
         );
         match run_live(
             make_source(center_freq),
@@ -1669,34 +1779,33 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             live.denoise,
             live.denoise_model.clone(),
             center_freq,
-            mode,
             live.standard,
+            scan_standard,
             live.debug,
             live.temporal_window,
         )? {
             RunLiveResult::UserExit => break,
-            // No hop list on this backend, so there's no blacklist for
-            // Skip to add to — it behaves like Next: re-scan the span.
             RunLiveResult::SignalLost
             | RunLiveResult::NextChannel
-            | RunLiveResult::SkipFrequency
             | RunLiveResult::TooManyOverruns => {
                 if auto_scan {
-                    println!("Re-scanning the capture span...");
-                    center_freq = SCAN_CENTER_HZ;
-                    mode = ViewerMode::Scan;
+                    explicit_freq = None;
                 } else {
                     println!("Signal lost (explicit-channel mode). Exiting.");
                     break;
                 }
             }
+            RunLiveResult::SkipFrequency => {
+                skipped_freqs.insert(center_freq.round() as u64);
+                if auto_scan {
+                    explicit_freq = None;
+                } else {
+                    break;
+                }
+            }
             RunLiveResult::TuneToChannel(freq) => {
-                let ch_name = get_fpv_channel_name(freq / 1e6)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{:.2} MHz", freq / 1e6));
-                println!("Tuning to channel {} ({:.3} MHz)...", ch_name, freq / 1e6);
-                center_freq = freq;
-                mode = ViewerMode::SingleChannel;
+                explicit_freq = Some(freq);
+                scan_standard = None;
             }
         }
     }
@@ -1729,8 +1838,8 @@ fn run_live(
     denoise: bool,
     denoise_model: String,
     center_freq: f64,
-    mode: ViewerMode,
     forced_standard: Option<SignalType>,
+    scan_hint: Option<SignalType>,
     debug: bool,
     temporal_window: usize,
 ) -> anyhow::Result<RunLiveResult> {
@@ -1770,113 +1879,38 @@ fn run_live(
         first_packet.samples.len()
     );
 
-    // Detect channels
-    let resolved_channels = match mode {
-        ViewerMode::SingleChannel => {
-            // Single channel at DC
-            let sig_type = if let Some(st) = forced_standard {
-                println!("Forced standard: {:?}", st);
-                st
-            } else {
-                println!("Auto-detecting video standard...");
-                let detector = AnalogFpvDetector::default();
-                let mut integ = SpectralIntegrator::new(4);
-                let (mut detected, mut confidence) = detector.detect_sync_pulses_integrated(
-                    &first_packet.samples,
-                    sample_rate_u32,
-                    actual_center as i64,
-                    &mut integ,
-                );
-                // Weak-signal patience: accumulate up to 3 more chunks
-                // before settling for an ambiguous or empty answer.
-                let mut attempts = 1;
-                while !matches!(
-                    detected,
-                    SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
-                ) && attempts < 4
-                {
-                    match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
-                        Ok(p) => {
-                            (detected, confidence) = detector.detect_sync_pulses_integrated(
-                                &p.samples,
-                                sample_rate_u32,
-                                actual_center as i64,
-                                &mut integ,
-                            );
-                        }
-                        Err(_) => break,
-                    }
-                    attempts += 1;
-                }
-                match detected {
-                    SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => {
-                        println!(
-                            "  → Detected: {:?} ({:.0}% confidence)",
-                            detected,
-                            confidence * 100.0
-                        );
-                        detected
-                    }
-                    SignalType::Unknown => {
-                        println!("  → No standard detected, defaulting to PAL");
-                        SignalType::AnalogVideoPal
-                    }
-                    // AnalogVideoUnknown (and any future variant):
-                    // definitely analog video, but the classifier
-                    // couldn't tell PAL from NTSC — resolve it in the
-                    // time domain rather than silently guessing.
-                    other => {
-                        // Band-limit first: the capture can be tens of
-                        // MHz wide, and demodulating the full span
-                        // buries the video baseband in out-of-band
-                        // noise, all but guaranteeing an inconclusive
-                        // measurement. Same probe filter Scan mode
-                        // uses, at 0 Hz offset (signal is at DC).
-                        let mut probe_ddc = StreamingDDC::new(
-                            0.0,
-                            sample_rate_u32,
-                            fm_deviation + LUMA_HEADROOM_HZ,
-                        );
-                        let probe_iq = probe_ddc.process(&first_packet.samples);
-                        concretize_standard(
-                            other,
-                            &probe_iq,
-                            sample_rate_u32,
-                            SignalType::AnalogVideoPal,
-                        )
-                    }
-                }
-            };
-            // Signal is at DC (SDR tuned directly); size the decode
-            // bandwidth so the worker's DDC cutoff lands at
-            // `fm_deviation + LUMA_HEADROOM_HZ`. Passing bare
-            // `fm_deviation * 2.0` made the worker's
-            // `.min(dev + headroom).max(dev)` collapse to exactly
-            // `fm_deviation`, so the documented sideband headroom was
-            // unreachable on the main live decode path.
-            vec![(sig_type, 0.0f32, (fm_deviation + LUMA_HEADROOM_HZ) * 2.0)]
-        }
-        ViewerMode::Scan => {
-            println!("Scanning for analog FPV signals...");
+    // Resolve the single channel at DC. (Wideband multi-signal scan
+    // lives in the pre-tune sweeps — scan_band_for_channel and the USRP
+    // scan loop — so by the time run_live starts, the centre is chosen.)
+    let resolved_channels = {
+        // Single channel at DC
+        let sig_type = if let Some(st) = forced_standard {
+            println!("Forced standard: {:?}", st);
+            st
+        } else {
+            println!("Auto-detecting video standard...");
             let detector = AnalogFpvDetector::default();
             let mut integ = SpectralIntegrator::new(4);
-            let mut results = detector.detect_from_iq_integrated(
+            let (mut detected, mut confidence) = detector.detect_sync_pulses_integrated(
                 &first_packet.samples,
-                actual_center as u64,
                 sample_rate_u32,
+                actual_center as i64,
                 &mut integ,
             );
-            // Weak-signal patience: integrate a few more chunks before
-            // declaring the band empty — several dB of sensitivity for
-            // a fraction of a second of startup latency.
+            // Weak-signal patience: accumulate up to 3 more chunks
+            // before settling for an ambiguous or empty answer.
             let mut attempts = 1;
-            while results.is_empty() && attempts < 4 {
+            while !matches!(
+                detected,
+                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
+            ) && attempts < 4
+            {
                 match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
                     Ok(p) => {
-                        results = detector.detect_from_iq_integrated(
+                        (detected, confidence) = detector.detect_sync_pulses_integrated(
                             &p.samples,
-                            actual_center as u64,
                             sample_rate_u32,
+                            actual_center as i64,
                             &mut integ,
                         );
                     }
@@ -1884,54 +1918,69 @@ fn run_live(
                 }
                 attempts += 1;
             }
-            if results.is_empty() {
-                println!("No analog FPV signals detected in the capture bandwidth.");
-                println!("Try specifying a channel with --channel A1");
-                std::process::exit(0);
-            }
-            let mut channels = Vec::new();
-            for res in &results {
-                let freq_offset = res.frequency_hz as f64 - actual_center;
-                let ch_name =
-                    get_fpv_channel_name(res.frequency_hz as f64 / 1e6).unwrap_or("Unknown");
-                println!(
-                    "  → Found {:?} at {:.3} MHz (channel {}, confidence {:.0}%, offset {:.2} MHz)",
-                    res.signal_type,
-                    res.frequency_hz as f64 / 1e6,
-                    ch_name,
-                    res.confidence * 100.0,
-                    freq_offset / 1e6
-                );
-                // Honor --standard here too (it used to apply only in
-                // single-channel mode and was silently ignored when
-                // scanning), and resolve standard-ambiguous tags in the
-                // time domain instead of letting the `is_pal` check
-                // downstream silently decode them as NTSC.
-                let sig_type = if let Some(st) = forced_standard {
-                    st
-                } else {
-                    match res.signal_type {
-                        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => res.signal_type,
-                        other => {
-                            let mut probe_ddc = StreamingDDC::new(
-                                freq_offset as f32,
-                                sample_rate_u32,
-                                fm_deviation + LUMA_HEADROOM_HZ,
-                            );
-                            let probe_iq = probe_ddc.process(&first_packet.samples);
-                            concretize_standard(
-                                other,
-                                &probe_iq,
-                                sample_rate_u32,
-                                SignalType::AnalogVideoPal,
-                            )
-                        }
+            match detected {
+                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => {
+                    println!(
+                        "  → Detected: {:?} ({:.0}% confidence)",
+                        detected,
+                        confidence * 100.0
+                    );
+                    detected
+                }
+                // Nothing found at the tuned centre. Prefer what the
+                // sweep measured over a blind default: the sweep
+                // integrates several looks and classified this very
+                // signal, while this re-detect gets one centre and a
+                // few chunks. It is a *fallback*, not an override — a
+                // confident re-detect above still wins, so a sweep
+                // verdict formed from mislabelled samples cannot
+                // outrank direct evidence at the tuned frequency.
+                SignalType::Unknown => match scan_hint {
+                    Some(hint) => {
+                        println!(
+                            "  → No standard detected here; using the sweep's verdict: {hint:?}"
+                        );
+                        hint
                     }
-                };
-                channels.push((sig_type, freq_offset as f32, res.bandwidth_hz as f32));
+                    None => {
+                        println!("  → No standard detected, defaulting to PAL");
+                        SignalType::AnalogVideoPal
+                    }
+                },
+                // AnalogVideoUnknown (and any future variant):
+                // definitely analog video, but the classifier
+                // couldn't tell PAL from NTSC — resolve it in the
+                // time domain rather than silently guessing.
+                other => {
+                    // Band-limit first: the capture can be tens of
+                    // MHz wide, and demodulating the full span
+                    // buries the video baseband in out-of-band
+                    // noise, all but guaranteeing an inconclusive
+                    // measurement. Same probe filter Scan mode
+                    // uses, at 0 Hz offset (signal is at DC).
+                    let mut probe_ddc =
+                        StreamingDDC::new(0.0, sample_rate_u32, fm_deviation + LUMA_HEADROOM_HZ);
+                    let probe_iq = probe_ddc.process(&first_packet.samples);
+                    // Same fallback order as above: time-domain
+                    // measurement first, then the sweep's verdict,
+                    // then PAL.
+                    concretize_standard(
+                        other,
+                        &probe_iq,
+                        sample_rate_u32,
+                        scan_hint.unwrap_or(SignalType::AnalogVideoPal),
+                    )
+                }
             }
-            channels
-        }
+        };
+        // Signal is at DC (SDR tuned directly); size the decode
+        // bandwidth so the worker's DDC cutoff lands at
+        // `fm_deviation + LUMA_HEADROOM_HZ`. Passing bare
+        // `fm_deviation * 2.0` made the worker's
+        // `.min(dev + headroom).max(dev)` collapse to exactly
+        // `fm_deviation`, so the documented sideband headroom was
+        // unreachable on the main live decode path.
+        vec![(sig_type, 0.0f32, (fm_deviation + LUMA_HEADROOM_HZ) * 2.0)]
     };
 
     let rf_center_freq = actual_center;
@@ -1960,6 +2009,24 @@ fn run_live(
         move |channel_txs, exit_flag| {
             let mut active_txs = channel_txs;
             let detector = AnalogFpvDetector::default();
+            // The lock check must integrate for the same reason the scan
+            // does: one 65,536-sample packet is ~1-3 ms of signal, below
+            // the length at which a single-shot detection finds anything
+            // at all. Checked single-shot, a healthy -49 dBm decode read
+            // confidence ~0 on every check, four "misses" accumulated in
+            // ~2 s, and the viewer declared signal lost, rescanned, and
+            // relocked in a loop — 44 times in four minutes on a live
+            // Aaronia link before crashing.
+            let mut lock_integ = SpectralIntegrator::new(4);
+            // Check cadence in wall time, not packets: a fixed 400-packet
+            // interval was 0.43 s at 61.44 MSPS but 1.3 s at HackRF's
+            // 20 MSPS, and the integrator's 4-batch memory plus the miss
+            // threshold multiply that into the time a dead channel holds
+            // the screen. ~2 Hz everywhere keeps loss detection near 3 s
+            // on every backend.
+            let check_every = ((sample_rate_u32 as f64 * 0.5) / first_samples.len().max(1) as f64)
+                .round()
+                .max(1.0) as usize;
 
             let mut packets = 0;
             let mut consecutive_lost = 0;
@@ -2000,12 +2067,33 @@ fn run_live(
                         }
 
                         // Check signal lock periodically (approx twice a second)
-                        if packets % 400 == 0 {
-                            let (_, conf) =
-                                detector.detect_sync_pulses(&packet.samples, sample_rate_u32);
-                            if conf < 0.15 {
+                        if packets % check_every == 0 {
+                            // The same sweep path that found the signal
+                            // decides whether it is still there — not
+                            // `detect_sync_pulses` on the raw full-rate
+                            // packet, which sees ~16 video lines per
+                            // 65,536-sample chunk at 61.44 MSPS and reads
+                            // near-zero confidence on a healthy decode.
+                            // Measured on a live -49 dBm Aaronia link:
+                            // single-shot flapped lock→lost 44 times in
+                            // four minutes, and integrating that same
+                            // full-rate check still flapped (13 cycles in
+                            // 30 s); the probe-based sweep detector holds.
+                            let hits = detector.detect_from_iq_integrated(
+                                &packet.samples,
+                                packet.center_frequency_hz as u64,
+                                sample_rate_u32,
+                                &mut lock_integ,
+                            );
+                            // Two misses, not four: the integrator holds
+                            // ~4 checks of history, so an empty result
+                            // already means several consecutive looks
+                            // found nothing. Stacking a 4-check threshold
+                            // on top made a dead channel linger for up to
+                            // 8 checks.
+                            if hits.is_empty() {
                                 consecutive_lost += 1;
-                                if consecutive_lost >= 4 {
+                                if consecutive_lost >= 2 {
                                     exit_flag.store(1, std::sync::atomic::Ordering::Relaxed);
                                     break;
                                 }
@@ -2029,7 +2117,7 @@ fn run_live(
                                 Err(mpsc::TrySendError::Disconnected(_)) => false, // UI closed
                             }
                         });
-                        if debug && packets % 400 == 0 && dropped_chunks > 0 {
+                        if debug && packets % check_every == 0 && dropped_chunks > 0 {
                             eprintln!(
                                 "[DEBUG] dropped {} IQ chunks so far (decode worker behind)",
                                 dropped_chunks

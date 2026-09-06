@@ -31,9 +31,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0"
 
 [features]
-default = []
-# Aaronia Spectran V6 backend (`aaronia` subcommand). Off by default so
-# a fresh clone / CI runner builds without the Aaronia native SDK.
+default = ["aaronia"]
+# Aaronia Spectran V6 backend (`aaronia` subcommand). On by default: the
+# AARTSAAPI SDK is resolved at *runtime*, not link time (the binary
+# carries no dynamic reference to it), so building needs no SDK — and
+# the HTTP backend never needs it at all, only `aaronia sdk` does.
+# `--no-default-features` restores the old lean build.
 aaronia = ["dep:sdr-aaronia-rs"]
 # Neural temporal denoiser (`--denoise`, toggled live with `D`). Off by
 # default: it pulls in ONNX Runtime, and the denoiser is a win under

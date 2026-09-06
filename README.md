@@ -13,17 +13,19 @@ this repository is the application around it.
 
 ## Features
 
-- **Multiple SDR backends.** Ettus USRP, HackRF One, and — behind the
-  `aaronia` feature — the Aaronia Spectran V6.
+- **Multiple SDR backends.** Ettus USRP, HackRF One, and the Aaronia
+  Spectran V6 — over the RTSA HTTP interface or the native SDK.
 - **Offline playback.** SigMF datasets (`.sigmf-meta` and `.sigmf-data`)
   and raw interleaved cf32 I/Q files.
-- **Automatic band sweep.** Scans the 5.8 GHz FPV band
+- **Automatic band sweep on every backend.** Scans the 5.8 GHz FPV band
   (5,645–5,945 MHz), locks onto active signals, and displays them.
   `--scan-bands all` extends this to every band in the channel table,
   1.24–5.945 GHz. Tune centres are planned against the real channel list
   rather than stepped uniformly, so the sweep spends tunes only where
   channels are: 6 tunes for the 40 channels of the 5.8 GHz band at
-  61.44 MSPS, or 45 for all 128 channels.
+  61.44 MSPS, or 45 for all 128 channels. The sweep's PAL/NTSC verdict
+  carries into the decoder, so the standard measured on air is the one
+  the picture is decoded with.
 - **Live monochrome rendering** in a desktop window.
 - **Weak-signal decoding**, enabled by default:
   - Matched-filter sync acquisition, a line-locked clock for straight
@@ -48,9 +50,9 @@ this repository is the application around it.
 
 - **Linux** — all SDRs and offline playback. Prebuilt release binaries
   target aarch64 (Raspberry Pi 5 class).
-- **macOS** — HackRF, USRP, and offline playback. Prebuilt release DMGs
-  target Apple Silicon. Aaronia's native drivers are unavailable on
-  macOS.
+- **macOS** — HackRF, USRP, offline playback, and Aaronia over the RTSA
+  HTTP interface. Prebuilt release DMGs target Apple Silicon. Only the
+  Aaronia native-SDK path (`aaronia sdk`) is unavailable on macOS.
 - **Windows** — builds from source with UHD installed. No prebuilt
   binaries, as CI has no unattended UHD installation for Windows.
 
@@ -65,17 +67,20 @@ cd fpv-viewer-rs
 cargo build --release
 ```
 
-Two optional features are available:
+The Aaronia backend is included by default. The AARTSAAPI SDK is
+resolved at runtime rather than link time, so building requires nothing
+extra — and the RTSA HTTP backend needs no SDK at all; only
+`aaronia sdk` does, on the machine running it. `--no-default-features`
+restores the lean build without the backend.
+
+One optional feature:
 
 ```bash
-cargo build --release --features aaronia      # Aaronia Spectran V6
 cargo build --release --features neural-vsr   # neural denoiser
 ```
 
-`aaronia` is disabled by default because it links against the native
-AARTSAAPI SDK, which requires RTSA-Suite PRO or the AARTSAAPI SDK to be
-installed. `neural-vsr` is disabled by default because it introduces a
-dependency on ONNX Runtime.
+`neural-vsr` is disabled by default because it introduces a dependency
+on ONNX Runtime.
 
 ## Usage
 
@@ -101,7 +106,13 @@ cargo run --release -- file /path/to/capture.sigmf-data
 Stream from an Aaronia Spectran V6:
 
 ```bash
-cargo run --release --features aaronia -- aaronia sdk --channel E4
+cargo run --release -- aaronia sdk --channel E4
+```
+
+Sweep the band from an RTSA HTTP server instead (no SDK needed):
+
+```bash
+cargo run --release -- aaronia http http://atc.local:54664
 ```
 
 Replay a file with the neural denoiser enabled from the start:
@@ -122,8 +133,8 @@ Commands:
   aaronia  Live capture from an Aaronia Spectran V6
 ```
 
-The `aaronia` subcommand is present only in builds made with
-`--features aaronia`.
+The `aaronia` subcommand is present in default builds; it is absent
+only from `--no-default-features` builds.
 
 Frequently used options, with the full set available from `--help` on any
 subcommand:
@@ -131,6 +142,7 @@ subcommand:
 | Option | Description |
 | :--- | :--- |
 | `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` adds the 5.3 GHz L/D bands and 1.2 GHz, at proportionally more tunes per sweep. |
+| `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant. Default 0.75 µs; `0` disables. |
 | `--denoise` | Start with the neural denoiser enabled (requires `--features neural-vsr`). |
