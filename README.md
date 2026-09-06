@@ -26,6 +26,12 @@ this repository is the application around it.
   61.44 MSPS, or 45 for all 128 channels. The sweep's PAL/NTSC verdict
   carries into the decoder, so the standard measured on air is the one
   the picture is decoded with.
+- **Band panel.** While sweeping, a window shows what the detector is
+  looking at: an energy bar per 5 MHz probe across the band, the planned
+  tune windows and how long ago each was visited, every channel in the
+  table at its true frequency, and each hit labelled with its channel,
+  standard, and localized carrier. Once locked, the same data sits as a
+  strip under the picture; `B` cycles strip, full panel, and off.
 - **Live monochrome rendering** in a desktop window.
 - **Weak-signal decoding**, enabled by default:
   - Matched-filter sync acquisition, a line-locked clock for straight
@@ -157,6 +163,7 @@ subcommand:
 | **`N`** | Next channel. Abandons the current lock and resumes sweeping. |
 | **`S`** | Skip and blacklist the current frequency. |
 | **`D`** | Toggle the neural denoiser. |
+| **`B`** | Cycle the band panel: strip, full, off. Closing the scan window, or `Q` in it, quits. |
 | **`C`** then band and channel | Direct tune. For R8, press `C`, then `R`, then `8`. |
 | **`Esc`** or **`Q`** | Quit. |
 

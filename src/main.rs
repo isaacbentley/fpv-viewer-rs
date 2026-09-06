@@ -1,3 +1,6 @@
+mod band_scan;
+
+use band_scan::{BandScan, PanelMode, ScanWindow};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use minifb::{Key, Window, WindowOptions};
 use num_complex::Complex;
@@ -6,7 +9,7 @@ use orecchiette_fpv_drone_analog_rs::demod::{
     DEFAULT_DEEMPHASIS_TAU_S, Deemphasis, PllFmDemod, fm_demod, fm_demod_into,
 };
 use orecchiette_fpv_drone_analog_rs::detector::{
-    AnalogFpvDetector, FpvDetector, SpectralIntegrator,
+    AnalogFpvDetector, FpvDetector, ProbeEnergy, SpectralIntegrator,
 };
 use orecchiette_fpv_drone_analog_rs::levels::estimate_cnr_db;
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
@@ -256,6 +259,26 @@ impl ScanBands {
             .filter(|f| match self {
                 ScanBands::Band58 => (5_645e6..=5_945e6).contains(f),
                 ScanBands::All => true,
+            })
+            .collect()
+    }
+
+    /// The same channels with their names and band letters, for the
+    /// band panel.
+    fn channels(self) -> Vec<band_scan::Channel> {
+        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
+            .into_iter()
+            .filter(|c| match self {
+                ScanBands::Band58 => (5_645e6..=5_945e6).contains(&(c.frequency_hz as f64)),
+                ScanBands::All => true,
+            })
+            .map(|c| {
+                let band = band_scan::band_letter(c.band);
+                band_scan::Channel {
+                    name: format!("{}{}", band, c.channel),
+                    band,
+                    hz: c.frequency_hz as f64,
+                }
             })
             .collect()
     }
@@ -763,6 +786,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         rf_center_freq,
         args.debug,
         args.temporal_window,
+        None,
         exit_reason,
         tune_freq,
         move |channel_txs, _exit_flag| {
@@ -897,11 +921,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
     // Cleared only when the user exits entirely.
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    // Cross-sweep spectral integration: persists across rescans so a
-    // weak signal accumulates sensitivity sweep over sweep (~+5 dB
-    // after 4 visits to the same hop). Buckets self-reset if the
-    // sample rate steps down.
-    let mut scan_integrator = SpectralIntegrator::new(4);
+    let mut sweep = SweepState::new(args.live.scan_bands);
 
     let mut explicit_freq = if let Some(ref ch) = args.live.channel {
         Some(resolve_channel(ch)?)
@@ -929,6 +949,14 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             }
             ViewerMode::Scan => {
                 let hop_freqs = build_scan_hops(current_sample_rate, args.live.scan_bands);
+                sweep.band.set_plan(
+                    hop_freqs.clone(),
+                    current_sample_rate * USABLE_SPAN_FRACTION,
+                );
+                sweep.band.set_skipped(&skipped_freqs);
+                if sweep.ui.is_none() {
+                    sweep.ui = Some(ScanWindow::open(sweep.band.full_height())?);
+                }
                 println!(
                     "Wideband scan requested [{}]. {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
                     args.live.scan_bands.label(),
@@ -977,8 +1005,10 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 let mut last_processed_freq = 0;
                 let mut packets_this_hop = 0usize;
                 let multi_hop = hop_freqs.len() > 1;
+                let mut probes: Vec<ProbeEnergy> = Vec::new();
 
-                let found_freq = 'scan_loop: loop {
+                // `None` when the operator closed the scan window.
+                let found_freq: Option<f64> = 'scan_loop: loop {
                     let packet = match handle.receiver.recv_timeout(Duration::from_millis(1000)) {
                         Ok(packet) => packet,
                         // `recv_timeout` returns Err immediately when the
@@ -998,6 +1028,15 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                     };
                     {
                         let center = packet.center_frequency_hz as u64;
+
+                        // Pump the scan window on every packet, drained
+                        // ones included, so it stays responsive.
+                        if let Some(ui) = sweep.ui.as_mut() {
+                            if !ui.update(&sweep.band) {
+                                (handle.stop)();
+                                break 'scan_loop None;
+                            }
+                        }
 
                         // Feed the sweep `DETECT_PACKETS_PER_HOP` packets
                         // per hop, then drain the rest of the dwell so the
@@ -1028,11 +1067,20 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
 
                         seen_freqs.insert(center);
 
-                        let results = detector.detect_from_iq_integrated(
+                        let results = detector.detect_from_iq_integrated_with_probes(
                             &packet.samples,
                             center,
                             current_sample_rate as u32,
-                            &mut scan_integrator,
+                            &mut sweep.integrator,
+                            &mut probes,
+                        );
+                        // With one tune there is no retune to mark a new
+                        // look, so every packet replaces the last.
+                        sweep.band.record_hop(
+                            center as f64,
+                            packets_this_hop == 1 || !multi_hop,
+                            &probes,
+                            &results,
                         );
                         for res in results {
                             let ch_name = get_fpv_channel_name(res.frequency_hz as f64 / 1e6)
@@ -1094,6 +1142,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         if seen_freqs.len() >= hop_freqs.len()
                             && packets_this_hop >= DETECT_PACKETS_PER_HOP
                         {
+                            sweep.band.end_sweep();
                             if let Some((freq, _rssi, _sig_type)) = best_hit {
                                 // Found something, break out of the infinite scan loop
                                 (handle.stop)();
@@ -1112,7 +1161,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                         snapped_freq / 1e6,
                                         freq / 1e6
                                     );
-                                    break 'scan_loop snapped_freq;
+                                    break 'scan_loop Some(snapped_freq);
                                 }
 
                                 println!(
@@ -1219,7 +1268,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                                             .unwrap_or("Unknown"),
                                                         best_freq / 1e6
                                                     );
-                                                    break 'scan_loop best_freq;
+                                                    break 'scan_loop Some(best_freq);
                                                 }
                                             }
 
@@ -1234,7 +1283,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                                 ch_name,
                                                 snapped_freq / 1e6
                                             );
-                                            break 'scan_loop snapped_freq;
+                                            break 'scan_loop Some(snapped_freq);
                                         }
                                     }
                                 }
@@ -1262,6 +1311,10 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         }
                     }
                 };
+                let Some(found_freq) = found_freq else {
+                    // The operator closed the scan window: done.
+                    break;
+                };
                 explicit_freq = Some(found_freq);
                 found_freq
             }
@@ -1273,6 +1326,8 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             antenna: args.antenna.clone(),
         });
 
+        // The picture window takes over from the scan window.
+        sweep.ui = None;
         match run_live(
             source,
             current_sample_rate,
@@ -1286,6 +1341,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
             None,
             args.live.debug,
             args.live.temporal_window,
+            Some(&sweep.band),
         )? {
             RunLiveResult::UserExit => {
                 break;
@@ -1393,7 +1449,7 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
     let auto_scan = args.live.channel.is_none();
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Cross-sweep spectral integration (see the USRP path's note).
-    let mut scan_integrator = SpectralIntegrator::new(4);
+    let mut sweep = SweepState::new(args.live.scan_bands);
     let mut explicit_freq = match args.live.channel {
         Some(ref ch) => Some(resolve_channel(ch)?),
         None => None,
@@ -1427,22 +1483,23 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
                 // with margin.
                 Duration::from_millis(20),
                 &skipped_freqs,
-                &mut scan_integrator,
+                &mut sweep,
             )? {
                 // Used directly as this iteration's centre; in auto-scan
                 // mode the RunLiveResult handling below decides whether to
                 // re-scan, so we don't need to stash it in `explicit_freq`.
-                Some((f, sig)) => {
+                ScanOutcome::Found(f, sig) => {
                     scan_standard = match sig {
                         SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => Some(sig),
                         _ => None,
                     };
                     f
                 }
-                None => {
+                ScanOutcome::Empty => {
                     println!("No analog FPV signal found in the scan band. Retrying...");
                     continue;
                 }
+                ScanOutcome::Quit => break,
             },
         };
 
@@ -1458,6 +1515,8 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             bias_tee: args.bias_tee,
         });
 
+        // The picture window takes over from the scan window.
+        sweep.ui = None;
         match run_live(
             source,
             sample_rate,
@@ -1471,6 +1530,7 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             scan_standard,
             args.live.debug,
             args.live.temporal_window,
+            Some(&sweep.band),
         )? {
             RunLiveResult::UserExit => break,
             RunLiveResult::SignalLost | RunLiveResult::NextChannel => {
@@ -1508,6 +1568,37 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a backend keeps between sweeps: the cross-sweep integrator (a
+/// weak signal accumulates sensitivity sweep over sweep, ~+5 dB after
+/// four visits to a hop; buckets self-reset if the sample rate steps
+/// down), the band panel's model, and the scan window, which is open
+/// only while sweeping.
+struct SweepState {
+    integrator: SpectralIntegrator,
+    band: BandScan,
+    ui: Option<ScanWindow>,
+}
+
+impl SweepState {
+    fn new(bands: ScanBands) -> Self {
+        SweepState {
+            integrator: SpectralIntegrator::new(4),
+            band: BandScan::new(bands.channels()),
+            ui: None,
+        }
+    }
+}
+
+/// What a coarse sweep came back with.
+enum ScanOutcome {
+    /// A channel to tune to, and what the sweep classified it as.
+    Found(f64, SignalType),
+    /// The band was quiet this pass.
+    Empty,
+    /// The operator closed the scan window or pressed `Q`.
+    Quit,
+}
+
 /// Single-stage coarse scan shared by the hopping backends: sweep the
 /// planned tune centres, run the wideband detector on
 /// `DETECT_PACKETS_PER_HOP` chunks per hop, and snap the strongest
@@ -1529,9 +1620,16 @@ fn scan_band_for_channel(
     scan_bands: ScanBands,
     dwell: Duration,
     skipped_freqs: &std::collections::HashSet<u64>,
-    scan_integrator: &mut SpectralIntegrator,
-) -> anyhow::Result<Option<(f64, SignalType)>> {
+    sweep: &mut SweepState,
+) -> anyhow::Result<ScanOutcome> {
     let hop_freqs = build_scan_hops(sample_rate, scan_bands);
+    sweep
+        .band
+        .set_plan(hop_freqs.clone(), sample_rate * USABLE_SPAN_FRACTION);
+    sweep.band.set_skipped(skipped_freqs);
+    if sweep.ui.is_none() {
+        sweep.ui = Some(ScanWindow::open(sweep.band.full_height())?);
+    }
     println!(
         "{backend_label} wideband scan [{}]: {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
         scan_bands.label(),
@@ -1559,11 +1657,24 @@ fn scan_band_for_channel(
     let mut seen = std::collections::HashSet::new();
     let mut last_freq = 0u64;
     let mut packets_this_hop = 0usize;
+    let mut probes: Vec<ProbeEnergy> = Vec::new();
+    let outcome = |hit: Option<(f64, f32, SignalType)>| match hit {
+        Some((f, _, sig)) => ScanOutcome::Found(snap_to_nearest_fpv_channel(f), sig),
+        None => ScanOutcome::Empty,
+    };
 
     loop {
         match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
             Ok(packet) => {
                 let center = packet.center_frequency_hz as u64;
+                // Pump the scan window on every packet, drained ones
+                // included, so it stays responsive through a long dwell.
+                if let Some(ui) = sweep.ui.as_mut() {
+                    if !ui.update(&sweep.band) {
+                        (handle.stop)();
+                        return Ok(ScanOutcome::Quit);
+                    }
+                }
                 // `DETECT_PACKETS_PER_HOP` detection passes per hop, then
                 // drain the rest of the dwell. Unlike the USRP loop this
                 // one needs no single-tune escape: it *returns* once the
@@ -1581,12 +1692,17 @@ fn scan_band_for_channel(
                 packets_this_hop += 1;
                 seen.insert(center);
 
-                for res in detector.detect_from_iq_integrated(
+                let results = detector.detect_from_iq_integrated_with_probes(
                     &packet.samples,
                     center,
                     sample_rate as u32,
-                    scan_integrator,
-                ) {
+                    &mut sweep.integrator,
+                    &mut probes,
+                );
+                sweep
+                    .band
+                    .record_hop(center as f64, packets_this_hop == 1, &probes, &results);
+                for res in results {
                     let snapped = snap_to_nearest_fpv_channel(res.frequency_hz as f64);
                     if skipped_freqs.contains(&(snapped.round() as u64)) {
                         continue;
@@ -1612,15 +1728,16 @@ fn scan_band_for_channel(
                 // length at which the sweep finds anything — so that
                 // channel could never be reported.
                 if seen.len() >= hop_freqs.len() && packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                    sweep.band.end_sweep();
                     (handle.stop)();
                     std::thread::sleep(Duration::from_millis(150));
-                    return Ok(best_hit.map(|(f, _, sig)| (snap_to_nearest_fpv_channel(f), sig)));
+                    return Ok(outcome(best_hit));
                 }
             }
             Err(_) => {
                 // SDR went quiet — return whatever we found this sweep.
                 (handle.stop)();
-                return Ok(best_hit.map(|(f, _, sig)| (snap_to_nearest_fpv_channel(f), sig)));
+                return Ok(outcome(best_hit));
             }
         }
     }
@@ -1716,7 +1833,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         .transpose()?;
 
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut scan_integrator = SpectralIntegrator::new(4);
+    let mut sweep = SweepState::new(live.scan_bands);
     // See the HackRF caller for why the sweep's PAL/NTSC verdict rides
     // along instead of being re-derived at the tuned centre.
     let mut scan_standard: Option<SignalType> = None;
@@ -1744,19 +1861,20 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 // at the cost of a ~3 s sweep.
                 Duration::from_millis(500),
                 &skipped_freqs,
-                &mut scan_integrator,
+                &mut sweep,
             )? {
-                Some((f, sig)) => {
+                ScanOutcome::Found(f, sig) => {
                     scan_standard = match sig {
                         SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => Some(sig),
                         _ => None,
                     };
                     f
                 }
-                None => {
+                ScanOutcome::Empty => {
                     println!("No analog FPV signal found in the scan band. Retrying...");
                     continue;
                 }
+                ScanOutcome::Quit => break,
             },
         };
 
@@ -1770,6 +1888,8 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             center_freq / 1e6,
             sample_rate / 1e6
         );
+        // The picture window takes over from the scan window.
+        sweep.ui = None;
         match run_live(
             make_source(center_freq),
             sample_rate,
@@ -1783,6 +1903,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             scan_standard,
             live.debug,
             live.temporal_window,
+            Some(&sweep.band),
         )? {
             RunLiveResult::UserExit => break,
             RunLiveResult::SignalLost
@@ -1842,6 +1963,7 @@ fn run_live(
     scan_hint: Option<SignalType>,
     debug: bool,
     temporal_window: usize,
+    band: Option<&BandScan>,
 ) -> anyhow::Result<RunLiveResult> {
     let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
     let config = SourceConfig {
@@ -2004,6 +2126,7 @@ fn run_live(
         rf_center_freq,
         debug,
         temporal_window,
+        band.cloned(),
         exit_reason.clone(),
         tune_freq,
         move |channel_txs, exit_flag| {
@@ -2159,6 +2282,7 @@ fn run_viewer_pipeline<F>(
     rf_center_freq: f64,
     debug: bool,
     temporal_window: usize,
+    band: Option<BandScan>,
     exit_reason: Arc<std::sync::atomic::AtomicU8>,
     tune_freq: Arc<std::sync::atomic::AtomicU64>,
     reader_fn: F,
@@ -2495,6 +2619,15 @@ where
     // Main UI Loop
     let mut ch_input = ChannelInputState::Idle;
     let mut denoise_toggle_requested = false;
+    // The band panel rides under the picture, marking the frequency this
+    // window is locked to. `B` cycles its size; the choice is process-wide
+    // so it survives a relock.
+    let mut band = band;
+    if let Some(b) = band.as_mut() {
+        b.set_lock(Some(rf_center_freq));
+    }
+    let mut panel_mode = PanelMode::load();
+    let mut panel_toggle_requested = false;
     let mut ch_input_flash_until: Option<std::time::Instant> = None;
     let mut ch_input_flash_msg = String::new();
     while !windows.is_empty() {
@@ -2548,6 +2681,12 @@ where
             // per-window loop.
             if idle && pressed.contains(&Key::D) {
                 denoise_toggle_requested = true;
+            }
+
+            // B → cycle the band panel (strip, full, off). Recorded like
+            // D and applied once after the per-window loop.
+            if idle && band.is_some() && pressed.contains(&Key::B) {
+                panel_toggle_requested = true;
             }
 
             // N → find next channel (resume scanning without blacklisting)
@@ -2650,15 +2789,32 @@ where
                         0xff000000,
                     );
 
-                    // Keybinding hints at the bottom
-                    let hint_y = (*height).saturating_sub(20);
+                    // Band panel over the bottom of the picture; the key
+                    // hints sit just above it.
+                    let panel_h = band
+                        .as_ref()
+                        .map(|b| b.overlay_height(panel_mode, *height))
+                        .unwrap_or(0);
+                    if let Some(b) = band.as_ref() {
+                        b.draw_overlay(&mut display_buffers[i], *width, *height, panel_mode);
+                    }
+
+                    // Keybinding hints at the bottom of the picture, just
+                    // above the band panel when one is shown. `B` is only
+                    // offered when there is a panel to cycle.
+                    let hint_y = (*height).saturating_sub(20 + panel_h);
+                    let hint = if band.is_some() {
+                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise  B:Band"
+                    } else {
+                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise"
+                    };
                     draw_text_with_bg(
                         &mut display_buffers[i],
                         *width,
                         *height,
                         10,
                         hint_y,
-                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise",
+                        hint,
                         0xffaaaaaa,
                         0x80000000,
                     );
@@ -2740,6 +2896,13 @@ where
                     "Denoiser unavailable: rebuild with `--features neural-vsr` to enable it."
                 );
             }
+        }
+
+        if panel_toggle_requested {
+            panel_toggle_requested = false;
+            panel_mode = panel_mode.next();
+            panel_mode.store();
+            println!("Band panel: {}", panel_mode.label());
         }
 
         thread::sleep(Duration::from_millis(5));
