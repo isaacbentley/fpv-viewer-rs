@@ -630,7 +630,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -2638,8 +2638,8 @@ dependencies = [
 
 [[package]]
 name = "sdr-aaronia-rs"
-version = "0.6.2"
-source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.6.2#bd061f5d9a4cb9c4238b84775e899e05b2dc68e3"
+version = "0.7.6"
+source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.7.6#71e7252ac3acb1b3c0b12ca7ceeacb913e73d555"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -2919,7 +2919,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
