@@ -164,7 +164,7 @@ subcommand:
 | `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The HTTP default of 61.44 MSPS is about 246 MB/s in `f16`, more than gigabit Ethernet carries, and the RTSA server discards data once its outbound buffer passes 8 MB. Measured over Wi-Fi, even 15.36 MSPS (61 MB/s) fell a few percent short and dropped most packets; a wired link is the fix, and `--sample-rate 15360000` is the widest span worth trying on a marginal one. This is a network limit only: decoding decimates to a fixed working rate, so a wide capture costs no more CPU than a narrow one. |
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
-| `--deemphasis-tau <s>` | Video deemphasis time constant. Default 0.75 µs; `0` disables. |
+| `--deemphasis-tau <s>` | Video deemphasis time constant, in seconds. Default 0.15 µs (`0.00000015`); `0` disables. It is a single pole, so its attenuation grows without limit: 0.15 µs costs 2.7 dB at 1 MHz and 11.1 dB at 4.2 MHz, where 0.75 µs costs 13.6 and 24.8 dB. NTSC luma runs to about 4.2 MHz, so a long time constant softens the picture badly — measured against a live transmitter, detail fell from 38.6 with it off to 1.6 at 0.75 µs. Lengthen it if your transmitter's pre-emphasis is strong and the picture looks noisy. |
 | `--denoise` | Start with the neural denoiser enabled (requires `--features neural-vsr`). |
 | `--denoise-model <path>` | ONNX model to load. Defaults to `models/temporal_denoiser.onnx`. |
 | `--temporal-window <n>` | Fields retained for temporal denoising and dropout repair. Default 5, giving roughly +7 dB on static scenes at about 83 ms latency; `1` disables temporal processing. |
@@ -201,9 +201,8 @@ not, the fault lies in the capture.
 
 The reference files carry no transmitter pre-emphasis, so
 `--deemphasis-tau 0` reproduces the generated waveform exactly and
-appears sharper. The default of 0.75 µs also decodes them correctly but
-with softer edges, as there is no pre-emphasis to invert. Against a real
-transmitter the default is correct.
+appears sharpest. The default of 0.15 µs also decodes them correctly,
+slightly softer, as there is no pre-emphasis to invert.
 
 ## License
 

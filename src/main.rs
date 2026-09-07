@@ -59,8 +59,11 @@ struct FileArgs {
     fm_deviation: Option<f32>,
     /// Video deemphasis time constant in seconds, undoing the VTX's
     /// pre-emphasis (which otherwise leaves high-frequency noise
-    /// emphasized in the picture). 0 disables. Default 0.75 µs is
-    /// common for analog FPV VTXs.
+    /// emphasized in the picture). 0 disables. Default 0.15 µs, from
+    /// the analog crate's [`DEFAULT_DEEMPHASIS_TAU_S`], whose docs
+    /// carry what each value costs the picture. Lengthen it if your
+    /// transmitter's pre-emphasis is strong and the result looks
+    /// noisy.
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
     /// FM demodulator. 'auto' (default) picks the PLL at or above
@@ -118,8 +121,11 @@ struct LiveArgs {
     fm_deviation: f32,
     /// Video deemphasis time constant in seconds, undoing the VTX's
     /// pre-emphasis (which otherwise leaves high-frequency noise
-    /// emphasized in the picture). 0 disables. Default 0.75 µs is
-    /// common for analog FPV VTXs.
+    /// emphasized in the picture). 0 disables. Default 0.15 µs, from
+    /// the analog crate's [`DEFAULT_DEEMPHASIS_TAU_S`], whose docs
+    /// carry what each value costs the picture. Lengthen it if your
+    /// transmitter's pre-emphasis is strong and the result looks
+    /// noisy.
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
     /// FM demodulator. 'auto' (default) picks the PLL at or above
