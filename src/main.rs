@@ -64,9 +64,12 @@ struct FileArgs {
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
     /// FM demodulator. 'auto' (default) picks the PLL at or above
-    /// ~25 MSPS and the discriminator below it, matching where each is
-    /// actually measured to win. Run with `--help` (long form, not
-    /// `-h`) to see per-value details.
+    /// ~25 MSPS of *decode* rate and the discriminator below it,
+    /// matching where each is actually measured to win. Decoding runs
+    /// below the capture rate on a wide capture, so 'auto' normally
+    /// resolves to the discriminator; 'pll' holds the decode rate up
+    /// instead, at a CPU cost. Run with `--help` (long form, not `-h`)
+    /// to see per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
     /// Start with the neural temporal denoiser enabled (requires a
@@ -120,9 +123,12 @@ struct LiveArgs {
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
     /// FM demodulator. 'auto' (default) picks the PLL at or above
-    /// ~25 MSPS and the discriminator below it, matching where each is
-    /// actually measured to win. Run with `--help` (long form, not
-    /// `-h`) to see per-value details.
+    /// ~25 MSPS of *decode* rate and the discriminator below it,
+    /// matching where each is actually measured to win. Decoding runs
+    /// below the capture rate on a wide capture, so 'auto' normally
+    /// resolves to the discriminator; 'pll' holds the decode rate up
+    /// instead, at a CPU cost. Run with `--help` (long form, not `-h`)
+    /// to see per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
     /// Start with the neural temporal denoiser enabled (requires a
@@ -148,19 +154,27 @@ struct LiveArgs {
     temporal_window: usize,
 }
 
-/// Sample rate at/above which `DemodKind::Auto` selects the PLL, and
+/// Decode rate at/above which `DemodKind::Auto` selects the PLL, and
 /// below which it selects the discriminator — the measured ~25 MSPS
 /// crossover documented on [`DemodKind::Pll`] and in the library's
 /// `weak_signal_sweep` example (below it the loop can't track a
 /// typical ~5 MHz FPV deviation).
+///
+/// This is compared against the *decode* rate, which since the worker
+/// started decimating (see [`decode_decimation`]) is normally well
+/// below the capture rate — so on a wide live capture `Auto` now
+/// resolves to the discriminator, which is both the cheaper and the
+/// better choice down there. `--demod pll` caps the decimation instead
+/// of being silently overruled.
 const PLL_AUTO_MIN_SAMPLE_RATE_HZ: u32 = 25_000_000;
 
 /// Which FM demodulator the decode worker runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum DemodKind {
     /// Automatically choose the discriminator or the PLL based on the
-    /// decode sample rate (see `PLL_AUTO_MIN_SAMPLE_RATE_HZ`) — the
-    /// default.
+    /// decode rate after decimation (see
+    /// `PLL_AUTO_MIN_SAMPLE_RATE_HZ` and [`decode_decimation`]) — the
+    /// default. On a wide capture that resolves to the discriminator.
     Auto,
     /// Per-sample quadrature discriminator (`fm_demod`) — robust at
     /// every sample rate.
@@ -170,17 +184,26 @@ enum DemodKind {
     /// demod SNR and ~one sigma-step deeper sync survival at ~25 MSPS
     /// decode rates and up, but UNUSABLE below ~20 MSPS (the loop
     /// can't track a 5 MHz deviation there).
+    ///
+    /// Because of that floor, asking for it stops the worker decimating
+    /// past 25 MSPS, and says so when that costs it a stride. That
+    /// costs the CPU the decimation would have saved, so on a
+    /// 61.44 MSPS capture it may not keep up. On a capture already
+    /// below 25 MSPS there is nothing to hold back and nothing to
+    /// warn about — the loop simply runs where it was asked to, which
+    /// below ~20 MSPS is where it cannot track.
     Pll,
 }
 
 impl DemodKind {
-    /// Resolve to a concrete choice for the given decode `sample_rate`
-    /// (Hz) — `true` selects the PLL.
-    fn use_pll(self, sample_rate: u32) -> bool {
+    /// Resolve to a concrete choice for the given decode rate in Hz —
+    /// the rate *after* decimation, not the capture rate. `true`
+    /// selects the PLL.
+    fn use_pll(self, decode_rate_hz: u32) -> bool {
         match self {
             DemodKind::Discriminator => false,
             DemodKind::Pll => true,
-            DemodKind::Auto => sample_rate >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
+            DemodKind::Auto => decode_rate_hz >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
         }
     }
 }
@@ -521,6 +544,57 @@ struct AaroniaSdkArgs {
 
 /// DDC cutoff is the FM deviation plus enough chroma headroom for PAL.
 const LUMA_HEADROOM_HZ: f32 = 2_000_000.0;
+
+/// Taps the decode down-converter uses when it decimates.
+///
+/// The 63-tap default is not sharp enough to decimate a wide capture.
+/// Decimating by N folds everything above the new Nyquist back onto the
+/// signal, and the frequency landing on the passband edge is
+/// `work_rate - cutoff` — 8.36 MHz out, for a 61.44 MSPS capture at 4x.
+/// That is where a neighbouring VTX sits, and 63 taps attenuate it by
+/// only 24 dB. 127 taps give 75 dB. The longer filter still costs less
+/// than today because the convolution runs only on the samples the
+/// stride keeps: 127 taps on a quarter of them is half the work of 63
+/// taps on all of them. Pinned by the analog crate's
+/// `a_decimated_down_conversion_still_decodes`, which puts a
+/// transmitter 20 dB up at that offset and watches sync quality fall to
+/// 0.01 on the default filter.
+const DECODE_FIR_TAPS: usize = 127;
+
+/// Width of the down-converter's transition band, as a fraction of the
+/// input rate times the tap count: `transition_hz ≈ K · fs / taps`.
+/// Fitted to the crate's Blackman design between its −6 dB and −50 dB
+/// points.
+const FIR_TRANSITION_K: f32 = 2.33;
+
+/// How far the decode path may decimate a capture and stay alias-free.
+///
+/// The video occupies `2 · cutoff` of the capture — about 14 MHz for a
+/// 5 MHz-deviation channel — so a 61.44 MSPS capture spends three
+/// quarters of every stage on spectrum the down-converter's filter
+/// already emptied. Decimating there lets the demodulator, deemphasis
+/// and frame reconstructor all run at the lower rate, which is the
+/// difference between 6.1 and under 1.0 CPU-seconds per second of
+/// signal (`examples/profile_decode.rs`).
+///
+/// The limit is aliasing: energy at `work_rate - cutoff` folds onto the
+/// passband edge, so that frequency has to clear the filter's stopband
+/// edge, one transition band above the cutoff.
+///
+/// It cannot be a fixed target rate. File playback defaults to a 17 MHz
+/// deviation, so a "always decimate to 15.36 MSPS" rule would fold a
+/// 19 MHz-wide channel onto itself.
+fn decode_decimation(sample_rate: u32, ddc_cutoff_hz: f32) -> usize {
+    if sample_rate == 0 || !ddc_cutoff_hz.is_finite() || ddc_cutoff_hz <= 0.0 {
+        return 1;
+    }
+    let transition = FIR_TRANSITION_K * sample_rate as f32 / DECODE_FIR_TAPS as f32;
+    let min_work_rate = 2.0 * ddc_cutoff_hz + transition;
+    if min_work_rate <= 0.0 {
+        return 1;
+    }
+    ((sample_rate as f32 / min_work_rate).floor() as usize).max(1)
+}
 
 /// Default centre of the 5.8 GHz FPV band for wideband scanning.
 /// (Only the Aaronia backend scans a single fixed span; USRP/HackRF
@@ -2436,8 +2510,55 @@ where
 
         let is_pal = sig_type == SignalType::AnalogVideoPal;
 
+        // Everything after the down-converter runs at the working rate,
+        // not the capture rate. Decided here rather than in the worker
+        // because the reconstructor is built here — its geometry sizes
+        // the window below.
+        //
+        // Floor the cutoff at `fm_deviation`: in scan mode
+        // `bandwidth_hz` comes from the detector, and an implausibly
+        // small detected bandwidth would otherwise collapse the FIR
+        // passband and render a black/garbage frame with no clue why.
+        let ddc_cutoff = (bandwidth_hz / 2.0)
+            .min(fm_deviation + LUMA_HEADROOM_HZ)
+            .max(fm_deviation);
+        let mut decim = decode_decimation(sample_rate, ddc_cutoff);
+        // The PLL cannot track a 5 MHz deviation much below 20 MSPS —
+        // its loop-bandwidth stability clamp caps ωₙ at 0.5 rad/sample,
+        // i.e. fs/4π (analog crate DESIGN.md §11). Asking for it
+        // explicitly therefore caps how far we may decimate, at the
+        // cost of the CPU the decimation would have saved.
+        if matches!(demod_kind, DemodKind::Pll) {
+            let cap = (sample_rate / PLL_AUTO_MIN_SAMPLE_RATE_HZ).max(1) as usize;
+            if decim > cap {
+                println!(
+                    "  → --demod pll holds the decode rate at {:.2} MSPS (the loop cannot \
+                     track this deviation below ~20 MSPS); it may not keep up. Drop the \
+                     flag to decode at {:.2} MSPS.",
+                    (sample_rate / cap as u32) as f64 / 1e6,
+                    (sample_rate / decim as u32) as f64 / 1e6
+                );
+                decim = cap;
+            }
+        }
+        let work_rate = sample_rate / decim as u32;
+        let use_pll = demod_kind.use_pll(work_rate);
+        if decim > 1 {
+            println!(
+                "  → Decoding at {:.2} MSPS ({:.2} MSPS capture / {})",
+                work_rate as f64 / 1e6,
+                sample_rate as f64 / 1e6,
+                decim
+            );
+        }
+        println!(
+            "  → Demodulator: {} ({:.2} MSPS)",
+            if use_pll { "PLL" } else { "discriminator" },
+            work_rate as f64 / 1e6
+        );
+
         #[allow(unused_mut)]
-        let mut reconstructor = FrameReconstructor::new(sample_rate, is_pal, fm_deviation, debug)
+        let mut reconstructor = FrameReconstructor::new(work_rate, is_pal, fm_deviation, debug)
             .with_temporal_window(temporal_window);
         // Load the denoiser once per channel (opening an ONNX session is
         // expensive, and the `D` hotkey must toggle instantly). It is
@@ -2494,14 +2615,16 @@ where
         });
 
         thread::spawn(move || {
-            // Floor the cutoff at `fm_deviation`: in scan mode
-            // `bandwidth_hz` comes from the detector, and an implausibly
-            // small detected bandwidth would otherwise collapse the FIR
-            // passband and render a black/garbage frame with no clue why.
-            let ddc_cutoff = (bandwidth_hz / 2.0)
-                .min(fm_deviation + LUMA_HEADROOM_HZ)
-                .max(fm_deviation);
-            let mut ddc = StreamingDDC::new(freq_offset, sample_rate, ddc_cutoff);
+            // The down-converter is the one stage that stays at the
+            // capture rate: it reads every input sample and emits one
+            // per stride. A decimating cut needs the longer filter (see
+            // `DECODE_FIR_TAPS`); at stride 1 nothing folds, so keep the
+            // default and leave that path byte-identical.
+            let mut ddc = if decim > 1 {
+                StreamingDDC::with_taps(freq_offset, sample_rate, ddc_cutoff, DECODE_FIR_TAPS)
+            } else {
+                StreamingDDC::new(freq_offset, sample_rate, ddc_cutoff)
+            };
             let mut shifted_iq: Vec<Complex<f32>> = Vec::new();
             // Last DDC output sample of the previous chunk. `fm_demod`
             // is stateless and returns n−1 samples for n inputs, so
@@ -2518,19 +2641,30 @@ where
             // placement the library documents (a stateful filter inside
             // the reconstructor would re-filter the re-read tail).
             let mut deemph = (deemphasis_tau.is_finite() && deemphasis_tau > 0.0)
-                .then(|| Deemphasis::new(sample_rate, deemphasis_tau));
+                .then(|| Deemphasis::new(work_rate, deemphasis_tau));
             // PLL demodulator (--demod pll, or auto's >= 25 MSPS
             // crossover): threshold extension — see DemodKind's doc
             // for the measured numbers and the low-rate caveat. 1 MHz
             // loop bandwidth per the weak_signal_sweep tuning.
-            let use_pll = demod_kind.use_pll(sample_rate);
-            println!(
-                "  → Demodulator: {} ({:.2} MSPS)",
-                if use_pll { "PLL" } else { "discriminator" },
-                sample_rate as f64 / 1e6
-            );
-            let mut pll = use_pll.then(|| PllFmDemod::new(sample_rate, 1.0e6, fm_deviation * 1.2));
+            // 1 MHz loop bandwidth is an absolute figure and does not
+            // scale with the rate; `use_pll` was resolved against the
+            // working rate in the setup loop.
+            let mut pll = use_pll.then(|| PllFmDemod::new(work_rate, 1.0e6, fm_deviation * 1.2));
             let mut demod_buffer: Vec<f32> = Vec::new();
+            // A field plus its blanking, the same bound the
+            // reconstructor's own fallback path uses before it will
+            // commit to a field. ~13 ms at 15.36 MSPS, well under a
+            // field period, so gating on it costs no latency.
+            let min_samples_per_field = {
+                let line_rate = if is_pal { 15_625.0f32 } else { 15_734.0 };
+                let lines = if is_pal { 288 } else { 240 } + 22;
+                ((work_rate as f32 / line_rate) * lines as f32) as usize
+            };
+            // ~33 ms consumed before compacting, ~83 ms of live region
+            // before the valve fires, ~16 ms kept when it does.
+            let compact_after = work_rate as usize / 30;
+            let live_region_cap = work_rate as usize / 12;
+            let keep_on_skip = work_rate as usize / 60;
             // Cursor into `demod_buffer`: live (unconsumed) samples are
             // `demod_buffer[demod_start..]`. Advancing a cursor instead
             // of `drain(0..consumed)` per field avoids an O(n) prefix
@@ -2558,7 +2692,7 @@ where
                 {
                     shifted_iq.push(prev);
                 }
-                ddc.process_into(&iq_chunk, &mut shifted_iq);
+                ddc.process_into_decimated(&iq_chunk, &mut shifted_iq, decim);
                 iq_carry = shifted_iq.last().copied();
                 match pll.as_mut() {
                     Some(p) => p.process_into(&shifted_iq, &mut demod_scratch),
@@ -2612,9 +2746,22 @@ where
                 // `frame_buf` is left untouched on the None paths (they
                 // return before writing it), so it's safe to keep for the
                 // next chunk.
-                while let Some(consumed) = reconstructor
-                    .reconstruct_frame_into(&demod_buffer[demod_start..], &mut frame_buf)
-                {
+                //
+                // Only ask once a field could actually be in there.
+                // `reconstruct_frame_into` runs three full-slice passes
+                // and two full-length allocations *before* the length
+                // check that would reject a short buffer, so calling it
+                // on every chunk means most calls do all that work and
+                // return None. It costs more the more chunks a second
+                // brings: measured, reconstruction ran at 0.34 CPU-s/s
+                // fed 65,536-sample chunks and 0.75 fed the
+                // 16,384-sample chunks a 4x stride produces.
+                while demod_buffer.len() - demod_start >= min_samples_per_field {
+                    let Some(consumed) = reconstructor
+                        .reconstruct_frame_into(&demod_buffer[demod_start..], &mut frame_buf)
+                    else {
+                        break;
+                    };
                     frame_count += 1;
 
                     // Rate-limited debug telemetry: print per-frame
@@ -2703,16 +2850,18 @@ where
 
                 // Amortised compaction: drop the consumed prefix in a
                 // single memmove once it's grown past the threshold,
-                // rather than once per field.
-                if demod_start > 2_000_000 {
+                // rather than once per field. Sized in time rather than
+                // samples, so decimating doesn't quietly buy four times
+                // the buffering.
+                if demod_start > compact_after {
                     demod_buffer.drain(0..demod_start);
                     demod_start = 0;
                 }
                 // Safety valve: if reconstruction can't keep up and the
                 // live region balloons, skip ahead (corrupts one field's
                 // sync, but bounds memory) instead of growing unbounded.
-                if demod_buffer.len() - demod_start > 5_000_000 {
-                    demod_start = demod_buffer.len().saturating_sub(1_000_000);
+                if demod_buffer.len() - demod_start > live_region_cap {
+                    demod_start = demod_buffer.len().saturating_sub(keep_on_skip);
                 }
             }
         });
@@ -3367,6 +3516,84 @@ mod tests {
                 span / 1e6
             );
         }
+    }
+
+    /// The decode path may only shed bandwidth it has already filtered
+    /// away. Energy at `work_rate - cutoff` folds onto the passband
+    /// edge, so that frequency has to clear the filter's stopband edge.
+    ///
+    /// The rule has to be driven by the channel's own cutoff, not a
+    /// fixed target rate: file playback defaults to a 17 MHz deviation,
+    /// and "always decode at 15.36 MSPS" would fold a 19 MHz-wide
+    /// channel onto itself.
+    #[test]
+    fn decode_decimation_never_folds_a_channel_onto_itself() {
+        // A live channel (5 MHz deviation) and a file one (17 MHz).
+        for cutoff in [5e6f32 + LUMA_HEADROOM_HZ, 17e6 + LUMA_HEADROOM_HZ] {
+            for rate in [
+                7_680_000u32,
+                15_360_000,
+                20_000_000,
+                25_000_000,
+                30_720_000,
+                40_000_000,
+                50_000_000,
+                61_440_000,
+                100_000_000,
+            ] {
+                let decim = decode_decimation(rate, cutoff);
+                assert!(decim >= 1, "{rate} at {cutoff}: factor must be positive");
+                if decim == 1 {
+                    // Declining to decimate is always safe. Whether the
+                    // capture was wide enough for the channel in the
+                    // first place is not this function's business — at
+                    // 7.68 MSPS a 7 MHz cutoff is already undersampled,
+                    // and no stride fixes that.
+                    continue;
+                }
+                let work_rate = (rate / decim as u32) as f32;
+                // Nothing above the new Nyquist that could fold into
+                // the passband is still inside the filter's transition.
+                let stopband_edge =
+                    cutoff + FIR_TRANSITION_K * rate as f32 / DECODE_FIR_TAPS as f32;
+                assert!(
+                    work_rate - cutoff >= stopband_edge,
+                    "{:.2} MSPS at a {:.1} MHz cutoff decimated by {decim} to {:.2} MSPS: \
+                     energy at {:.2} MHz folds onto the passband edge but the filter is \
+                     still {:.2} MHz from its stopband",
+                    rate as f64 / 1e6,
+                    cutoff as f64 / 1e6,
+                    work_rate as f64 / 1e6,
+                    (work_rate - cutoff) as f64 / 1e6,
+                    stopband_edge as f64 / 1e6
+                );
+            }
+        }
+
+        // The live defaults, spelled out: both wide Aaronia spans land
+        // on the same working rate, and every rate a decoder already
+        // kept up with is left alone.
+        let live = 5e6f32 + LUMA_HEADROOM_HZ;
+        assert_eq!(decode_decimation(61_440_000, live), 4);
+        assert_eq!(decode_decimation(30_720_000, live), 2);
+        for unchanged in [25_000_000u32, 20_000_000, 15_360_000, 7_680_000] {
+            assert_eq!(
+                decode_decimation(unchanged, live),
+                1,
+                "{unchanged} has nothing to shed at a 7 MHz cutoff"
+            );
+        }
+
+        // A 19 MHz-wide file channel needs ~38 MSPS of working rate, so
+        // it must not decimate below that.
+        let file = 17e6f32 + LUMA_HEADROOM_HZ;
+        assert_eq!(decode_decimation(61_440_000, file), 1);
+        assert!(100_000_000 / decode_decimation(100_000_000, file) as u32 >= 38_000_000);
+
+        // Degenerate input must not divide by zero or panic.
+        assert_eq!(decode_decimation(0, live), 1);
+        assert_eq!(decode_decimation(61_440_000, 0.0), 1);
+        assert_eq!(decode_decimation(61_440_000, f32::NAN), 1);
     }
 
     #[test]

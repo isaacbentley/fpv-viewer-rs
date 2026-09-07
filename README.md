@@ -32,6 +32,15 @@ this repository is the application around it.
   table at its true frequency, and each hit labelled with its channel,
   standard, and localized carrier. Once locked, the same data sits as a
   strip under the picture; `B` cycles strip, full panel, and off.
+- **Decoding costs the same whether the capture is wide or narrow.** A
+  wide capture is what the sweep needs, but the video inside it is only
+  about 14 MHz wide, so the down-converter decimates as far as that
+  channel allows before anything else touches the samples. A 61.44 MSPS
+  capture decodes at 15.36 MSPS; a capture already that narrow is left
+  alone. Measured on one core, that is the difference between 5.3 and
+  0.8 CPU-seconds of work per second of signal
+  (`cargo run --release --example profile_decode`), and live it is the
+  difference between dropping 89% of what arrives and dropping 0.8%.
 - **Live monochrome rendering** in a desktop window.
 - **Weak-signal decoding**, enabled by default:
   - Matched-filter sync acquisition, a line-locked clock for straight
@@ -45,8 +54,12 @@ this repository is the application around it.
     high-frequency noise is not left emphasized in the picture
     (`--deemphasis-tau`, `0` to disable).
 - **Optional PLL demodulator.** At 25 MSPS and above, `--demod pll` holds
-  sync approximately one noise step deeper than the discriminator. The
-  discriminator remains preferable at lower rates.
+  sync approximately one noise step deeper than the discriminator. Its
+  loop cannot track a typical FPV deviation much below 20 MSPS, so
+  asking for it holds the decode rate up rather than decimating, and the
+  viewer says so; that costs the CPU the decimation would have saved.
+  The discriminator is the default everywhere the decode rate lands
+  below the crossover, which on a wide capture is everywhere.
 - **Optional neural denoiser.** Built with `--features neural-vsr`,
   `--denoise` starts with it enabled and **`D`** toggles it during
   playback. It improves a degraded signal and costs a small amount of
@@ -148,9 +161,9 @@ subcommand:
 | Option | Description |
 | :--- | :--- |
 | `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` adds the 5.3 GHz L/D bands and 1.2 GHz, at proportionally more tunes per sweep. |
-| `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The HTTP default of 61.44 MSPS is about 246 MB/s in `f16`, more than gigabit Ethernet carries, and the RTSA server discards data once its outbound buffer passes 8 MB. Measured over Wi-Fi, even 15.36 MSPS (61 MB/s) fell a few percent short and dropped most packets; a wired link is the fix, and `--sample-rate 15360000` is the widest span worth trying on a marginal one. |
+| `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The HTTP default of 61.44 MSPS is about 246 MB/s in `f16`, more than gigabit Ethernet carries, and the RTSA server discards data once its outbound buffer passes 8 MB. Measured over Wi-Fi, even 15.36 MSPS (61 MB/s) fell a few percent short and dropped most packets; a wired link is the fix, and `--sample-rate 15360000` is the widest span worth trying on a marginal one. This is a network limit only: decoding decimates to a fixed working rate, so a wide capture costs no more CPU than a narrow one. |
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
-| `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below. |
+| `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant. Default 0.75 µs; `0` disables. |
 | `--denoise` | Start with the neural denoiser enabled (requires `--features neural-vsr`). |
 | `--denoise-model <path>` | ONNX model to load. Defaults to `models/temporal_denoiser.onnx`. |
