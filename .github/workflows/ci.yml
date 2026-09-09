@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # No Windows job: the USRP backend links libuhd via pkg-config and
+      # the Windows runners have no unattended UHD install, so the build
+      # can never link there. Windows users build from source with UHD
+      # installed (see README).
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+
+      - name: Install macOS Dependencies
+        if: runner.os == 'macOS'
+        run: brew install uhd
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Default features, which include `aaronia`. The AARTSAAPI SDK is
+      # resolved at runtime, not link time, so the backend builds and
+      # tests here without one installed.
+      - name: cargo test
+        run: cargo test --locked
+
+  clippy_fmt:
+    name: Clippy + Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # Default features — see the note on the test job.
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings

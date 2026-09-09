@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Ship whatever platforms succeed: one target's toolchain hiccup
+      # shouldn't cancel the other release artifacts.
+      fail-fast: false
+      # No Windows target: the USRP backend links libuhd via pkg-config,
+      # and there is no workable unattended UHD install on the Windows
+      # runners today. Windows users build from source with UHD
+      # installed (see README) until the USRP backend is feature-gated
+      # or a UHD install step exists.
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: fpv-viewer-linux-rpi5
+            ext: ""
+          # Native Apple Silicon. An x86_64 cross-target can't link
+          # against Homebrew's arm64 libuhd on the arm64 runners.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: fpv-viewer-macos-arm64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Cross-Compilation Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg --add-architecture arm64
+          # The default archive/security.ubuntu.com mirrors host amd64
+          # only; fetching arm64 indexes from them 404s and fails
+          # `apt-get update`. Restrict the stock sources to amd64 and
+          # add ports.ubuntu.com (the arm64 mirror) for arm64 packages.
+          sudo sed -i 's/^Signed-By:/Architectures: amd64\nSigned-By:/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo tee /etc/apt/sources.list.d/arm64-ports.sources > /dev/null <<'SRC'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main universe restricted multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SRC
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config
+          # Install the arm64 versions of our SDR and UI dependencies.
+          # libboost-system-dev: libuhd's link line carries
+          # -lboost_system, and only the -dev package provides the
+          # unversioned .so symlink the linker resolves it from.
+          sudo apt-get install -y libuhd-dev:arm64 libboost-system-dev:arm64 libasound2-dev:arm64 libiio-dev:arm64 libfontconfig1-dev:arm64
+          
+          # Tell cargo which linker to use for aarch64
+          mkdir -p .cargo
+          cat <<EOF > .cargo/config.toml
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+          
+          # Point pkg-config to the arm64 sysroot
+          {
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "PKG_CONFIG_DIR="
+            echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+            echo "PKG_CONFIG_SYSROOT_DIR=/"
+          } >> "$GITHUB_ENV"
+
+      - name: Install UHD (macOS)
+        if: runner.os == 'macOS'
+        run: brew install uhd
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # For Windows and Linux, just upload the binary
+      - name: Upload Binary (Windows/Linux)
+        if: runner.os != 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/fpv-viewer${{ matrix.ext }}
+
+      # For macOS, package as DMG to follow global preference
+      - name: Create DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p FPVViewer
+          cp target/${{ matrix.target }}/release/fpv-viewer FPVViewer/
+          hdiutil create -volname "FPVViewer" -srcfolder FPVViewer -ov -format UDZO "${{ matrix.artifact_name }}.dmg"
+
+      - name: Upload DMG (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}.dmg
+          path: ${{ matrix.artifact_name }}.dmg

@@ -1,0 +1,3665 @@
+mod band_scan;
+
+use band_scan::{BandScan, PanelMode, ScanWindow};
+use clap::{Args as ClapArgs, Parser, Subcommand};
+use minifb::{Key, Window, WindowOptions};
+use num_complex::Complex;
+use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
+use orecchiette_fpv_drone_analog_rs::demod::{
+    DEFAULT_DEEMPHASIS_TAU_S, Deemphasis, PllFmDemod, fm_demod, fm_demod_into,
+};
+use orecchiette_fpv_drone_analog_rs::detector::{
+    AnalogFpvDetector, FpvDetector, ProbeEnergy, SpectralIntegrator,
+};
+use orecchiette_fpv_drone_analog_rs::levels::estimate_cnr_db;
+use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
+use orecchiette_fpv_drone_analog_rs::types::SignalType;
+use orecchiette_fpv_drone_analog_rs::video::{FrameReconstructor, detect_video_standard};
+use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// ── CLI ────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Real-time Analog FPV Viewer")]
+struct Cli {
+    #[command(subcommand)]
+    source: SourceCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum SourceCmd {
+    /// Replay a SigMF or raw IQ file.
+    File(FileArgs),
+    /// Live capture from an Ettus USRP B2xx.
+    Usrp(UsrpArgs),
+    /// Live capture from a HackRF One.
+    Hackrf(HackrfArgs),
+    /// Live capture from an Aaronia Spectran V6.
+    #[cfg(feature = "aaronia")]
+    #[command(subcommand)]
+    Aaronia(AaroniaCmd),
+}
+
+// ── File subcommand ────────────────────────────────────────────────
+
+#[derive(ClapArgs, Debug)]
+struct FileArgs {
+    /// Path to the SigMF `.sigmf-data` / `.sigmf-meta` or raw IQ file.
+    input: PathBuf,
+    #[arg(long)]
+    sample_rate: Option<u32>,
+    #[arg(long)]
+    fm_deviation: Option<f32>,
+    /// Video deemphasis time constant in seconds, undoing the VTX's
+    /// pre-emphasis (which otherwise leaves high-frequency noise
+    /// emphasized in the picture). 0 disables. Default 0.15 µs, from
+    /// the analog crate's [`DEFAULT_DEEMPHASIS_TAU_S`], whose docs
+    /// carry what each value costs the picture. Lengthen it if your
+    /// transmitter's pre-emphasis is strong and the result looks
+    /// noisy.
+    #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
+    deemphasis_tau: f32,
+    /// FM demodulator. 'auto' (default) picks the PLL at or above
+    /// ~25 MSPS of *decode* rate and the discriminator below it,
+    /// matching where each is actually measured to win. Decoding runs
+    /// below the capture rate on a wide capture, so 'auto' normally
+    /// resolves to the discriminator; 'pll' holds the decode rate up
+    /// instead, at a CPU cost. Run with `--help` (long form, not `-h`)
+    /// to see per-value details.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
+    demod: DemodKind,
+    /// Start with the neural temporal denoiser enabled (requires a
+    /// build with `--features neural-vsr`). Toggle it live with `D`.
+    #[arg(long)]
+    denoise: bool,
+    /// Path to the denoiser ONNX model.
+    #[arg(long, default_value = "models/temporal_denoiser.onnx")]
+    denoise_model: String,
+    #[arg(long)]
+    debug: bool,
+    /// Number of fields kept in the temporal denoise / dropout-repair
+    /// history (Phase A-E). 5 (default) gives ≈ +7 dB SNR on static
+    /// scenes with ~83 ms latency; 1 disables temporal processing.
+    /// Clamped to the range 1–8 (higher values allocate history the
+    /// denoise never reads).
+    #[arg(long, default_value_t = 5)]
+    temporal_window: usize,
+}
+
+// ── Shared live-SDR flags ──────────────────────────────────────────
+
+#[derive(ClapArgs, Debug, Clone)]
+struct LiveArgs {
+    /// FPV channel name (A1–A8, B1–B8, E1–E8, F1–F8, R1–R8, L1–L8,
+    /// D1–D8) or raw frequency in Hz (e.g. 5865000000).
+    ///
+    /// Omit to auto-scan: the viewer captures wideband, detects all
+    /// active analog FPV signals, and opens a window for each.
+    #[arg(long)]
+    channel: Option<String>,
+    /// Force video standard instead of auto-detecting.
+    #[arg(long, value_parser = parse_standard)]
+    standard: Option<SignalType>,
+    /// Override sample rate (Hz). Defaults per backend: USRP 25 MSPS,
+    /// HackRF 20 MSPS (its USB 2.0 ceiling), Aaronia 61.44 MSPS (it runs 61.44 MHz over powers of two, down to 120 kSPS).
+    #[arg(long)]
+    sample_rate: Option<f64>,
+    /// Which bands the auto-scan sweeps. '5.8' (default) covers
+    /// 5.645-5.945 GHz; 'all' adds the 5.3 GHz L/D bands and 1.2 GHz,
+    /// at proportionally more tunes per sweep. Ignored with --channel.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = ScanBands::Band58)]
+    scan_bands: ScanBands,
+    /// FM deviation (Hz). Defaults to 5 MHz for live SDR.
+    #[arg(long, default_value_t = 5_000_000.0)]
+    fm_deviation: f32,
+    /// Video deemphasis time constant in seconds, undoing the VTX's
+    /// pre-emphasis (which otherwise leaves high-frequency noise
+    /// emphasized in the picture). 0 disables. Default 0.15 µs, from
+    /// the analog crate's [`DEFAULT_DEEMPHASIS_TAU_S`], whose docs
+    /// carry what each value costs the picture. Lengthen it if your
+    /// transmitter's pre-emphasis is strong and the result looks
+    /// noisy.
+    #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
+    deemphasis_tau: f32,
+    /// FM demodulator. 'auto' (default) picks the PLL at or above
+    /// ~25 MSPS of *decode* rate and the discriminator below it,
+    /// matching where each is actually measured to win. Decoding runs
+    /// below the capture rate on a wide capture, so 'auto' normally
+    /// resolves to the discriminator; 'pll' holds the decode rate up
+    /// instead, at a CPU cost. Run with `--help` (long form, not `-h`)
+    /// to see per-value details.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
+    demod: DemodKind,
+    /// Start with the neural temporal denoiser enabled (requires a
+    /// build with `--features neural-vsr`). Toggle it live with `D`.
+    /// It is a clear win on impaired links — dropouts especially — and
+    /// a small cost on a clean signal, so it starts off by default.
+    #[arg(long)]
+    denoise: bool,
+    /// Path to the denoiser ONNX model.
+    #[arg(long, default_value = "models/temporal_denoiser.onnx")]
+    denoise_model: String,
+    /// Enable debug mode: saves startup frames 1-3 and steady-state
+    /// frames 30-32 as PNGs, prints periodic metrics, and keeps
+    /// running until quit (Q / Ctrl-C).
+    #[arg(long)]
+    debug: bool,
+    /// Number of fields kept in the temporal denoise / dropout-repair
+    /// history (Phase A-E). 5 (default) gives ≈ +7 dB SNR on static
+    /// scenes with ~83 ms latency; 1 disables temporal processing.
+    /// Clamped to the range 1–8 (higher values allocate history the
+    /// denoise never reads).
+    #[arg(long, default_value_t = 5)]
+    temporal_window: usize,
+}
+
+/// Decode rate at/above which `DemodKind::Auto` selects the PLL, and
+/// below which it selects the discriminator — the measured ~25 MSPS
+/// crossover documented on [`DemodKind::Pll`] and in the library's
+/// `weak_signal_sweep` example (below it the loop can't track a
+/// typical ~5 MHz FPV deviation).
+///
+/// This is compared against the *decode* rate, which since the worker
+/// started decimating (see [`decode_decimation`]) is normally well
+/// below the capture rate — so on a wide live capture `Auto` now
+/// resolves to the discriminator, which is both the cheaper and the
+/// better choice down there. `--demod pll` caps the decimation instead
+/// of being silently overruled.
+const PLL_AUTO_MIN_SAMPLE_RATE_HZ: u32 = 25_000_000;
+
+/// Which FM demodulator the decode worker runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum DemodKind {
+    /// Automatically choose the discriminator or the PLL based on the
+    /// decode rate after decimation (see
+    /// `PLL_AUTO_MIN_SAMPLE_RATE_HZ` and [`decode_decimation`]) — the
+    /// default. On a wide capture that resolves to the discriminator.
+    Auto,
+    /// Per-sample quadrature discriminator (`fm_demod`) — robust at
+    /// every sample rate.
+    #[value(name = "disc", alias = "discriminator")]
+    Discriminator,
+    /// PLL demodulator (`PllFmDemod`, 1 MHz loop): measured +6-17 dB
+    /// demod SNR and ~one sigma-step deeper sync survival at ~25 MSPS
+    /// decode rates and up, but UNUSABLE below ~20 MSPS (the loop
+    /// can't track a 5 MHz deviation there).
+    ///
+    /// Because of that floor, asking for it stops the worker decimating
+    /// past 25 MSPS, and says so when that costs it a stride. That
+    /// costs the CPU the decimation would have saved, so on a
+    /// 61.44 MSPS capture it may not keep up. On a capture already
+    /// below 25 MSPS there is nothing to hold back and nothing to
+    /// warn about — the loop simply runs where it was asked to, which
+    /// below ~20 MSPS is where it cannot track.
+    Pll,
+}
+
+impl DemodKind {
+    /// Resolve to a concrete choice for the given decode rate in Hz —
+    /// the rate *after* decimation, not the capture rate. `true`
+    /// selects the PLL.
+    fn use_pll(self, decode_rate_hz: u32) -> bool {
+        match self {
+            DemodKind::Discriminator => false,
+            DemodKind::Pll => true,
+            DemodKind::Auto => decode_rate_hz >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
+        }
+    }
+}
+
+// `--standard` stays a hand-written `value_parser` rather than
+// `clap::ValueEnum`: `SignalType` is a foreign, `#[non_exhaustive]`
+// type from `orecchiette_fpv_drone_analog_rs`, so the orphan rule
+// blocks implementing `ValueEnum` for it here — unlike `DemodKind`,
+// which is a local type and derives it directly above.
+fn parse_standard(s: &str) -> Result<SignalType, String> {
+    match s.to_lowercase().as_str() {
+        "pal" => Ok(SignalType::AnalogVideoPal),
+        "ntsc" => Ok(SignalType::AnalogVideoNtsc),
+        _ => Err(format!(
+            "unknown standard '{}'; expected 'pal' or 'ntsc'",
+            s
+        )),
+    }
+}
+
+/// How many capture packets per hop get fed to the detector before the
+/// rest of the dwell is drained.
+///
+/// `detect_from_iq_integrated` accumulates magnitude spectra per
+/// frequency, and a single 65,536-sample packet is below the length at
+/// which the sweep detects anything: with one packet per hop the first
+/// sweep finds nothing and detection lands only on the second visit,
+/// once the integrator holds two batches. Consecutive packets from one
+/// hop show where it turns over (`--` = no detection, else confidence):
+///
+/// ```text
+///   25.00 MSPS  packets 1..8:  --  0.80 0.80 0.80 0.80 0.80  --  0.80
+///   61.44 MSPS  packets 1..8:  --  0.80 0.80 0.80 0.80 0.80 0.80 0.80
+/// ```
+///
+/// Two gives first-visit detection. Beyond two measures no better:
+/// confidence plateaus at 0.80 and never promotes, and on weak signals
+/// the σ cliff sits between 1.0 and 1.5 and does not move with 12× the
+/// dwell — so `DwellController`'s adaptive dwell stays switched off.
+///
+/// The cost is CPU, not time on air: two packets is ~5.2 ms of signal at
+/// 25 MSPS but ~18 ms of detection work, so a hop becomes CPU-bound
+/// rather than dwell-bound.
+const DETECT_PACKETS_PER_HOP: usize = 2;
+
+/// Which FPV bands the auto-scan covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ScanBands {
+    /// The 5.8 GHz band only (5.645–5.945 GHz) — A/B/E/F/R. The default.
+    #[value(name = "5.8", alias = "58")]
+    Band58,
+    /// Every band in the channel table, 1.080–5.945 GHz: 5.8 GHz plus the
+    /// 5.3 GHz L/D bands and 1.2 GHz. Costs more tunes per sweep, so the
+    /// revisit interval on any one channel goes up proportionally.
+    All,
+}
+
+impl ScanBands {
+    /// Short human-readable name for startup logging.
+    fn label(self) -> &'static str {
+        match self {
+            ScanBands::Band58 => "5.8 GHz",
+            ScanBands::All => "all bands",
+        }
+    }
+
+    /// Channel centre frequencies this setting covers, in Hz.
+    fn channel_freqs_hz(self) -> Vec<f64> {
+        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
+            .iter()
+            .map(|c| c.frequency_hz as f64)
+            .filter(|f| match self {
+                ScanBands::Band58 => (5_645e6..=5_945e6).contains(f),
+                ScanBands::All => true,
+            })
+            .collect()
+    }
+
+    /// The same channels with their names and band letters, for the
+    /// band panel.
+    fn channels(self) -> Vec<band_scan::Channel> {
+        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
+            .into_iter()
+            .filter(|c| match self {
+                ScanBands::Band58 => (5_645e6..=5_945e6).contains(&(c.frequency_hz as f64)),
+                ScanBands::All => true,
+            })
+            .map(|c| {
+                let band = band_scan::band_letter(c.band);
+                band_scan::Channel {
+                    name: format!("{}{}", band, c.channel),
+                    band,
+                    hz: c.frequency_hz as f64,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Fraction of the sample rate across which the detector still places a
+/// carrier accurately, so a channel centred anywhere inside it is both
+/// found and reported at the right frequency.
+///
+/// Measured against the sliding-DDC sweep rather than assumed from the
+/// anti-alias filter. Feeding the viewer's real scan path (65,536-sample
+/// packets through `detect_from_iq_integrated`) a clean synthetic NTSC
+/// carrier at increasing offsets from the tuned centre, at 61.44 MSPS:
+///
+/// ```text
+///   offset  +0    +5    +10   +15   +20   +25   +30 MHz
+///   error  -0.7  -0.7  -0.7  -0.7  -0.7  -0.7  -55.7
+/// ```
+///
+/// The constant −0.7 MHz is probe-grid quantisation, absorbed downstream
+/// by `CHANNEL_SNAP_TOLERANCE_MHZ`. Localisation holds all the way to
+/// ±25 MHz (0.81 × the ±30.72 MHz capture half-width) and only collapses
+/// at the very edge. Detection *rate* starts thinning around the same
+/// point — at 25 MSPS a carrier at 0.8 × half-width scored 7/12 sweeps
+/// against 10–12/12 further in. 0.8 keeps planning inside the region
+/// where both hold.
+const USABLE_SPAN_FRACTION: f64 = 0.8;
+
+/// Plan the fewest tune centres that put every channel in `channels_hz`
+/// inside some capture window of width `span_hz`.
+///
+/// Greedy interval cover, the same shape as `orecchiette`'s
+/// `plan_tune_centers`: walk the sorted channels, anchor on the leftmost
+/// one not yet covered, absorb every channel within `span_hz` of it, and
+/// emit the **midpoint of the group actually absorbed** rather than the
+/// anchor, which holds the absorbed channels as far from the window
+/// edges — where localisation degrades — as the group allows. Anchoring
+/// left and taking as much as fits is optimal in the number of windows
+/// for covering points on a line with a fixed width.
+///
+/// The coverage test is on channel *centres*, not whole channel widths.
+/// `orecchiette` subtracts a 20 MHz allowance from the reach because it
+/// needs a whole DJI channel inside one window to demodulate it. Here the
+/// window only has to be good enough to *detect and localise* a carrier,
+/// which the measurements behind [`USABLE_SPAN_FRACTION`] show needs the
+/// carrier centre inside the span and nothing more. Charging every narrow
+/// analog channel a 20 MHz guard would roughly halve the reach at
+/// 25 MSPS for no gain.
+fn plan_tune_centers(channels_hz: &[f64], span_hz: f64) -> Vec<f64> {
+    let mut sorted: Vec<f64> = channels_hz
+        .iter()
+        .copied()
+        .filter(|f| f.is_finite())
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.dedup();
+
+    let reach = span_hz.max(0.0);
+    let mut centers = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let first = sorted[i];
+        let mut last = first;
+        let mut j = i;
+        while j < sorted.len() && sorted[j] - first <= reach {
+            last = sorted[j];
+            j += 1;
+        }
+        // `j > i` always holds: the anchor satisfies the window test
+        // (distance 0), so the inner loop advances at least once and the
+        // outer loop cannot spin. This guards only a NaN-poisoned
+        // comparison ordering escaping the filter above.
+        if j == i {
+            j = i + 1;
+        }
+        centers.push((first + last) * 0.5);
+        i = j;
+    }
+    centers
+}
+
+/// Build the hop list for the auto-scan loop, covering every channel in
+/// `bands` with as few tunes as the SDR's instantaneous bandwidth allows.
+///
+/// Planning against the channel list rather than stepping uniformly
+/// spends tunes only where channels are:
+///
+/// ```text
+///                        5.8 GHz    all bands
+///                    (40 channels) (137 channels)
+///     20.00 MSPS            16          101
+///     25.00 MSPS            11           93
+///     40.00 MSPS             8           56
+///     61.44 MSPS             6           48
+/// ```
+///
+/// Revisit interval is `tunes × (retune + dwell)`, so those tune counts
+/// are directly how long a signal can hide between looks.
+///
+/// Ordered low→high so synthesisers retune monotonically, which minimises
+/// PLL re-lock time on most parts.
+fn build_scan_hops(sample_rate: f64, bands: ScanBands) -> Vec<f64> {
+    let channels: Vec<f64> = bands.channel_freqs_hz();
+    plan_tune_centers(&channels, sample_rate * USABLE_SPAN_FRACTION)
+}
+
+/// Resolve --channel to a centre frequency in Hz.
+fn resolve_channel(ch: &str) -> anyhow::Result<f64> {
+    // Try channel name first
+    if let Some(freq) = lookup_channel_by_name(ch) {
+        return Ok(freq as f64);
+    }
+    // Try raw frequency
+    if let Ok(freq) = ch.parse::<f64>()
+        && freq > 1e6
+    {
+        return Ok(freq);
+    }
+    anyhow::bail!(
+        "unrecognised channel '{}'; expected A1–A8, B1–B8, E1–E8, F1–F8, R1–R8, L1–L8, D1–D8, or a frequency in Hz",
+        ch
+    );
+}
+
+// ── USRP subcommand ────────────────────────────────────────────────
+
+#[derive(ClapArgs, Debug)]
+struct UsrpArgs {
+    #[command(flatten)]
+    live: LiveArgs,
+    /// UHD device args (e.g. "type=b200").
+    #[arg(long, default_value = "")]
+    args: String,
+    /// RX gain in dB.
+    #[arg(long, default_value_t = 40.0)]
+    gain: f64,
+    /// RX antenna port.
+    #[arg(long, default_value = "RX2")]
+    antenna: String,
+}
+
+// ── HackRF subcommand ──────────────────────────────────────────────
+
+#[derive(ClapArgs, Debug)]
+struct HackrfArgs {
+    #[command(flatten)]
+    live: LiveArgs,
+    /// LNA (IF) gain in dB, 0–40 in 8 dB steps.
+    #[arg(long, default_value_t = 16)]
+    lna_gain: u16,
+    /// VGA (baseband) gain in dB, 0–62 in 2 dB steps.
+    #[arg(long, default_value_t = 20)]
+    vga_gain: u16,
+    /// Enable the front-end +14 dB RF amplifier (off by default; it
+    /// overloads easily on strong ambient traffic).
+    #[arg(long, default_value_t = false)]
+    amp: bool,
+    /// Enable the bias-tee (antenna-port DC power) for active antennas.
+    #[arg(long, default_value_t = false)]
+    bias_tee: bool,
+}
+
+// ── Aaronia subcommands ────────────────────────────────────────────
+
+#[cfg(feature = "aaronia")]
+#[derive(Subcommand, Debug)]
+enum AaroniaCmd {
+    /// Stream from an RTSA HTTP server block.
+    Http(AaroniaHttpArgs),
+    /// Stream via the native AARTSAAPI SDK.
+    Sdk(AaroniaSdkArgs),
+}
+
+#[cfg(feature = "aaronia")]
+#[derive(ClapArgs, Debug)]
+struct AaroniaHttpArgs {
+    /// Base URL of the RTSA HTTP server.
+    #[arg(value_name = "URL")]
+    url: String,
+    #[command(flatten)]
+    live: LiveArgs,
+    /// Reference level (dBm).
+    #[arg(long, default_value_t = -25.0)]
+    ref_level: f64,
+    /// IQ wire format for the HTTP stream. f16 (default) halves the
+    /// network rate against f32 — 61.44 MSPS is ~246 MB/s in f16 versus
+    /// ~491 in f32, and the fatter stream is prone to stalling ("no
+    /// samples arrived within the read deadline"). Video tolerates the
+    /// precision loss: an 11-bit significand leaves ~66 dB of SNR
+    /// headroom, far beyond an analog FPV link.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = AaroniaStreamFormat::F16)]
+    stream_format: AaroniaStreamFormat,
+}
+
+/// IQ wire format for the RTSA HTTP stream (`--stream-format`).
+#[cfg(feature = "aaronia")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AaroniaStreamFormat {
+    /// IEEE half precision, 4 bytes per IQ pair.
+    F16,
+    /// Full single precision, 8 bytes per IQ pair.
+    F32,
+    /// 16-bit integers with a scale factor, 4 bytes per IQ pair.
+    Int16,
+}
+
+#[cfg(feature = "aaronia")]
+impl AaroniaStreamFormat {
+    fn to_driver(self) -> sdr_aaronia_rs::http_streaming::StreamFormat {
+        use sdr_aaronia_rs::http_streaming::StreamFormat;
+        match self {
+            AaroniaStreamFormat::F16 => StreamFormat::Float16,
+            AaroniaStreamFormat::F32 => StreamFormat::Float32,
+            AaroniaStreamFormat::Int16 => StreamFormat::Int16,
+        }
+    }
+}
+
+#[cfg(feature = "aaronia")]
+#[derive(ClapArgs, Debug)]
+struct AaroniaSdkArgs {
+    #[command(flatten)]
+    live: LiveArgs,
+    /// Device serial number.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Reference level (dBm).
+    #[arg(long, default_value_t = -25.0)]
+    ref_level: f64,
+}
+
+// ── Constants ──────────────────────────────────────────────────────
+
+/// DDC cutoff is the FM deviation plus enough chroma headroom for PAL.
+const LUMA_HEADROOM_HZ: f32 = 2_000_000.0;
+
+/// Taps the decode down-converter uses when it decimates.
+///
+/// The 63-tap default is not sharp enough to decimate a wide capture.
+/// Decimating by N folds everything above the new Nyquist back onto the
+/// signal, and the frequency landing on the passband edge is
+/// `work_rate - cutoff` — 8.36 MHz out, for a 61.44 MSPS capture at 4x.
+/// That is where a neighbouring VTX sits, and 63 taps attenuate it by
+/// only 24 dB. 127 taps give 75 dB. The longer filter still costs less
+/// than today because the convolution runs only on the samples the
+/// stride keeps: 127 taps on a quarter of them is half the work of 63
+/// taps on all of them. Pinned by the analog crate's
+/// `a_decimated_down_conversion_still_decodes`, which puts a
+/// transmitter 20 dB up at that offset and watches sync quality fall to
+/// 0.01 on the default filter.
+const DECODE_FIR_TAPS: usize = 127;
+
+/// Width of the down-converter's transition band, as a fraction of the
+/// input rate times the tap count: `transition_hz ≈ K · fs / taps`.
+/// Fitted to the crate's Blackman design between its −6 dB and −50 dB
+/// points.
+const FIR_TRANSITION_K: f32 = 2.33;
+
+/// How far the decode path may decimate a capture and stay alias-free.
+///
+/// The video occupies `2 · cutoff` of the capture — about 14 MHz for a
+/// 5 MHz-deviation channel — so a 61.44 MSPS capture spends three
+/// quarters of every stage on spectrum the down-converter's filter
+/// already emptied. Decimating there lets the demodulator, deemphasis
+/// and frame reconstructor all run at the lower rate: 3.93 against 0.61
+/// CPU-seconds per second of signal on one core of an Apple M4
+/// (`examples/profile_decode.rs`). Above 1.0 the worker drops chunks.
+///
+/// The limit is aliasing: energy at `work_rate - cutoff` folds onto the
+/// passband edge, so that frequency has to clear the filter's stopband
+/// edge, one transition band above the cutoff.
+///
+/// It cannot be a fixed target rate. File playback defaults to a 17 MHz
+/// deviation, so a "always decimate to 15.36 MSPS" rule would fold a
+/// 19 MHz-wide channel onto itself.
+fn decode_decimation(sample_rate: u32, ddc_cutoff_hz: f32) -> usize {
+    if sample_rate == 0 || !ddc_cutoff_hz.is_finite() || ddc_cutoff_hz <= 0.0 {
+        return 1;
+    }
+    let transition = FIR_TRANSITION_K * sample_rate as f32 / DECODE_FIR_TAPS as f32;
+    let min_work_rate = 2.0 * ddc_cutoff_hz + transition;
+    if min_work_rate <= 0.0 {
+        return 1;
+    }
+    ((sample_rate as f32 / min_work_rate).floor() as usize).max(1)
+}
+
+/// Default centre of the 5.8 GHz FPV band for wideband scanning.
+/// (Only the Aaronia backend scans a single fixed span; USRP/HackRF
+/// hop through `build_scan_hops` instead.)
+#[cfg(feature = "aaronia")]
+const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
+
+/// Default Aaronia span when no --sample-rate is given (max complex span for 92.16 MHz clock).
+#[cfg(feature = "aaronia")]
+const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
+
+// ── No-op dwell advice (single-channel, no hopping) ────────────────
+
+struct NoOpDwell;
+impl DwellAdvice for NoOpDwell {
+    fn latest_signal_at(&self, _: u64) -> Option<Instant> {
+        None
+    }
+}
+
+// ── Main ───────────────────────────────────────────────────────────
+
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    match cli.source {
+        SourceCmd::File(f) => run_file(f),
+        SourceCmd::Usrp(u) => run_live_usrp(u),
+        SourceCmd::Hackrf(h) => run_live_hackrf(h),
+        #[cfg(feature = "aaronia")]
+        SourceCmd::Aaronia(a) => run_live_aaronia(a),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FILE MODE — unchanged from before, now behind `file` subcommand
+// ═══════════════════════════════════════════════════════════════════
+
+/// Turn a detector classification into the concrete PAL-or-NTSC choice
+/// a `FrameReconstructor` needs.
+///
+/// `detect_sync_pulses` / `detect_from_iq` can legitimately return
+/// [`SignalType::AnalogVideoUnknown`] — "this is analog video but the
+/// FFT couldn't resolve the 109 Hz PAL/NTSC line-rate gap" (common on
+/// the first wideband chunk). The library's docs explicitly warn
+/// callers not to act on a PAL-vs-NTSC tag in that state; treating it
+/// as NTSC (what `== AnalogVideoPal` comparisons silently did) builds
+/// a reconstructor with the wrong line rate and geometry for a PAL
+/// signal → rolling, torn video with no hint why. Instead, measure the
+/// median sync-tip interval directly on the demodulated baseband via
+/// `detect_video_standard`, and only fall back to `default` when even
+/// that is inconclusive.
+fn concretize_standard(
+    tagged: SignalType,
+    baseband_iq: &[Complex<f32>],
+    sample_rate: u32,
+    default: SignalType,
+) -> SignalType {
+    match tagged {
+        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => tagged,
+        _ => {
+            let demod = fm_demod(baseband_iq);
+            match detect_video_standard(&demod, sample_rate) {
+                s @ (SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc) => {
+                    println!("  → Standard ambiguous; time-domain line-rate check says {s:?}");
+                    s
+                }
+                _ => {
+                    println!("  → Standard ambiguous and undecidable; defaulting to {default:?}");
+                    default
+                }
+            }
+        }
+    }
+}
+
+fn run_file(args: FileArgs) -> anyhow::Result<()> {
+    // Attempt to load SigMF metadata
+    let mut meta_path = args.input.clone();
+    meta_path.set_extension("sigmf-meta");
+
+    let mut sample_rate = args.sample_rate.unwrap_or(100_000_000);
+    let mut fm_deviation = args.fm_deviation.unwrap_or(17_000_000.0);
+    let mut rf_center_freq = 5_800_000_000.0_f64;
+    let mut channels_to_spawn = Vec::new();
+
+    if meta_path.exists() {
+        println!("Found SigMF metadata: {:?}", meta_path);
+        let meta_str = std::fs::read_to_string(&meta_path)?;
+        let meta_json: serde_json::Value = serde_json::from_str(&meta_str)?;
+
+        if let Some(global) = meta_json.get("global") {
+            if let Some(sr) = global.get("core:sample_rate").and_then(|v| v.as_u64()) {
+                sample_rate = sr as u32;
+            }
+            if let Some(dev) = global.get("fpv:fm_deviation").and_then(|v| v.as_f64()) {
+                fm_deviation = dev as f32;
+            }
+            // The parser below reads interleaved little-endian f32 IQ
+            // pairs unconditionally; any other recorded datatype would
+            // silently decode as garbage, so reject it loudly instead.
+            match global.get("core:datatype").and_then(|v| v.as_str()) {
+                Some("cf32_le") | None => {}
+                Some(other) => anyhow::bail!(
+                    "unsupported SigMF core:datatype '{}'; only cf32_le (interleaved little-endian f32 IQ) is supported",
+                    other
+                ),
+            }
+        }
+
+        if let Some(captures) = meta_json.get("captures").and_then(|v| v.as_array())
+            && let Some(first_cap) = captures.first()
+            && let Some(freq) = first_cap.get("core:frequency").and_then(|v| v.as_f64())
+        {
+            rf_center_freq = freq;
+        }
+
+        if let Some(annotations) = meta_json.get("annotations").and_then(|v| v.as_array()) {
+            for ann in annotations {
+                let lower = ann
+                    .get("core:freq_lower_edge")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let upper = ann
+                    .get("core:freq_upper_edge")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let label = ann
+                    .get("core:label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown");
+
+                let freq_offset = (lower + upper) / 2.0;
+                let label_upper = label.to_uppercase();
+                let sig_type = if label_upper.contains("PAL") {
+                    Some(SignalType::AnalogVideoPal)
+                } else if label_upper.contains("NTSC") {
+                    Some(SignalType::AnalogVideoNtsc)
+                } else if label_upper.contains("ANALOG") || label_upper.contains("VIDEO") {
+                    None
+                } else {
+                    continue;
+                };
+
+                channels_to_spawn.push((sig_type, freq_offset as f32, label.to_string()));
+            }
+        }
+    }
+
+    if channels_to_spawn.is_empty() {
+        channels_to_spawn.push((None, -25_000_000.0, "Channel A".to_string()));
+        channels_to_spawn.push((None, 25_000_000.0, "Channel B".to_string()));
+    }
+
+    println!(
+        "Configuration loaded: {} MSPS, {} MHz Deviation",
+        sample_rate as f32 / 1e6,
+        fm_deviation / 1e6
+    );
+
+    let mut data_path = args.input.clone();
+    if data_path.extension().and_then(|s| s.to_str()) == Some("sigmf-meta") {
+        data_path.set_extension("sigmf-data");
+    }
+
+    // Validate the resolved DSP parameters before they feed buffer-size
+    // and filter math: a zero sample rate makes `chunk_size` 0 (an
+    // empty read that silently "succeeds" on an empty slice), and a
+    // non-positive deviation collapses the DDC passband.
+    if sample_rate == 0 {
+        anyhow::bail!("sample rate resolved to 0 Hz; pass a valid --sample-rate");
+    }
+    if fm_deviation <= 0.0 {
+        anyhow::bail!(
+            "fm deviation resolved to {} Hz; pass a positive --fm-deviation",
+            fm_deviation
+        );
+    }
+
+    let mut file = File::open(&data_path)?;
+    let chunk_size = sample_rate as usize / 10;
+    let mut buf = vec![0u8; chunk_size * 8];
+
+    file.read_exact(&mut buf)?;
+
+    let first_iq: Vec<Complex<f32>> = buf
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let re = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let im = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            Complex::new(re, im)
+        })
+        .collect();
+
+    let detector = AnalogFpvDetector::default();
+    let mut resolved_channels: Vec<(SignalType, f32, f32)> = Vec::new();
+    for (maybe_type, freq_offset, label) in &channels_to_spawn {
+        let sig_type = if let Some(t) = maybe_type {
+            println!(
+                "Channel '{}' at {:.0} MHz: explicitly labeled {:?}",
+                label,
+                freq_offset / 1e6,
+                t
+            );
+            *t
+        } else {
+            println!(
+                "Channel '{}' at {:.0} MHz: probing signal...",
+                label,
+                freq_offset / 1e6
+            );
+            let mut probe_ddc =
+                StreamingDDC::new(*freq_offset, sample_rate, fm_deviation + LUMA_HEADROOM_HZ);
+            let probe_iq = probe_ddc.process(&first_iq);
+            let (detected_type, confidence) = detector.detect_sync_pulses(&probe_iq, sample_rate);
+            if matches!(
+                detected_type,
+                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
+            ) {
+                println!(
+                    "  → Auto-detected: {:?} (confidence {:.0}%)",
+                    detected_type,
+                    confidence * 100.0
+                );
+                detected_type
+            } else if detected_type == SignalType::Unknown {
+                println!("  → Could not detect standard, defaulting to NTSC");
+                SignalType::AnalogVideoNtsc
+            } else {
+                concretize_standard(
+                    detected_type,
+                    &probe_iq,
+                    sample_rate,
+                    SignalType::AnalogVideoNtsc,
+                )
+            }
+        };
+        resolved_channels.push((
+            sig_type,
+            *freq_offset,
+            (fm_deviation + LUMA_HEADROOM_HZ) * 2.0,
+        ));
+    }
+
+    let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let _ = run_viewer_pipeline(
+        resolved_channels,
+        sample_rate,
+        fm_deviation,
+        args.deemphasis_tau,
+        args.demod,
+        args.denoise,
+        args.denoise_model.clone(),
+        rf_center_freq,
+        args.debug,
+        args.temporal_window,
+        None,
+        exit_reason,
+        tune_freq,
+        move |channel_txs, _exit_flag| {
+            let _ = file.seek(SeekFrom::Start(0));
+            let mut active_txs = channel_txs;
+            loop {
+                if active_txs.is_empty() {
+                    return;
+                }
+                match file.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = file.seek(SeekFrom::Start(0));
+                    }
+                    Ok(bytes_read) => {
+                        let samples_read = bytes_read / 8;
+                        // Parse via from_le_bytes rather than
+                        // bytemuck::cast_slice: cast_slice panics by
+                        // contract if the Vec<u8> isn't 4-byte aligned,
+                        // which the allocator happens to guarantee today
+                        // but nothing requires.
+                        let iq_vec: Vec<Complex<f32>> = buf[..samples_read * 8]
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| {
+                                let re = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                                let im = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+                                Complex::new(re, im)
+                            })
+                            .collect();
+                        let pooled =
+                            orecchiette_sdr_source_rs::PooledIqBuffer::new_unpooled(iq_vec);
+                        let arc_chunk = Arc::new(pooled);
+                        active_txs.retain(|tx| tx.send(Arc::clone(&arc_chunk)).is_ok());
+                    }
+                    Err(_) => break,
+                }
+            }
+        },
+    )?;
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE USRP MODE
+// ═══════════════════════════════════════════════════════════════════
+
+pub enum RunLiveResult {
+    UserExit,
+    SignalLost,
+    TooManyOverruns,
+    /// User pressed 'S' — skip this frequency and resume scanning.
+    SkipFrequency,
+    /// User pressed 'N' — find the next signal (resume scanning without blacklisting).
+    NextChannel,
+    /// User pressed 'C' + two-char channel name — tune to a specific channel.
+    TuneToChannel(f64),
+}
+
+/// Helper: convert a minifb Key to an ASCII char (A-Z, 0-9).
+fn key_to_char(k: Key) -> Option<char> {
+    match k {
+        Key::A => Some('A'),
+        Key::B => Some('B'),
+        Key::C => Some('C'),
+        Key::D => Some('D'),
+        Key::E => Some('E'),
+        Key::F => Some('F'),
+        Key::G => Some('G'),
+        Key::H => Some('H'),
+        Key::I => Some('I'),
+        Key::J => Some('J'),
+        Key::K => Some('K'),
+        Key::L => Some('L'),
+        Key::M => Some('M'),
+        Key::N => Some('N'),
+        Key::O => Some('O'),
+        Key::P => Some('P'),
+        Key::Q => Some('Q'),
+        Key::R => Some('R'),
+        Key::S => Some('S'),
+        Key::T => Some('T'),
+        Key::U => Some('U'),
+        Key::V => Some('V'),
+        Key::W => Some('W'),
+        Key::X => Some('X'),
+        Key::Y => Some('Y'),
+        Key::Z => Some('Z'),
+        Key::Key0 | Key::NumPad0 => Some('0'),
+        Key::Key1 | Key::NumPad1 => Some('1'),
+        Key::Key2 | Key::NumPad2 => Some('2'),
+        Key::Key3 | Key::NumPad3 => Some('3'),
+        Key::Key4 | Key::NumPad4 => Some('4'),
+        Key::Key5 | Key::NumPad5 => Some('5'),
+        Key::Key6 | Key::NumPad6 => Some('6'),
+        Key::Key7 | Key::NumPad7 => Some('7'),
+        Key::Key8 | Key::NumPad8 => Some('8'),
+        Key::Key9 | Key::NumPad9 => Some('9'),
+        _ => None,
+    }
+}
+
+/// State machine for the C -> two-char channel input.
+#[derive(Debug, Clone)]
+enum ChannelInputState {
+    /// Not active.
+    Idle,
+    /// Waiting for first character (the band letter).
+    WaitingFirst,
+    /// Got the first character, waiting for second (the channel number).
+    WaitingSecond(char),
+}
+
+fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
+    use orecchiette_sdr_usrp_rs::UsrpSource;
+
+    let initial_sample_rate = if let Some(sr) = args.live.sample_rate {
+        println!("Using user-specified sample rate: {:.2} MSPS", sr / 1e6);
+        sr
+    } else {
+        println!("No sample rate specified. Defaulting to 25.00 MSPS.");
+        25_000_000.0
+    };
+
+    let mut current_sample_rate = initial_sample_rate;
+    let auto_scan = args.live.channel.is_none();
+    let mut current_mode = if auto_scan {
+        ViewerMode::Scan
+    } else {
+        ViewerMode::SingleChannel
+    };
+
+    // Frequencies temporarily blacklisted by the user pressing 'S'.
+    // Cleared only when the user exits entirely.
+    let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    let mut sweep = SweepState::new(args.live.scan_bands);
+
+    let mut explicit_freq = if let Some(ref ch) = args.live.channel {
+        Some(resolve_channel(ch)?)
+    } else {
+        None
+    };
+
+    let fm_deviation = args.live.fm_deviation;
+
+    loop {
+        let center_freq = match current_mode {
+            ViewerMode::SingleChannel => {
+                // Invariant: SingleChannel mode is only entered with a
+                // resolved frequency. Surface a clean error instead of
+                // panicking if a future state-machine edit ever breaks
+                // that.
+                let freq = explicit_freq.ok_or_else(|| {
+                    anyhow::anyhow!("SingleChannel mode entered with no frequency set")
+                })?;
+                let ch_name = get_fpv_channel_name(freq / 1e6)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{:.2} MHz", freq / 1e6));
+                println!("Single-channel mode: {} ({:.3} MHz)", ch_name, freq / 1e6);
+                freq
+            }
+            ViewerMode::Scan => {
+                let hop_freqs = build_scan_hops(current_sample_rate, args.live.scan_bands);
+                sweep.band.set_plan(
+                    hop_freqs.clone(),
+                    current_sample_rate * USABLE_SPAN_FRACTION,
+                );
+                sweep.band.set_skipped(&skipped_freqs);
+                if sweep.ui.is_none() {
+                    sweep.ui = Some(ScanWindow::open(sweep.band.full_height())?);
+                }
+                println!(
+                    "Wideband scan requested [{}]. {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
+                    args.live.scan_bands.label(),
+                    args.live.scan_bands.channel_freqs_hz().len(),
+                    hop_freqs.len(),
+                    current_sample_rate * USABLE_SPAN_FRACTION / 1e6
+                );
+
+                let config = SourceConfig {
+                    sample_rate_hz: current_sample_rate,
+                    channels_hz: hop_freqs.clone(),
+                    // Long enough to actually deliver
+                    // `DETECT_PACKETS_PER_HOP` captures plus retune
+                    // settling. Two 65,536-sample packets is 5.2 ms of
+                    // signal at 25 MSPS and 6.6 ms at 20 MSPS, so 20 ms
+                    // leaves comfortable margin at every rate the scan
+                    // runs at. Two detection passes are ~18 ms of CPU,
+                    // so the hop is bound by that rather than by the
+                    // dwell.
+                    //
+                    // `dwell_max == dwell_min` leaves the source crate's
+                    // adaptive dwell off: a longer look neither promotes
+                    // confidence on a strong signal (it plateaus at 0.80
+                    // from the second packet) nor recovers a weak one
+                    // (the sigma cliff sits between 1.0 and 1.5 and does
+                    // not move with 12x the dwell).
+                    dwell_min: Duration::from_millis(20),
+                    dwell_max: Duration::from_millis(20),
+                    dwell_extension: Duration::ZERO,
+                };
+                let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
+                let source = Box::new(UsrpSource {
+                    args: args.args.clone(),
+                    gain_db: args.gain,
+                    antenna: args.antenna.clone(),
+                });
+
+                let handle = source.start(config, advice.clone())?;
+                let detector = viewer_detector();
+                let mut best_hit: Option<(f64, f32, SignalType)> = None;
+                let mut seen_freqs = std::collections::HashSet::new();
+                let mut sweeps_completed = 0;
+                let mut last_progress_msg = Instant::now();
+                let mut last_processed_freq = 0;
+                let mut packets_this_hop = 0usize;
+                let multi_hop = hop_freqs.len() > 1;
+                let mut probes: Vec<ProbeEnergy> = Vec::new();
+
+                // `None` when the operator closed the scan window.
+                let found_freq: Option<f64> = 'scan_loop: loop {
+                    let packet = match handle.receiver.recv_timeout(Duration::from_millis(1000)) {
+                        Ok(packet) => packet,
+                        // `recv_timeout` returns Err immediately when the
+                        // sender is dropped (capture thread died — e.g. a
+                        // USB reset), not only after the timeout. Retrying
+                        // a disconnected channel busy-spins at 100% CPU
+                        // flooding stdout, with no exit path.
+                        Err(e) if e.is_disconnected() => {
+                            anyhow::bail!(
+                                "SDR capture thread died during scan (channel disconnected)"
+                            );
+                        }
+                        Err(_) => {
+                            println!("SDR timed out during scan. Retrying...");
+                            continue;
+                        }
+                    };
+                    {
+                        let center = packet.center_frequency_hz as u64;
+
+                        // Pump the scan window on every packet, drained
+                        // ones included, so it stays responsive.
+                        if let Some(ui) = sweep.ui.as_mut()
+                            && !ui.update(&sweep.band)
+                        {
+                            (handle.stop)();
+                            break 'scan_loop None;
+                        }
+
+                        // Feed the sweep `DETECT_PACKETS_PER_HOP` packets
+                        // per hop, then drain the rest of the dwell so the
+                        // SDR's buffer doesn't overflow.
+                        //
+                        // A change of centre frequency is the only signal
+                        // `IqPacket` carries that a new hop began, so the
+                        // budget resets on that. `plan_tune_centers`
+                        // dedups and emits strictly ascending centres
+                        // (pinned by `tune_planner_emits_ascending_hops`),
+                        // so two consecutive hops never share one.
+                        //
+                        // With a single tune the source never retunes, so
+                        // there is no boundary to observe and no hop to
+                        // drain for; every packet is processed.
+                        if multi_hop && center == last_processed_freq {
+                            if packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                                continue;
+                            }
+                        } else if center != last_processed_freq {
+                            last_processed_freq = center;
+                            packets_this_hop = 0;
+                        }
+                        packets_this_hop += 1;
+
+                        seen_freqs.insert(center);
+
+                        let results = detector.detect_from_iq_integrated_with_probes(
+                            &packet.samples,
+                            center,
+                            current_sample_rate as u32,
+                            &mut sweep.integrator,
+                            &mut probes,
+                        );
+                        // With one tune there is no retune to mark a new
+                        // look, so every packet replaces the last.
+                        sweep.band.record_hop(
+                            center as f64,
+                            packets_this_hop == 1 || !multi_hop,
+                            &probes,
+                            &results,
+                        );
+                        for res in results {
+                            let ch_name = get_fpv_channel_name(res.frequency_hz as f64 / 1e6)
+                                .unwrap_or("Unknown");
+                            println!(
+                                "  → Found {:?} at {:.3} MHz (channel {}, conf {:.0}%, rssi {:.1} dBm)",
+                                res.signal_type,
+                                res.frequency_hz as f64 / 1e6,
+                                ch_name,
+                                res.confidence * 100.0,
+                                res.rssi_dbm
+                            );
+                            // A hit is selectable unless the user
+                            // blacklisted everything it could tune to.
+                            // Off-table bands (3.3 GHz, 6-7 GHz) have no
+                            // channel-table candidates at all; those tune
+                            // to the detection frequency itself (the
+                            // `candidates.is_empty()` snap below), so
+                            // they are gated on that frequency's own skip
+                            // key rather than on having a candidate.
+                            let candidates = get_candidate_fpv_channels(res.frequency_hz as f64);
+                            let selectable = if candidates.is_empty() {
+                                // Off-table hits tune to (and get
+                                // blacklisted at) their raw detection
+                                // frequency, which jitters by up to a
+                                // probe step (~2.5 MHz) between sweeps —
+                                // an exact u64 match would never
+                                // re-recognise a skipped signal. Match
+                                // within the same tolerance the channel
+                                // snap uses.
+                                !skipped_freqs.iter().any(|&s| {
+                                    (s as f64 - res.frequency_hz as f64).abs()
+                                        <= CHANNEL_SNAP_TOLERANCE_MHZ * 1e6
+                                })
+                            } else {
+                                candidates
+                                    .iter()
+                                    .any(|&c| !skipped_freqs.contains(&(c.round() as u64)))
+                            };
+                            let better = best_hit
+                                .map(|(_, best_rssi, _)| res.rssi_dbm > best_rssi)
+                                .unwrap_or(true);
+                            if selectable && better {
+                                best_hit =
+                                    Some((res.frequency_hz as f64, res.rssi_dbm, res.signal_type));
+                            }
+                        }
+                        // Sweep is complete once every hop has been visited
+                        // *and* the current one has had its full packet
+                        // budget. Without the budget half of that test this
+                        // fires on the first packet of the last hop, which
+                        // both cuts that hop short of the two passes it
+                        // needs to detect anything and clears `seen_freqs`
+                        // mid-hop, sliding the sweep boundary one hop
+                        // earlier on every subsequent pass.
+                        if seen_freqs.len() >= hop_freqs.len()
+                            && packets_this_hop >= DETECT_PACKETS_PER_HOP
+                        {
+                            sweep.band.end_sweep();
+                            if let Some((freq, _rssi, _sig_type)) = best_hit {
+                                // Found something, break out of the infinite scan loop
+                                (handle.stop)();
+                                std::thread::sleep(Duration::from_millis(200));
+
+                                let mut candidates = get_candidate_fpv_channels(freq);
+                                candidates
+                                    .retain(|&c| !skipped_freqs.contains(&(c.round() as u64)));
+                                if candidates.is_empty() {
+                                    let snapped_freq = snap_to_nearest_fpv_channel(freq);
+                                    let ch_name = get_fpv_channel_name(snapped_freq / 1e6)
+                                        .unwrap_or("Unknown");
+                                    println!(
+                                        "Sweep complete. Auto-tuning to exact channel: {} ({:.3} MHz) [raw hit at {:.3} MHz]",
+                                        ch_name,
+                                        snapped_freq / 1e6,
+                                        freq / 1e6
+                                    );
+                                    break 'scan_loop Some(snapped_freq);
+                                }
+
+                                println!(
+                                    "Coarse hit at {:.3} MHz. Fine-tuning across {} candidate channels...",
+                                    freq / 1e6,
+                                    candidates.len()
+                                );
+
+                                let ft_config = SourceConfig {
+                                    sample_rate_hz: current_sample_rate,
+                                    channels_hz: candidates.clone(),
+                                    // Fine-tune needs slightly more settle time
+                                    // but still only one chunk per candidate.
+                                    dwell_min: Duration::from_millis(15),
+                                    dwell_max: Duration::from_millis(15),
+                                    dwell_extension: Duration::ZERO,
+                                };
+                                let ft_source = Box::new(UsrpSource {
+                                    args: args.args.clone(),
+                                    gain_db: args.gain,
+                                    antenna: args.antenna.clone(),
+                                });
+                                let ft_handle = ft_source.start(ft_config, advice.clone())?;
+
+                                let mut ft_best_hit: Option<(f64, f32, f32)> = None;
+                                let mut ft_seen = std::collections::HashSet::new();
+                                let mut ft_last_freq = 0;
+
+                                loop {
+                                    let packet = match ft_handle
+                                        .receiver
+                                        .recv_timeout(Duration::from_millis(1000))
+                                    {
+                                        Ok(packet) => packet,
+                                        // Same immediate-Err-on-disconnect
+                                        // semantics as the coarse loop above.
+                                        Err(e) if e.is_disconnected() => {
+                                            anyhow::bail!(
+                                                "SDR capture thread died during fine-tune (channel disconnected)"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            println!("SDR timed out during fine-tune. Retrying...");
+                                            continue;
+                                        }
+                                    };
+                                    {
+                                        let center = packet.center_frequency_hz as u64;
+
+                                        // Drain duplicates to stay real-time
+                                        if center == ft_last_freq {
+                                            continue;
+                                        }
+                                        ft_last_freq = center;
+
+                                        ft_seen.insert(center);
+
+                                        let (_sig_type, conf) = detector.detect_sync_pulses(
+                                            &packet.samples,
+                                            current_sample_rate as u32,
+                                        );
+
+                                        let mut rssi = -100.0;
+                                        if let Some(res) = detector
+                                            .detect_from_iq(
+                                                &packet.samples,
+                                                center,
+                                                current_sample_rate as u32,
+                                            )
+                                            .first()
+                                        {
+                                            rssi = res.rssi_dbm;
+                                        }
+
+                                        println!(
+                                            "  → Testing {:.3} MHz ({}): conf {:.0}%, rssi {:.1} dBm",
+                                            center as f64 / 1e6,
+                                            get_fpv_channel_name(center as f64 / 1e6)
+                                                .unwrap_or("Unknown"),
+                                            conf * 100.0,
+                                            rssi
+                                        );
+
+                                        if let Some((_, best_conf, best_rssi)) = ft_best_hit {
+                                            // Use confidence first, RSSI as a tie-breaker or fallback if confidences are similar
+                                            if conf > best_conf + 0.05
+                                                || (conf > best_conf - 0.05 && rssi > best_rssi)
+                                            {
+                                                ft_best_hit = Some((center as f64, conf, rssi));
+                                            }
+                                        } else {
+                                            ft_best_hit = Some((center as f64, conf, rssi));
+                                        }
+
+                                        if ft_seen.len() >= candidates.len() {
+                                            (ft_handle.stop)();
+                                            std::thread::sleep(Duration::from_millis(200));
+
+                                            if let Some((best_freq, best_conf, _)) = ft_best_hit
+                                                && best_conf > 0.1
+                                            {
+                                                println!(
+                                                    "Fine-tuning complete. Selected exact channel: {} ({:.3} MHz)",
+                                                    get_fpv_channel_name(best_freq / 1e6)
+                                                        .unwrap_or("Unknown"),
+                                                    best_freq / 1e6
+                                                );
+                                                break 'scan_loop Some(best_freq);
+                                            }
+
+                                            println!(
+                                                "Fine-tuning didn't find clear sync pulses. Falling back to simple snap."
+                                            );
+                                            let snapped_freq = snap_to_nearest_fpv_channel(freq);
+                                            let ch_name = get_fpv_channel_name(snapped_freq / 1e6)
+                                                .unwrap_or("Unknown");
+                                            println!(
+                                                "Auto-tuning to exact channel: {} ({:.3} MHz)",
+                                                ch_name,
+                                                snapped_freq / 1e6
+                                            );
+                                            break 'scan_loop Some(snapped_freq);
+                                        }
+                                    }
+                                }
+                            } else {
+                                sweeps_completed += 1;
+                                // Time-gated, not every Nth sweep. A sweep
+                                // is `tunes × dwell`, which ranges from
+                                // ~120 ms for six tunes to ~2 s for the
+                                // whole table — so a fixed sweep count
+                                // prints either far too often or barely at
+                                // all depending on --scan-bands and the
+                                // sample rate. It also bounds the
+                                // degenerate single-tune case, where a
+                                // "sweep" is one hop and completes on
+                                // every packet.
+                                if last_progress_msg.elapsed() >= Duration::from_secs(5) {
+                                    println!(
+                                        "Still sweeping ({sweeps_completed} passes)... no signals found yet."
+                                    );
+                                    last_progress_msg = Instant::now();
+                                }
+                                // Reset for the next sweep.
+                                seen_freqs.clear();
+                            }
+                        }
+                    }
+                };
+                let Some(found_freq) = found_freq else {
+                    // The operator closed the scan window: done.
+                    break;
+                };
+                explicit_freq = Some(found_freq);
+                found_freq
+            }
+        };
+
+        let source = Box::new(UsrpSource {
+            args: args.args.clone(),
+            gain_db: args.gain,
+            antenna: args.antenna.clone(),
+        });
+
+        // The picture window takes over from the scan window.
+        sweep.ui = None;
+        match run_live(
+            source,
+            current_sample_rate,
+            fm_deviation,
+            args.live.deemphasis_tau,
+            args.live.demod,
+            args.live.denoise,
+            args.live.denoise_model.clone(),
+            center_freq,
+            args.live.standard,
+            None,
+            args.live.debug,
+            args.live.temporal_window,
+            Some(&sweep.band),
+            OverrunPolicy::StepDown,
+            Duration::ZERO,
+        )? {
+            RunLiveResult::UserExit => {
+                break;
+            }
+            RunLiveResult::SignalLost => {
+                println!("Signal lost. Resuming scan...");
+                if auto_scan {
+                    current_mode = ViewerMode::Scan;
+                    explicit_freq = None;
+                } else {
+                    println!("Cannot resume scan in explicit channel mode. Exiting.");
+                    break;
+                }
+            }
+            RunLiveResult::SkipFrequency => {
+                let freq_key = center_freq.round() as u64;
+                skipped_freqs.insert(freq_key);
+                println!(
+                    "Skipped {:.3} MHz ({}). {} frequencies blacklisted. Resuming scan...",
+                    center_freq / 1e6,
+                    get_fpv_channel_name(center_freq / 1e6).unwrap_or("Unknown"),
+                    skipped_freqs.len()
+                );
+                if auto_scan {
+                    current_mode = ViewerMode::Scan;
+                    explicit_freq = None;
+                } else {
+                    println!("Cannot resume scan in explicit channel mode. Exiting.");
+                    break;
+                }
+            }
+            RunLiveResult::NextChannel => {
+                println!("Finding next channel...");
+                if auto_scan {
+                    current_mode = ViewerMode::Scan;
+                    explicit_freq = None;
+                } else {
+                    println!("Cannot scan for next channel in explicit channel mode. Exiting.");
+                    break;
+                }
+            }
+            RunLiveResult::TuneToChannel(freq) => {
+                let ch_name = get_fpv_channel_name(freq / 1e6)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{:.2} MHz", freq / 1e6));
+                println!("Tuning to channel {} ({:.3} MHz)...", ch_name, freq / 1e6);
+                explicit_freq = Some(freq);
+                current_mode = ViewerMode::SingleChannel;
+            }
+            RunLiveResult::TooManyOverruns => {
+                println!("Hardware buffer overrun limit reached.");
+                if current_sample_rate > 16_000_000.0 {
+                    current_sample_rate -= 5_000_000.0;
+                    println!(
+                        "Stepping down SDR sample rate to {:.2} MSPS...",
+                        current_sample_rate / 1e6
+                    );
+                    if auto_scan {
+                        current_mode = ViewerMode::Scan;
+                        explicit_freq = None;
+                    }
+                } else {
+                    println!("Sample rate is already near minimum. Cannot step down further.");
+                    if auto_scan {
+                        current_mode = ViewerMode::Scan;
+                        explicit_freq = None;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Use process::exit to skip UHD's broken C++ static destructors.
+    // libuhd keeps a global `std::map<unsigned long, usrp_ptr>` that
+    // double-frees during __cxa_finalize if the Rust side already dropped
+    // the Usrp handle.  The capture thread is already stopped cleanly by
+    // handle_stop() in run_live, so this is safe.
+    std::process::exit(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE HACKRF MODE
+// ═══════════════════════════════════════════════════════════════════
+
+fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
+    use orecchiette_sdr_hackrf_rs::{HACKRF_MAX_SAMPLE_RATE_HZ, HackRfSource};
+
+    // HackRF One is USB 2.0: default to its ~20 MSPS ceiling (just enough
+    // for analog FPV's ~20 MHz FM) and clamp any larger request to it.
+    let requested = args.live.sample_rate.unwrap_or(HACKRF_MAX_SAMPLE_RATE_HZ);
+    let sample_rate = requested.min(HACKRF_MAX_SAMPLE_RATE_HZ);
+    if requested > HACKRF_MAX_SAMPLE_RATE_HZ {
+        println!(
+            "Requested {:.2} MSPS exceeds the HackRF's {:.0} MSPS USB-2.0 ceiling; using {:.0} MSPS.",
+            requested / 1e6,
+            HACKRF_MAX_SAMPLE_RATE_HZ / 1e6,
+            sample_rate / 1e6
+        );
+    } else {
+        println!("HackRF sample rate: {:.2} MSPS.", sample_rate / 1e6);
+    }
+
+    let fm_deviation = args.live.fm_deviation;
+    let auto_scan = args.live.channel.is_none();
+    let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Cross-sweep spectral integration (see the USRP path's note).
+    let mut sweep = SweepState::new(args.live.scan_bands);
+    let mut explicit_freq = match args.live.channel {
+        Some(ref ch) => Some(resolve_channel(ch)?),
+        None => None,
+    };
+
+    // What the sweep classified the chosen signal as. Carried into the
+    // live decode so a concrete PAL/NTSC verdict from the scan is not
+    // re-derived (and possibly lost) by the single-channel re-detect:
+    // the sweep integrates several looks per hop, while the re-detect
+    // gets one centre and a fallback default — it measured NTSC on air
+    // and then decoded it as default-PAL geometry.
+    let mut scan_standard: Option<SignalType> = None;
+    loop {
+        let center_freq = match explicit_freq {
+            Some(f) => f,
+            None => match scan_band_for_channel(
+                Box::new(HackRfSource {
+                    lna_gain: args.lna_gain,
+                    vga_gain: args.vga_gain,
+                    amp_enable: args.amp,
+                    bias_tee: args.bias_tee,
+                }),
+                "HackRF",
+                sample_rate,
+                args.live.scan_bands,
+                // See the USRP scan's dwell for why 20 ms and why
+                // adaptive dwell stays off. HackRF retunes its
+                // synthesiser in well under a millisecond, and its
+                // 20 MSPS ceiling makes packets the longest of any
+                // backend at 3.3 ms — 20 ms lands the per-hop budget
+                // with margin.
+                Duration::from_millis(20),
+                &skipped_freqs,
+                &mut sweep,
+            )? {
+                // Used directly as this iteration's centre; in auto-scan
+                // mode the RunLiveResult handling below decides whether to
+                // re-scan, so we don't need to stash it in `explicit_freq`.
+                ScanOutcome::Found(f, sig) => {
+                    scan_standard = match sig {
+                        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => Some(sig),
+                        _ => None,
+                    };
+                    f
+                }
+                ScanOutcome::Empty => {
+                    println!("No analog FPV signal found in the scan band. Retrying...");
+                    continue;
+                }
+                ScanOutcome::Quit => break,
+            },
+        };
+
+        let ch_name = get_fpv_channel_name(center_freq / 1e6)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{:.2} MHz", center_freq / 1e6));
+        println!("HackRF tuned: {} ({:.3} MHz)", ch_name, center_freq / 1e6);
+
+        let source = Box::new(HackRfSource {
+            lna_gain: args.lna_gain,
+            vga_gain: args.vga_gain,
+            amp_enable: args.amp,
+            bias_tee: args.bias_tee,
+        });
+
+        // The picture window takes over from the scan window.
+        sweep.ui = None;
+        match run_live(
+            source,
+            sample_rate,
+            fm_deviation,
+            args.live.deemphasis_tau,
+            args.live.demod,
+            args.live.denoise,
+            args.live.denoise_model.clone(),
+            center_freq,
+            args.live.standard,
+            scan_standard,
+            args.live.debug,
+            args.live.temporal_window,
+            Some(&sweep.band),
+            OverrunPolicy::StepDown,
+            Duration::ZERO,
+        )? {
+            RunLiveResult::UserExit => break,
+            RunLiveResult::SignalLost | RunLiveResult::NextChannel => {
+                if auto_scan {
+                    explicit_freq = None;
+                } else {
+                    println!("Signal lost (explicit-channel mode). Exiting.");
+                    break;
+                }
+            }
+            RunLiveResult::SkipFrequency => {
+                skipped_freqs.insert(center_freq.round() as u64);
+                if auto_scan {
+                    explicit_freq = None;
+                } else {
+                    break;
+                }
+            }
+            RunLiveResult::TuneToChannel(freq) => {
+                explicit_freq = Some(freq);
+                scan_standard = None;
+            }
+            // HackRF doesn't surface hardware-overrun metadata, so this
+            // variant isn't expected from its backend; handle it like a
+            // signal loss to stay exhaustive and safe.
+            RunLiveResult::TooManyOverruns => {
+                if auto_scan {
+                    explicit_freq = None;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a backend keeps between sweeps: the cross-sweep integrator (a
+/// weak signal accumulates sensitivity sweep over sweep, ~+5 dB after
+/// four visits to a hop; buckets self-reset if the sample rate steps
+/// down), the band panel's model, and the scan window, which is open
+/// only while sweeping.
+struct SweepState {
+    integrator: SpectralIntegrator,
+    band: BandScan,
+    ui: Option<ScanWindow>,
+}
+
+impl SweepState {
+    fn new(bands: ScanBands) -> Self {
+        SweepState {
+            integrator: SpectralIntegrator::new(4),
+            band: BandScan::new(bands.channels()),
+            ui: None,
+        }
+    }
+}
+
+/// What a backend wants done when the source flags an overrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrunPolicy {
+    /// The host cannot keep up with the hardware: give the channel up so
+    /// the caller can step the sample rate down (USRP over USB).
+    StepDown,
+    /// A gap in a network stream drops a few samples and glitches the
+    /// picture; it says nothing about the channel. Count it, keep going.
+    /// The RTSA HTTP server also leaves timestamp gaps around every
+    /// retune, which under `StepDown` ended a fresh lock within 200 ms.
+    #[cfg_attr(not(feature = "aaronia"), allow(dead_code))]
+    Tolerate,
+}
+
+/// How long the RTSA HTTP server keeps delivering samples from the
+/// previous centre after acknowledging a retune, over and above the
+/// driver's own 75 ms drain: measured at 150–300 ms. Packets inside this
+/// window belong to the old channel, whatever their label says.
+#[cfg(feature = "aaronia")]
+const AARONIA_HTTP_TUNE_SETTLE: Duration = Duration::from_millis(400);
+
+/// Length of contiguous signal the standard is decided on. PAL and NTSC
+/// line rates are 109 Hz apart, so the FFT separates them only past
+/// ~9.2 ms of record; one 65,536-sample packet is 1–4 ms at the live
+/// rates, and on that the library can only answer "analog video,
+/// standard unknown" — measured on a clean 20 dB NTSC link, which then
+/// decoded as PAL. 25 ms puts the two rates 2.6 bins apart.
+const STANDARD_DETECT_RECORD: Duration = Duration::from_millis(25);
+/// Give up waiting for a clean record after this long and decide on
+/// whatever was gathered.
+const STANDARD_DETECT_PATIENCE: Duration = Duration::from_millis(1500);
+
+/// Confidence floor for the sweep and the lock check. Both ask whether
+/// analog video is present, not which standard it is: the standard is
+/// settled afterwards on a long record (`STANDARD_DETECT_RECORD`). Their
+/// 1–4 ms packets cannot resolve PAL from NTSC, and the library reports
+/// that honestly as `AnalogVideoUnknown` at 0.6 — a hit that has passed
+/// the harmonic and cepstral gates — which the detector's default 0.7
+/// floor discarded. Measured on a 20 dB NTSC link at 15.36 MSPS: the
+/// sweep reported an empty band on every pass, and a decoder with
+/// perfect vertical sync "lost" its signal on every check.
+const VIEWER_MIN_CONFIDENCE: f32 = 0.55;
+
+/// The detector every live path uses, with the floor above.
+fn viewer_detector() -> AnalogFpvDetector {
+    let mut d = AnalogFpvDetector::default();
+    d.min_confidence = VIEWER_MIN_CONFIDENCE;
+    d
+}
+
+/// What a coarse sweep came back with.
+enum ScanOutcome {
+    /// A channel to tune to, and what the sweep classified it as.
+    Found(f64, SignalType),
+    /// The band was quiet this pass.
+    Empty,
+    /// The operator closed the scan window or pressed `Q`.
+    Quit,
+}
+
+/// Single-stage coarse scan shared by the hopping backends: sweep the
+/// planned tune centres, run the wideband detector on
+/// `DETECT_PACKETS_PER_HOP` chunks per hop, and snap the strongest
+/// (non-blacklisted) hit to the nearest FPV channel. Returns `None` if
+/// the band is empty.
+///
+/// This is intentionally simpler than the USRP path's two-stage
+/// coarse-then-fine-tune sweep — the single coarse snap is enough to
+/// land on a channel. The `source` decides what actually retunes:
+/// HackRF hops its synthesiser, while the Aaronia HTTP backend issues a
+/// capture-config update to the RTSA server per hop, whose latency is
+/// network-dependent — the per-hop packet budget doesn't care how long
+/// a retune took, only that fresh packets eventually arrive at the new
+/// centre.
+fn scan_band_for_channel(
+    source: Box<dyn SdrSource>,
+    backend_label: &str,
+    sample_rate: f64,
+    scan_bands: ScanBands,
+    dwell: Duration,
+    skipped_freqs: &std::collections::HashSet<u64>,
+    sweep: &mut SweepState,
+) -> anyhow::Result<ScanOutcome> {
+    let hop_freqs = build_scan_hops(sample_rate, scan_bands);
+    sweep
+        .band
+        .set_plan(hop_freqs.clone(), sample_rate * USABLE_SPAN_FRACTION);
+    sweep.band.set_skipped(skipped_freqs);
+    if sweep.ui.is_none() {
+        sweep.ui = Some(ScanWindow::open(sweep.band.full_height())?);
+    }
+    println!(
+        "{backend_label} wideband scan [{}]: {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
+        scan_bands.label(),
+        scan_bands.channel_freqs_hz().len(),
+        hop_freqs.len(),
+        sample_rate * USABLE_SPAN_FRACTION / 1e6
+    );
+    let config = SourceConfig {
+        sample_rate_hz: sample_rate,
+        channels_hz: hop_freqs.clone(),
+        // Caller-chosen: the dwell must cover the backend's real retune
+        // latency, or packets from one centre arrive tagged with the
+        // next hop's frequency and every detection is reported at the
+        // wrong absolute frequency. See the call sites.
+        dwell_min: dwell,
+        dwell_max: dwell,
+        dwell_extension: Duration::ZERO,
+    };
+    let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
+    let handle = source.start(config, advice)?;
+    let detector = viewer_detector();
+
+    // (raw freq Hz, rssi dBm, what the sweep classified it as)
+    let mut best_hit: Option<(f64, f32, SignalType)> = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut last_freq = 0u64;
+    let mut packets_this_hop = 0usize;
+    let mut probes: Vec<ProbeEnergy> = Vec::new();
+    let outcome = |hit: Option<(f64, f32, SignalType)>| match hit {
+        Some((f, _, sig)) => ScanOutcome::Found(snap_to_nearest_fpv_channel(f), sig),
+        None => ScanOutcome::Empty,
+    };
+
+    loop {
+        match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
+            Ok(packet) => {
+                let center = packet.center_frequency_hz as u64;
+                // Pump the scan window on every packet, drained ones
+                // included, so it stays responsive through a long dwell.
+                if let Some(ui) = sweep.ui.as_mut()
+                    && !ui.update(&sweep.band)
+                {
+                    (handle.stop)();
+                    return Ok(ScanOutcome::Quit);
+                }
+                // `DETECT_PACKETS_PER_HOP` detection passes per hop, then
+                // drain the rest of the dwell. Unlike the USRP loop this
+                // one needs no single-tune escape: it *returns* once the
+                // sweep is complete rather than clearing `seen` and going
+                // round again, so a one-tune plan finishes on its first
+                // packet and can never sit draining.
+                if center == last_freq {
+                    if packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                        continue;
+                    }
+                } else {
+                    last_freq = center;
+                    packets_this_hop = 0;
+                }
+                packets_this_hop += 1;
+                seen.insert(center);
+
+                let results = detector.detect_from_iq_integrated_with_probes(
+                    &packet.samples,
+                    center,
+                    sample_rate as u32,
+                    &mut sweep.integrator,
+                    &mut probes,
+                );
+                sweep
+                    .band
+                    .record_hop(center as f64, packets_this_hop == 1, &probes, &results);
+                for res in results {
+                    let snapped = snap_to_nearest_fpv_channel(res.frequency_hz as f64);
+                    if skipped_freqs.contains(&(snapped.round() as u64)) {
+                        continue;
+                    }
+                    let better = best_hit.map(|(_, r, _)| res.rssi_dbm > r).unwrap_or(true);
+                    if better {
+                        best_hit = Some((res.frequency_hz as f64, res.rssi_dbm, res.signal_type));
+                        println!(
+                            "  → {:?} at {:.3} MHz ({}), rssi {:.1} dBm",
+                            res.signal_type,
+                            res.frequency_hz as f64 / 1e6,
+                            get_fpv_channel_name(res.frequency_hz as f64 / 1e6)
+                                .unwrap_or("Unknown"),
+                            res.rssi_dbm
+                        );
+                    }
+                }
+
+                // As in the USRP loop: the last hop must get its full
+                // packet budget before the sweep counts as done. Returning
+                // on its first packet left the highest frequency in every
+                // HackRF scan with a single detection pass — below the
+                // length at which the sweep finds anything — so that
+                // channel could never be reported.
+                if seen.len() >= hop_freqs.len() && packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                    sweep.band.end_sweep();
+                    (handle.stop)();
+                    std::thread::sleep(Duration::from_millis(150));
+                    return Ok(outcome(best_hit));
+                }
+            }
+            Err(_) => {
+                // SDR went quiet — return whatever we found this sweep.
+                (handle.stop)();
+                return Ok(outcome(best_hit));
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE AARONIA MODE
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "aaronia")]
+fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
+    use sdr_aaronia_rs::{SpectranBackend, SpectranSdrSource};
+
+    // Backend params split from LiveArgs so a fresh source can be built
+    // for every (re)tune: `run_live` consumes its source, and every
+    // non-quit RunLiveResult needs a new one to honour the S/N/C keys
+    // and signal loss.
+    enum Backend {
+        Http {
+            url: String,
+            ref_level: f64,
+            stream_format: sdr_aaronia_rs::http_streaming::StreamFormat,
+        },
+        Sdk {
+            serial: Option<String>,
+            ref_level: f64,
+        },
+    }
+    let (backend, live, label) = match cmd {
+        AaroniaCmd::Http(h) => {
+            let label = format!("Aaronia HTTP ({})", h.url);
+            (
+                Backend::Http {
+                    url: h.url,
+                    ref_level: h.ref_level,
+                    stream_format: h.stream_format.to_driver(),
+                },
+                h.live,
+                label,
+            )
+        }
+        AaroniaCmd::Sdk(s) => (
+            Backend::Sdk {
+                serial: s.serial,
+                ref_level: s.ref_level,
+            },
+            s.live,
+            "Aaronia SDK".to_string(),
+        ),
+    };
+    let make_source = |center_freq: f64| -> Box<dyn SdrSource> {
+        match &backend {
+            Backend::Http {
+                url,
+                ref_level,
+                stream_format,
+            } => Box::new(SpectranSdrSource {
+                backend: SpectranBackend::Http(url.clone()),
+                center_frequency_hz: center_freq,
+                reference_level_dbm: *ref_level,
+                block_size: 65_536,
+                stream_format: Some(*stream_format),
+            }),
+            Backend::Sdk { serial, ref_level } => Box::new(SpectranSdrSource {
+                backend: SpectranBackend::Sdk {
+                    serial: serial.clone(),
+                },
+                center_frequency_hz: center_freq,
+                reference_level_dbm: *ref_level,
+                block_size: 65_536,
+                stream_format: None,
+            }),
+        }
+    };
+
+    // `--sample-rate` is a rate, so it maps to the nearest rate the
+    // hardware runs (61.44 MHz over powers of two) — not through the
+    // driver's bandwidth-to-rate helper, which reads its argument as
+    // usable spectrum and would answer 15.36 MSPS with a 30.72 MSPS
+    // stream.
+    let requested_rate = live.sample_rate.unwrap_or(AARONIA_DEFAULT_RATE_HZ);
+    let sample_rate = sdr_aaronia_rs::nearest_iq_sample_rate(requested_rate);
+    if (sample_rate - requested_rate).abs() > 1.0 {
+        tracing::warn!(
+            requested_hz = requested_rate,
+            using_hz = sample_rate,
+            "requested sample rate is not one the Aaronia hardware runs; using the nearest"
+        );
+    }
+    let fm_deviation = live.fm_deviation;
+    let auto_scan = live.channel.is_none();
+    let mut explicit_freq = live
+        .channel
+        .as_ref()
+        .map(|ch| resolve_channel(ch))
+        .transpose()?;
+
+    let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut sweep = SweepState::new(live.scan_bands);
+    // See the HackRF caller for why the sweep's PAL/NTSC verdict rides
+    // along instead of being re-derived at the tuned centre.
+    let mut scan_standard: Option<SignalType> = None;
+
+    loop {
+        let center_freq = match explicit_freq {
+            Some(f) => f,
+            // The sweeping source is built at the band centre, but that
+            // choice is cosmetic — the hop list in the scan's
+            // SourceConfig retunes it before the first packet arrives.
+            None => match scan_band_for_channel(
+                make_source(SCAN_CENTER_HZ),
+                &label,
+                sample_rate,
+                live.scan_bands,
+                // An RTSA HTTP retune is a config PUT plus a stream
+                // settle, measured at 150-300 ms — an order of magnitude
+                // above a synthesiser hop. With a dwell below that, the
+                // sweep detects real signals in stale samples and
+                // reports them at hop_centre - 25.72 MHz (the first
+                // probe position): a VTX on A1 was reported as NTSC at
+                // 5915.28 MHz on every sweep, the viewer tuned to empty
+                // spectrum, lost it, and rescanned in a loop. 500 ms
+                // keeps every packet attributable to its claimed centre
+                // at the cost of a ~3 s sweep.
+                Duration::from_millis(500),
+                &skipped_freqs,
+                &mut sweep,
+            )? {
+                ScanOutcome::Found(f, sig) => {
+                    scan_standard = match sig {
+                        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => Some(sig),
+                        _ => None,
+                    };
+                    f
+                }
+                ScanOutcome::Empty => {
+                    println!("No analog FPV signal found in the scan band. Retrying...");
+                    continue;
+                }
+                ScanOutcome::Quit => break,
+            },
+        };
+
+        let ch_name = get_fpv_channel_name(center_freq / 1e6)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{:.2} MHz", center_freq / 1e6));
+        println!(
+            "{}: {} ({:.3} MHz) at {:.2} MSPS",
+            label,
+            ch_name,
+            center_freq / 1e6,
+            sample_rate / 1e6
+        );
+        // The picture window takes over from the scan window.
+        sweep.ui = None;
+        match run_live(
+            make_source(center_freq),
+            sample_rate,
+            fm_deviation,
+            live.deemphasis_tau,
+            live.demod,
+            live.denoise,
+            live.denoise_model.clone(),
+            center_freq,
+            live.standard,
+            scan_standard,
+            live.debug,
+            live.temporal_window,
+            Some(&sweep.band),
+            OverrunPolicy::Tolerate,
+            AARONIA_HTTP_TUNE_SETTLE,
+        )? {
+            RunLiveResult::UserExit => break,
+            r @ (RunLiveResult::SignalLost
+            | RunLiveResult::NextChannel
+            | RunLiveResult::TooManyOverruns) => {
+                let why = match r {
+                    RunLiveResult::SignalLost => "Signal lost",
+                    RunLiveResult::NextChannel => "Next channel requested",
+                    _ => "Too many stream overruns",
+                };
+                if auto_scan {
+                    println!("{why}. Resuming scan...");
+                    explicit_freq = None;
+                } else {
+                    println!("{why} (explicit-channel mode). Exiting.");
+                    break;
+                }
+            }
+            RunLiveResult::SkipFrequency => {
+                skipped_freqs.insert(center_freq.round() as u64);
+                if auto_scan {
+                    explicit_freq = None;
+                } else {
+                    break;
+                }
+            }
+            RunLiveResult::TuneToChannel(freq) => {
+                explicit_freq = Some(freq);
+                scan_standard = None;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SHARED LIVE PIPELINE
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy)]
+enum ViewerMode {
+    /// Tune to a single channel; one window.
+    SingleChannel,
+    /// Wideband scan; detect and open windows for all active signals.
+    Scan,
+}
+
+// Mirrors run_viewer_pipeline's wide signature — every knob the CLI
+// surfaces lands here before being forwarded. Splitting would mean
+// boxing a config struct, which is more ceremony than the call sites
+// justify today.
+#[allow(clippy::too_many_arguments)]
+fn run_live(
+    source: Box<dyn SdrSource>,
+    sample_rate: f64,
+    fm_deviation: f32,
+    deemphasis_tau: f32,
+    demod_kind: DemodKind,
+    denoise: bool,
+    denoise_model: String,
+    center_freq: f64,
+    forced_standard: Option<SignalType>,
+    scan_hint: Option<SignalType>,
+    debug: bool,
+    temporal_window: usize,
+    band: Option<&BandScan>,
+    overrun_policy: OverrunPolicy,
+    settle_after_tune: Duration,
+) -> anyhow::Result<RunLiveResult> {
+    let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
+    let config = SourceConfig {
+        sample_rate_hz: sample_rate,
+        channels_hz: vec![center_freq],
+        dwell_min: Duration::from_secs(3600), // stay forever
+        dwell_max: Duration::from_secs(3600),
+        dwell_extension: Duration::ZERO,
+    };
+
+    let handle = source.start(config, advice)?;
+    let sample_rate_u32 = sample_rate as u32;
+
+    // Receive the first chunk for auto-detection
+    println!("Waiting for first IQ chunk from SDR...");
+    let mut first_packet = handle
+        .receiver
+        .recv()
+        .map_err(|_| anyhow::anyhow!("SDR source closed before delivering any samples"))?;
+    // A source that keeps sending the previous centre's samples after the
+    // retune is acknowledged would have the standard auto-detected on the
+    // wrong channel (measured: a clean NTSC link read "ambiguous" and
+    // decoded as PAL). Discard until the backend's settle has passed and
+    // start from the freshest packet.
+    if !settle_after_tune.is_zero() {
+        let t0 = Instant::now();
+        while t0.elapsed() < settle_after_tune {
+            let left = settle_after_tune.saturating_sub(t0.elapsed());
+            match handle.receiver.recv_timeout(left) {
+                Ok(p) => first_packet = p,
+                Err(_) => break,
+            }
+        }
+    }
+    let actual_sample_rate = first_packet.sample_rate_hz as u32;
+    let actual_center = first_packet.center_frequency_hz;
+    if actual_sample_rate != sample_rate_u32 {
+        println!(
+            "Note: SDR actual sample rate {:.2} MSPS differs from requested {:.2} MSPS",
+            actual_sample_rate as f64 / 1e6,
+            sample_rate / 1e6
+        );
+    }
+    let sample_rate_u32 = actual_sample_rate;
+
+    println!(
+        "Receiving: {:.2} MSPS at {:.3} MHz ({} samples in first chunk)",
+        sample_rate_u32 as f64 / 1e6,
+        actual_center / 1e6,
+        first_packet.samples.len()
+    );
+
+    // Resolve the single channel at DC. (Wideband multi-signal scan
+    // lives in the pre-tune sweeps — scan_band_for_channel and the USRP
+    // scan loop — so by the time run_live starts, the centre is chosen.)
+    let resolved_channels = {
+        // Single channel at DC
+        let sig_type = if let Some(st) = forced_standard {
+            println!("Forced standard: {:?}", st);
+            st
+        } else {
+            println!("Auto-detecting video standard...");
+            let detector = AnalogFpvDetector::default();
+            // Decide on one contiguous record long enough for the FFT to
+            // tell the line rates apart (see `STANDARD_DETECT_RECORD`).
+            // A packet flagged overrun follows a gap in the stream, so
+            // the record restarts from it rather than splicing across
+            // the hole. The packets consumed here are not fed to the
+            // decoder; the pipeline starts from the last one.
+            let want = (sample_rate_u32 as f64 * STANDARD_DETECT_RECORD.as_secs_f64()) as usize;
+            let mut record: Vec<Complex<f32>> =
+                Vec::with_capacity(want + first_packet.samples.len());
+            record.extend_from_slice(&first_packet.samples);
+            let t0 = Instant::now();
+            while record.len() < want && t0.elapsed() < STANDARD_DETECT_PATIENCE {
+                let left = STANDARD_DETECT_PATIENCE.saturating_sub(t0.elapsed());
+                match handle.receiver.recv_timeout(left) {
+                    Ok(p) => {
+                        if p.overrun {
+                            record.clear();
+                        }
+                        record.extend_from_slice(&p.samples);
+                        first_packet = p;
+                    }
+                    Err(_) => break,
+                }
+            }
+            let (detected, confidence) = detector.detect_sync_pulses(&record, sample_rate_u32);
+            if debug {
+                eprintln!(
+                    "[DEBUG] standard decided on {:.1} ms of signal: {detected:?} {confidence:.2}",
+                    record.len() as f64 / sample_rate_u32 as f64 * 1e3
+                );
+            }
+            match detected {
+                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => {
+                    println!(
+                        "  → Detected: {:?} ({:.0}% confidence)",
+                        detected,
+                        confidence * 100.0
+                    );
+                    detected
+                }
+                // Nothing found at the tuned centre. Prefer what the
+                // sweep measured over a blind default: the sweep
+                // integrates several looks and classified this very
+                // signal, while this re-detect gets one centre and a
+                // few chunks. It is a *fallback*, not an override — a
+                // confident re-detect above still wins, so a sweep
+                // verdict formed from mislabelled samples cannot
+                // outrank direct evidence at the tuned frequency.
+                SignalType::Unknown => match scan_hint {
+                    Some(hint) => {
+                        println!(
+                            "  → No standard detected here; using the sweep's verdict: {hint:?}"
+                        );
+                        hint
+                    }
+                    None => {
+                        println!("  → No standard detected, defaulting to PAL");
+                        SignalType::AnalogVideoPal
+                    }
+                },
+                // AnalogVideoUnknown (and any future variant):
+                // definitely analog video, but the classifier
+                // couldn't tell PAL from NTSC — resolve it in the
+                // time domain rather than silently guessing.
+                other => {
+                    // Band-limit first: the capture can be tens of
+                    // MHz wide, and demodulating the full span
+                    // buries the video baseband in out-of-band
+                    // noise, all but guaranteeing an inconclusive
+                    // measurement. Same probe filter Scan mode
+                    // uses, at 0 Hz offset (signal is at DC).
+                    let mut probe_ddc =
+                        StreamingDDC::new(0.0, sample_rate_u32, fm_deviation + LUMA_HEADROOM_HZ);
+                    let probe_iq = probe_ddc.process(&record);
+                    // Same fallback order as above: time-domain
+                    // measurement first, then the sweep's verdict,
+                    // then PAL.
+                    concretize_standard(
+                        other,
+                        &probe_iq,
+                        sample_rate_u32,
+                        scan_hint.unwrap_or(SignalType::AnalogVideoPal),
+                    )
+                }
+            }
+        };
+        // Signal is at DC (SDR tuned directly); size the decode
+        // bandwidth so the worker's DDC cutoff lands at
+        // `fm_deviation + LUMA_HEADROOM_HZ`. Passing bare
+        // `fm_deviation * 2.0` made the worker's
+        // `.min(dev + headroom).max(dev)` collapse to exactly
+        // `fm_deviation`, so the documented sideband headroom was
+        // unreachable on the main live decode path.
+        vec![(sig_type, 0.0f32, (fm_deviation + LUMA_HEADROOM_HZ) * 2.0)]
+    };
+
+    let rf_center_freq = actual_center;
+
+    // Feed the first chunk into the pipeline, then continue from the receiver
+    let first_samples = first_packet.samples;
+    let receiver = handle.receiver.clone();
+    let handle_stop = handle.stop; // Take ownership of the stop closure
+
+    let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let result = run_viewer_pipeline(
+        resolved_channels,
+        sample_rate_u32,
+        fm_deviation,
+        deemphasis_tau,
+        demod_kind,
+        denoise,
+        denoise_model,
+        rf_center_freq,
+        debug,
+        temporal_window,
+        band.cloned(),
+        exit_reason.clone(),
+        tune_freq,
+        move |channel_txs, exit_flag| {
+            let mut active_txs = channel_txs;
+            // The lock check must integrate for the same reason the scan
+            // does: one 65,536-sample packet is ~1-3 ms of signal, below
+            // the length at which a single-shot detection finds anything
+            // at all. Checked single-shot, a healthy -49 dBm decode read
+            // confidence ~0 on every check, four "misses" accumulated in
+            // ~2 s, and the viewer declared signal lost, rescanned, and
+            // relocked in a loop — 44 times in four minutes on a live
+            // Aaronia link before crashing.
+            let mut lock_integ = SpectralIntegrator::new(4);
+            let detector = viewer_detector();
+            // Check cadence in wall time, not packets: a fixed 400-packet
+            // interval was 0.43 s at 61.44 MSPS but 1.3 s at HackRF's
+            // 20 MSPS, and the integrator's 4-batch memory plus the miss
+            // threshold multiply that into the time a dead channel holds
+            // the screen. ~2 Hz everywhere keeps loss detection near 3 s
+            // on every backend.
+            let check_every = ((sample_rate_u32 as f64 * 0.5) / first_samples.len().max(1) as f64)
+                .round()
+                .max(1.0) as usize;
+
+            let mut packets = 0;
+            let mut consecutive_lost = 0;
+            let mut dropped_chunks = 0u64;
+
+            let mut overrun_count = 0;
+            let mut last_overrun_clear = Instant::now();
+
+            // Send first chunk
+            {
+                let arc_chunk = Arc::new(first_samples);
+                active_txs.retain(|tx| tx.send(Arc::clone(&arc_chunk)).is_ok());
+            }
+
+            // Continue from SDR
+            while !active_txs.is_empty() {
+                // Bail promptly when the UI signals exit (Q/S/N/channel
+                // change) instead of waiting for the worker→UI channels
+                // to disconnect — minimises retune/rescan latency.
+                if exit_flag.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    break;
+                }
+                match receiver.recv() {
+                    Ok(packet) => {
+                        packets += 1;
+
+                        // Check overruns
+                        if packet.overrun {
+                            overrun_count += 1;
+                            if debug {
+                                eprintln!(
+                                    "[DEBUG] overrun flagged on packet {packets} ({overrun_count} in the last minute)"
+                                );
+                            }
+                            if overrun_policy == OverrunPolicy::StepDown && overrun_count >= 2 {
+                                exit_flag.store(2, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        if last_overrun_clear.elapsed() >= Duration::from_secs(60) {
+                            overrun_count = 0;
+                            last_overrun_clear = Instant::now();
+                        }
+
+                        // Check signal lock periodically (approx twice a second)
+                        if packets % check_every == 0 {
+                            // The same sweep path that found the signal
+                            // decides whether it is still there — not
+                            // `detect_sync_pulses` on the raw full-rate
+                            // packet, which sees ~16 video lines per
+                            // 65,536-sample chunk at 61.44 MSPS and reads
+                            // near-zero confidence on a healthy decode.
+                            // Measured on a live -49 dBm Aaronia link:
+                            // single-shot flapped lock→lost 44 times in
+                            // four minutes, and integrating that same
+                            // full-rate check still flapped (13 cycles in
+                            // 30 s); the probe-based sweep detector holds.
+                            let hits = detector.detect_from_iq_integrated(
+                                &packet.samples,
+                                packet.center_frequency_hz as u64,
+                                sample_rate_u32,
+                                &mut lock_integ,
+                            );
+                            // Two misses, not four: the integrator holds
+                            // ~4 checks of history, so an empty result
+                            // already means several consecutive looks
+                            // found nothing. Stacking a 4-check threshold
+                            // on top made a dead channel linger for up to
+                            // 8 checks.
+                            if debug {
+                                let best = hits
+                                    .iter()
+                                    .max_by(|a, b| a.confidence.total_cmp(&b.confidence));
+                                eprintln!(
+                                    "[DEBUG] lock check at packet {packets}: {} hit(s){}",
+                                    hits.len(),
+                                    best.map(|h| format!(
+                                        ", best {:?} conf {:.2} at {:.3} MHz rssi {:.1}",
+                                        h.signal_type,
+                                        h.confidence,
+                                        h.frequency_hz as f64 / 1e6,
+                                        h.rssi_dbm
+                                    ))
+                                    .unwrap_or_default()
+                                );
+                            }
+                            if hits.is_empty() {
+                                consecutive_lost += 1;
+                                if consecutive_lost >= 2 {
+                                    exit_flag.store(1, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                            } else {
+                                consecutive_lost = 0;
+                            }
+                        }
+
+                        let arc_chunk = Arc::new(packet.samples);
+                        active_txs.retain(|tx| {
+                            match tx.try_send(Arc::clone(&arc_chunk)) {
+                                Ok(_) => true,
+                                // Worker behind: drop this chunk but keep
+                                // the channel. Dropping raw IQ breaks DDC
+                                // continuity (a visible glitch), so we
+                                // count it and surface the cost in debug.
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    dropped_chunks += 1;
+                                    true
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => false, // UI closed
+                            }
+                        });
+                        if debug && packets % check_every == 0 && dropped_chunks > 0 {
+                            eprintln!(
+                                "[DEBUG] dropped {} IQ chunks so far (decode worker behind)",
+                                dropped_chunks
+                            );
+                        }
+                    }
+                    Err(_) => break, // SDR disconnected
+                }
+            }
+        },
+    );
+
+    // Shut down the USRP capture thread cleanly before dropping the handle.
+    // Without this, the capture thread races with UHD's global usrp_ptr map
+    // destructor during process exit, causing a double-free (SIGABRT).
+    (handle_stop)();
+    std::thread::sleep(Duration::from_millis(100));
+
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SHARED VIEWER PIPELINE — works for both file and live SDR
+// ═══════════════════════════════════════════════════════════════════
+
+// Touching every parameter on every call site of this fn would be more
+// disruptive than splitting it into separate helpers — the shape of the
+// args here mirrors the shape of the live/file dispatch and the
+// signature changes whenever a new pipeline knob arrives.
+#[allow(clippy::too_many_arguments)]
+fn run_viewer_pipeline<F>(
+    resolved_channels: Vec<(SignalType, f32, f32)>,
+    sample_rate: u32,
+    fm_deviation: f32,
+    deemphasis_tau: f32,
+    demod_kind: DemodKind,
+    denoise: bool,
+    denoise_model: String,
+    rf_center_freq: f64,
+    debug: bool,
+    temporal_window: usize,
+    band: Option<BandScan>,
+    exit_reason: Arc<std::sync::atomic::AtomicU8>,
+    tune_freq: Arc<std::sync::atomic::AtomicU64>,
+    reader_fn: F,
+) -> anyhow::Result<RunLiveResult>
+where
+    F: FnOnce(
+            Vec<mpsc::SyncSender<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>>,
+            Arc<std::sync::atomic::AtomicU8>,
+        ) + Send
+        + 'static,
+{
+    let mut channel_txs = Vec::new();
+    let mut frame_rxs = Vec::new();
+    let mut recycle_txs = Vec::new();
+    let mut windows = Vec::new();
+    let mut display_buffers = Vec::new();
+
+    // Live denoiser toggle, shared UI thread → every decode worker. The
+    // reconstructors live in per-channel threads, so the `D` hotkey flips
+    // this flag and each worker picks it up on its next field rather than
+    // the UI reaching into another thread's state.
+    let denoise_on = Arc::new(std::sync::atomic::AtomicBool::new(denoise));
+
+    for (sig_type, freq_offset, bandwidth_hz) in resolved_channels {
+        // Both are only read by the `neural-vsr` code paths; without that
+        // feature the worker has no denoiser to toggle.
+        #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
+        let denoise_on = Arc::clone(&denoise_on);
+        #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
+        let denoise_model = denoise_model.clone();
+        let (iq_tx, iq_rx) =
+            mpsc::sync_channel::<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>(10);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u32>>(2);
+        // Frame-buffer recycle pool: the UI hands spent frame buffers
+        // back here so the decode worker can refill them in place
+        // (`reconstruct_frame_into`) instead of allocating + zeroing a
+        // fresh ~1.4 MB Vec every field. Both ends use non-blocking
+        // try_*; on miss the worker just allocates and on a full return
+        // channel the UI drops the buffer — so there's no deadlock path.
+        let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u32>>(3);
+
+        let is_pal = sig_type == SignalType::AnalogVideoPal;
+
+        // Everything after the down-converter runs at the working rate,
+        // not the capture rate. Decided here rather than in the worker
+        // because the reconstructor is built here — its geometry sizes
+        // the window below.
+        //
+        // Floor the cutoff at `fm_deviation`: in scan mode
+        // `bandwidth_hz` comes from the detector, and an implausibly
+        // small detected bandwidth would otherwise collapse the FIR
+        // passband and render a black/garbage frame with no clue why.
+        let ddc_cutoff = (bandwidth_hz / 2.0)
+            .min(fm_deviation + LUMA_HEADROOM_HZ)
+            .max(fm_deviation);
+        let mut decim = decode_decimation(sample_rate, ddc_cutoff);
+        // The PLL cannot track a 5 MHz deviation much below 20 MSPS —
+        // its loop-bandwidth stability clamp caps ωₙ at 0.5 rad/sample,
+        // i.e. fs/4π (analog crate DESIGN.md §11). Asking for it
+        // explicitly therefore caps how far we may decimate, at the
+        // cost of the CPU the decimation would have saved.
+        if matches!(demod_kind, DemodKind::Pll) {
+            let cap = (sample_rate / PLL_AUTO_MIN_SAMPLE_RATE_HZ).max(1) as usize;
+            if decim > cap {
+                println!(
+                    "  → --demod pll holds the decode rate at {:.2} MSPS (the loop cannot \
+                     track this deviation below ~20 MSPS); it may not keep up. Drop the \
+                     flag to decode at {:.2} MSPS.",
+                    (sample_rate / cap as u32) as f64 / 1e6,
+                    (sample_rate / decim as u32) as f64 / 1e6
+                );
+                decim = cap;
+            }
+        }
+        let work_rate = sample_rate / decim as u32;
+        let use_pll = demod_kind.use_pll(work_rate);
+        if decim > 1 {
+            println!(
+                "  → Decoding at {:.2} MSPS ({:.2} MSPS capture / {})",
+                work_rate as f64 / 1e6,
+                sample_rate as f64 / 1e6,
+                decim
+            );
+        }
+        println!(
+            "  → Demodulator: {} ({:.2} MSPS)",
+            if use_pll { "PLL" } else { "discriminator" },
+            work_rate as f64 / 1e6
+        );
+
+        #[allow(unused_mut)]
+        let mut reconstructor = FrameReconstructor::new(work_rate, is_pal, fm_deviation, debug)
+            .with_temporal_window(temporal_window);
+        // Load the denoiser once per channel (opening an ONNX session is
+        // expensive, and the `D` hotkey must toggle instantly). It is
+        // parked in `stashed_restorer` while disabled and moved back into
+        // the reconstructor when enabled, so no reload happens on toggle.
+        #[cfg(feature = "neural-vsr")]
+        let mut stashed_restorer = {
+            reconstructor = reconstructor.with_neural_restorer(&denoise_model, true);
+            if reconstructor.neural_restorer.is_none() {
+                eprintln!(
+                    "Denoiser unavailable: could not load {denoise_model} — continuing without it."
+                );
+            }
+            // Start parked unless the operator asked for it up front.
+            if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
+                None
+            } else {
+                reconstructor.neural_restorer.take()
+            }
+        };
+        let width = reconstructor.width;
+        let height = reconstructor.height;
+
+        let type_name = if is_pal { "PAL" } else { "NTSC" };
+        let absolute_freq_mhz = (rf_center_freq + freq_offset as f64) / 1_000_000.0;
+        let channel_name = get_fpv_channel_name(absolute_freq_mhz);
+        let window_title = if let Some(ch) = channel_name {
+            format!("{} · Channel {}", type_name, ch)
+        } else {
+            format!("{} · {:.2} MHz", type_name, absolute_freq_mhz)
+        };
+        println!("  → Window: {} ({}×{})", window_title, width, height);
+        let window = Window::new(&window_title, width, height, WindowOptions::default())?;
+
+        windows.push((window, width, height, is_pal, absolute_freq_mhz));
+        display_buffers.push(vec![0u32; width * height]);
+        channel_txs.push(iq_tx);
+        frame_rxs.push(frame_rx);
+        recycle_txs.push(recycle_tx);
+
+        // Per-channel snapshot encoder thread. PNG encoding is tens of
+        // ms; running it inline in the decode loop stalls decoding,
+        // which drops IQ chunks (breaking DDC continuity) right when the
+        // snapshot is taken — so the saved image would misrepresent the
+        // decode. The decode loop hands (path, rgb, w, h) here instead.
+        let (snap_tx, snap_rx) = mpsc::channel::<(String, Vec<u8>, u32, u32)>();
+        thread::spawn(move || {
+            while let Ok((path, rgb, w, h)) = snap_rx.recv() {
+                match image::save_buffer(&path, &rgb, w, h, image::ColorType::Rgb8) {
+                    Ok(()) => eprintln!("[DEBUG] Saved {}", path),
+                    Err(e) => eprintln!("Failed to save {}: {}", path, e),
+                }
+            }
+        });
+
+        thread::spawn(move || {
+            // The down-converter is the one stage that stays at the
+            // capture rate: it reads every input sample and emits one
+            // per stride. A decimating cut needs the longer filter (see
+            // `DECODE_FIR_TAPS`); at stride 1 nothing folds, so keep the
+            // default and leave that path byte-identical.
+            let mut ddc = if decim > 1 {
+                StreamingDDC::with_taps(freq_offset, sample_rate, ddc_cutoff, DECODE_FIR_TAPS)
+            } else {
+                StreamingDDC::new(freq_offset, sample_rate, ddc_cutoff)
+            };
+            let mut shifted_iq: Vec<Complex<f32>> = Vec::new();
+            // Last DDC output sample of the previous chunk. `fm_demod`
+            // is stateless and returns n−1 samples for n inputs, so
+            // without this carry the phase transition across every
+            // chunk boundary is silently dropped (~15 ppm timebase
+            // slip). Seeding each chunk with the previous chunk's final
+            // sample makes the demod stream gapless.
+            let mut iq_carry: Option<Complex<f32>> = None;
+            // Reused per-chunk demod scratch (fm_demod_into) — a fresh
+            // ~256 KB Vec per chunk was pure allocator churn.
+            let mut demod_scratch: Vec<f32> = Vec::new();
+            // Stream-side deemphasis, applied exactly once per sample,
+            // before anything enters the persistent demod buffer — the
+            // placement the library documents (a stateful filter inside
+            // the reconstructor would re-filter the re-read tail).
+            let mut deemph = (deemphasis_tau.is_finite() && deemphasis_tau > 0.0)
+                .then(|| Deemphasis::new(work_rate, deemphasis_tau));
+            // PLL demodulator (--demod pll, or auto's >= 25 MSPS
+            // crossover): threshold extension — see DemodKind's doc
+            // for the measured numbers and the low-rate caveat. 1 MHz
+            // loop bandwidth per the weak_signal_sweep tuning.
+            // 1 MHz loop bandwidth is an absolute figure and does not
+            // scale with the rate; `use_pll` was resolved against the
+            // working rate in the setup loop.
+            let mut pll = use_pll.then(|| PllFmDemod::new(work_rate, 1.0e6, fm_deviation * 1.2));
+            let mut demod_buffer: Vec<f32> = Vec::new();
+            // A field plus its blanking, the same bound the
+            // reconstructor's own fallback path uses before it will
+            // commit to a field. ~13 ms at 15.36 MSPS, well under a
+            // field period, so gating on it costs no latency.
+            let min_samples_per_field = {
+                let line_rate = if is_pal { 15_625.0f32 } else { 15_734.0 };
+                let lines = if is_pal { 288 } else { 240 } + 22;
+                ((work_rate as f32 / line_rate) * lines as f32) as usize
+            };
+            // ~33 ms consumed before compacting, ~83 ms of live region
+            // before the valve fires, ~16 ms kept when it does.
+            let compact_after = work_rate as usize / 30;
+            let live_region_cap = work_rate as usize / 12;
+            let keep_on_skip = work_rate as usize / 60;
+            // Cursor into `demod_buffer`: live (unconsumed) samples are
+            // `demod_buffer[demod_start..]`. Advancing a cursor instead
+            // of `drain(0..consumed)` per field avoids an O(n) prefix
+            // memmove every frame; we compact in one shot once the
+            // consumed prefix grows large.
+            let mut demod_start = 0usize;
+            // Reused frame buffer; refilled in place by
+            // `reconstruct_frame_into` and swapped for a recycled/fresh
+            // one each time a completed field is shipped to the UI.
+            let mut frame_buf: Vec<u32> = vec![0u32; width * height];
+            let mut frame_count = 0u64;
+            // One-shot guard for the PAL demod-range probe. Gating on
+            // `frame_count == 0` instead floods the console: that stays
+            // true for every chunk when the field never locks.
+            let mut pal_debug_done = false;
+
+            while let Ok(iq_chunk) = iq_rx.recv() {
+                shifted_iq.clear();
+                // The carry sample only serves the stateless
+                // discriminator; the PLL's loop state already spans
+                // chunk boundaries, and a duplicated sample would be a
+                // phase glitch to it.
+                if pll.is_none()
+                    && let Some(prev) = iq_carry
+                {
+                    shifted_iq.push(prev);
+                }
+                ddc.process_into_decimated(&iq_chunk, &mut shifted_iq, decim);
+                iq_carry = shifted_iq.last().copied();
+                match pll.as_mut() {
+                    Some(p) => p.process_into(&shifted_iq, &mut demod_scratch),
+                    None => fm_demod_into(&shifted_iq, &mut demod_scratch),
+                }
+                if let Some(d) = deemph.as_mut() {
+                    d.process_in_place(&mut demod_scratch);
+                }
+
+                // Live denoiser toggle + link-quality conditioning. The
+                // CNR is measured on the DDC-filtered channel, not the
+                // raw wideband chunk, so it reflects THIS signal's link
+                // rather than the whole capture's noise floor.
+                #[cfg(feature = "neural-vsr")]
+                {
+                    let want = denoise_on.load(std::sync::atomic::Ordering::Relaxed);
+                    let have = reconstructor.neural_restorer.is_some();
+                    if want && !have {
+                        reconstructor.neural_restorer = stashed_restorer.take();
+                        // Drop temporal context accumulated before the
+                        // gap — blending across a disabled period would
+                        // mix in stale fields.
+                        reconstructor.hidden_state = None;
+                    } else if !want && have {
+                        stashed_restorer = reconstructor.neural_restorer.take();
+                    }
+                    if reconstructor.neural_restorer.is_some()
+                        && let Some(cnr) = estimate_cnr_db(&shifted_iq)
+                    {
+                        reconstructor.set_neural_noise_level(cnr);
+                    }
+                }
+
+                if debug && is_pal && !pal_debug_done && !demod_scratch.is_empty() {
+                    let min = demod_scratch.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = demod_scratch
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let mean = demod_scratch.iter().sum::<f32>() / demod_scratch.len() as f32;
+                    eprintln!(
+                        "[PAL DEBUG] first demod chunk: min={:.4} max={:.4} mean={:.4}",
+                        min, max, mean
+                    );
+                    pal_debug_done = true;
+                }
+
+                demod_buffer.extend_from_slice(&demod_scratch);
+
+                // None ends the loop (no full field buffered yet);
+                // `frame_buf` is left untouched on the None paths (they
+                // return before writing it), so it's safe to keep for the
+                // next chunk.
+                //
+                // Only ask once a field could actually be in there.
+                // `reconstruct_frame_into` runs three full-slice passes
+                // and two full-length allocations *before* the length
+                // check that would reject a short buffer, so calling it
+                // on every chunk means most calls do all that work and
+                // return None. It costs more the more chunks a second
+                // brings: measured, reconstruction ran at 0.34 CPU-s/s
+                // fed 65,536-sample chunks and 0.75 fed the
+                // 16,384-sample chunks a 4x stride produces.
+                while demod_buffer.len() - demod_start >= min_samples_per_field {
+                    let Some(consumed) = reconstructor
+                        .reconstruct_frame_into(&demod_buffer[demod_start..], &mut frame_buf)
+                    else {
+                        break;
+                    };
+                    frame_count += 1;
+
+                    // Rate-limited debug telemetry: print per-frame
+                    // for the first 3 frames (which also get saved
+                    // as PNGs for visual inspection), then every
+                    // 30 frames thereafter (≈ once every 500 ms at
+                    // NTSC's 60-field rate). The 3-frame auto-exit
+                    // was dropped after the chroma-PLL wind-up bug
+                    // — that failure mode develops over seconds of
+                    // continuous capture and was invisible in a
+                    // 3-frame snapshot, so debug mode now keeps
+                    // running and lets you `Ctrl-C` (or `timeout`)
+                    // when you've seen enough.
+                    let metrics_due = debug && (frame_count <= 3 || frame_count.is_multiple_of(30));
+                    if metrics_due {
+                        // Envelope CNR (link-quality meter) + PLL lock
+                        // telemetry when applicable. Measured on the
+                        // DDC-filtered channel (`shifted_iq`), not the
+                        // raw capture — a wideband chunk's envelope
+                        // reflects the whole band's floor, not this
+                        // channel's link.
+                        let cnr = estimate_cnr_db(&shifted_iq)
+                            .map(|v| format!("{v:.1} dB"))
+                            .unwrap_or_else(|| "n/a".into());
+                        let lock = pll
+                            .as_ref()
+                            .map(|p| format!(" | PLLerr: {:.2} rad", p.phase_error_rms()))
+                            .unwrap_or_default();
+                        println!("[DEBUG LINK] CNRest: {cnr}{lock}");
+                        // New v0.4.37 telemetry fields:
+                        //  - SyncQ : per-field MAD-rejection-pass
+                        //    rate. 1.00 = perfect; <0.5 = dropout
+                        //    repair fires.
+                        //  - Y_avg : mean Y amplitude post-notch.
+                        //    Sudden drops mark transmitter going
+                        //    out of range / antenna blockage.
+                        //  - HistD : how full the temporal history
+                        //    is (1 → window). Denoise benefit
+                        //    scales with √HistD.
+                        println!(
+                            "[DEBUG METRICS] Frame {} | Std: {:?} | LinePer: {:.2}s | SyncQ: {:.2} | Y_avg: {:+.3} | HistD: {}",
+                            frame_count,
+                            reconstructor.video_standard(),
+                            reconstructor.line_period_samples(),
+                            reconstructor.latest_sync_quality(),
+                            reconstructor.latest_mean_amplitude(),
+                            reconstructor.history_depth(),
+                        );
+                    }
+
+                    // Snapshot the first 3 frames (startup transient,
+                    // before the line-period history + temporal denoise
+                    // settle) and frames 30-32 (steady state, ≈ 0.5 s
+                    // in) for visual inspection. The cheap RGB conversion
+                    // runs here; the PNG encode is handed to the snapshot
+                    // thread so it never stalls the decode loop.
+                    if debug && (frame_count <= 3 || (30..=32).contains(&frame_count)) {
+                        // Frequency in the filename: in Scan mode several
+                        // per-channel workers snapshot concurrently, and
+                        // an undiscriminated `fpv_frame_{n}.png` had them
+                        // racing to overwrite each other's files.
+                        let path =
+                            format!("fpv_frame_{:.0}MHz_{}.png", absolute_freq_mhz, frame_count);
+                        let mut rgb_buf = vec![0u8; width * height * 3];
+                        for (i, &pixel) in frame_buf.iter().enumerate() {
+                            rgb_buf[i * 3] = ((pixel >> 16) & 0xFF) as u8;
+                            rgb_buf[i * 3 + 1] = ((pixel >> 8) & 0xFF) as u8;
+                            rgb_buf[i * 3 + 2] = (pixel & 0xFF) as u8;
+                        }
+                        let _ = snap_tx.send((path, rgb_buf, width as u32, height as u32));
+                    }
+
+                    demod_start += consumed;
+                    // Swap in a recycled (or fresh) buffer and ship the
+                    // just-filled one to the UI.
+                    let next = recycle_rx
+                        .try_recv()
+                        .unwrap_or_else(|_| vec![0u32; width * height]);
+                    if frame_tx
+                        .send(std::mem::replace(&mut frame_buf, next))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+
+                // Amortised compaction: drop the consumed prefix in a
+                // single memmove once it's grown past the threshold,
+                // rather than once per field. Sized in time rather than
+                // samples, so decimating doesn't quietly buy four times
+                // the buffering.
+                if demod_start > compact_after {
+                    demod_buffer.drain(0..demod_start);
+                    demod_start = 0;
+                }
+                // Safety valve: if reconstruction can't keep up and the
+                // live region balloons, skip ahead (corrupts one field's
+                // sync, but bounds memory) instead of growing unbounded.
+                if demod_buffer.len() - demod_start > live_region_cap {
+                    demod_start = demod_buffer.len().saturating_sub(keep_on_skip);
+                }
+            }
+        });
+    }
+
+    if channel_txs.is_empty() {
+        println!("No analog video signals detected!");
+        std::process::exit(0);
+    }
+
+    // Spawn reader thread (file or SDR)
+    let thread_exit_flag = exit_reason.clone();
+    thread::spawn(move || reader_fn(channel_txs, thread_exit_flag));
+    // Main UI Loop
+    let mut ch_input = ChannelInputState::Idle;
+    let mut denoise_toggle_requested = false;
+    // The band panel rides under the picture, marking the frequency this
+    // window is locked to. `B` cycles its size; the choice is process-wide
+    // so it survives a relock.
+    let mut band = band;
+    if let Some(b) = band.as_mut() {
+        b.set_lock(Some(rf_center_freq));
+    }
+    let mut panel_mode = PanelMode::load();
+    let mut panel_toggle_requested = false;
+    let mut ch_input_flash_until: Option<std::time::Instant> = None;
+    let mut ch_input_flash_msg = String::new();
+    while !windows.is_empty() {
+        let reason = exit_reason.load(std::sync::atomic::Ordering::Relaxed);
+        if reason != 0 {
+            windows.clear();
+            frame_rxs.clear();
+            display_buffers.clear();
+            break;
+        }
+
+        let mut i = 0;
+        while i < windows.len() {
+            let (window, width, height, is_pal, absolute_freq_mhz) = &mut windows[i];
+
+            // Q / Escape / window close → quit the app. Gated on the
+            // channel-input state machine being idle, and edge-triggered
+            // (`get_keys_pressed`, which is idempotent within a frame):
+            // while typing a channel, Escape must *cancel the input* (the
+            // state machine below handles that) and Q is a candidate
+            // keystroke, so neither may quit the app. Edge-triggering
+            // also stops the Escape that cancelled input from still being
+            // held down on the next 5 ms iteration and quitting anyway.
+            let pressed = window.get_keys_pressed(minifb::KeyRepeat::No);
+            let idle = matches!(ch_input, ChannelInputState::Idle);
+            if !window.is_open()
+                || (idle && (pressed.contains(&Key::Escape) || pressed.contains(&Key::Q)))
+            {
+                windows.remove(i);
+                frame_rxs.remove(i);
+                recycle_txs.remove(i);
+                display_buffers.remove(i);
+                continue;
+            }
+
+            // S → skip this frequency (blacklist it), resume scanning
+            if matches!(ch_input, ChannelInputState::Idle) && window.is_key_down(Key::S) {
+                exit_reason.store(3, std::sync::atomic::Ordering::Relaxed);
+                windows.clear();
+                frame_rxs.clear();
+                display_buffers.clear();
+                break;
+            }
+
+            // D → toggle the neural denoiser. Only *record* the request
+            // here: this block runs once per open window, so acting on it
+            // inline would toggle N times for one keypress — with two
+            // windows that is a silent no-op. Applied once after the
+            // per-window loop.
+            if idle && pressed.contains(&Key::D) {
+                denoise_toggle_requested = true;
+            }
+
+            // B → cycle the band panel (strip, full, off). Recorded like
+            // D and applied once after the per-window loop.
+            if idle && band.is_some() && pressed.contains(&Key::B) {
+                panel_toggle_requested = true;
+            }
+
+            // N → find next channel (resume scanning without blacklisting)
+            if matches!(ch_input, ChannelInputState::Idle) && window.is_key_down(Key::N) {
+                exit_reason.store(4, std::sync::atomic::Ordering::Relaxed);
+                windows.clear();
+                frame_rxs.clear();
+                display_buffers.clear();
+                break;
+            }
+
+            // C → enter channel input mode
+            if matches!(ch_input, ChannelInputState::Idle) {
+                let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
+                if keys.contains(&Key::C) {
+                    ch_input = ChannelInputState::WaitingFirst;
+                }
+            }
+
+            // Channel input state machine
+            match ch_input.clone() {
+                ChannelInputState::WaitingFirst => {
+                    let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
+                    for k in keys {
+                        if k == Key::C {
+                            continue;
+                        } // ignore the C that started us
+                        if k == Key::Escape {
+                            ch_input = ChannelInputState::Idle;
+                            break;
+                        }
+                        if let Some(c) = key_to_char(k)
+                            && c.is_ascii_alphabetic()
+                        {
+                            ch_input = ChannelInputState::WaitingSecond(c);
+                            break;
+                        }
+                    }
+                }
+                ChannelInputState::WaitingSecond(first) => {
+                    let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
+                    for k in keys {
+                        if k == Key::Escape {
+                            ch_input = ChannelInputState::Idle;
+                            break;
+                        }
+                        if let Some(c) = key_to_char(k) {
+                            let ch_name = format!("{}{}", first, c);
+                            if let Some(freq) = lookup_channel_by_name(&ch_name) {
+                                // Found it! Store the frequency and signal exit.
+                                tune_freq.store(freq, std::sync::atomic::Ordering::Relaxed);
+                                exit_reason.store(5, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            } else {
+                                // Invalid channel name, flash error and reset
+                                ch_input_flash_msg = format!("Unknown channel: {}", ch_name);
+                                ch_input_flash_until =
+                                    Some(std::time::Instant::now() + Duration::from_secs(2));
+                                ch_input = ChannelInputState::Idle;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ChannelInputState::Idle => {}
+            }
+
+            if let Ok(frame_u32) = frame_rxs[i].try_recv() {
+                if frame_u32.len() == display_buffers[i].len() {
+                    display_buffers[i].copy_from_slice(&frame_u32);
+                    // Hand the buffer back to the worker's recycle pool
+                    // (drop it if the pool is full — the worker will just
+                    // allocate). Done before drawing the overlays, which
+                    // operate on `display_buffers[i]`.
+                    let _ = recycle_txs[i].try_send(frame_u32);
+
+                    let format_str = if *is_pal { "PAL" } else { "NTSC" };
+                    let channel_name = get_fpv_channel_name(*absolute_freq_mhz);
+                    // Show the denoiser state so the operator can see what
+                    // `D` did without hunting the console.
+                    let dn = if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
+                        " DN"
+                    } else {
+                        ""
+                    };
+                    let display_text = if let Some(ch) = channel_name {
+                        format!("{} · Channel {} [BW]{}", format_str, ch, dn)
+                    } else {
+                        format!("{} · {:.2} MHz [BW]{}", format_str, absolute_freq_mhz, dn)
+                    };
+
+                    draw_text_with_bg(
+                        &mut display_buffers[i],
+                        *width,
+                        *height,
+                        10,
+                        10,
+                        &display_text,
+                        0xff00ff00,
+                        0xff000000,
+                    );
+
+                    // Band panel over the bottom of the picture; the key
+                    // hints sit just above it.
+                    let panel_h = band
+                        .as_ref()
+                        .map(|b| b.overlay_height(panel_mode, *height))
+                        .unwrap_or(0);
+                    if let Some(b) = band.as_ref() {
+                        b.draw_overlay(&mut display_buffers[i], *width, *height, panel_mode);
+                    }
+
+                    // Keybinding hints at the bottom of the picture, just
+                    // above the band panel when one is shown. `B` is only
+                    // offered when there is a panel to cycle.
+                    let hint_y = (*height).saturating_sub(20 + panel_h);
+                    let hint = if band.is_some() {
+                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise  B:Band"
+                    } else {
+                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise"
+                    };
+                    draw_text_with_bg(
+                        &mut display_buffers[i],
+                        *width,
+                        *height,
+                        10,
+                        hint_y,
+                        hint,
+                        0xffaaaaaa,
+                        0x80000000,
+                    );
+
+                    // Channel input prompt overlay
+                    match &ch_input {
+                        ChannelInputState::WaitingFirst => {
+                            draw_text_with_bg(
+                                &mut display_buffers[i],
+                                *width,
+                                *height,
+                                10,
+                                30,
+                                "CH: __",
+                                0xffffff00,
+                                0xcc000000,
+                            );
+                        }
+                        ChannelInputState::WaitingSecond(first) => {
+                            draw_text_with_bg(
+                                &mut display_buffers[i],
+                                *width,
+                                *height,
+                                10,
+                                30,
+                                &format!("CH: {}_", first),
+                                0xffffff00,
+                                0xcc000000,
+                            );
+                        }
+                        ChannelInputState::Idle => {}
+                    }
+
+                    // Flash message for invalid channel
+                    if let Some(until) = ch_input_flash_until {
+                        if std::time::Instant::now() < until {
+                            draw_text_with_bg(
+                                &mut display_buffers[i],
+                                *width,
+                                *height,
+                                10,
+                                30,
+                                &ch_input_flash_msg,
+                                0xffff4444,
+                                0xcc000000,
+                            );
+                        } else {
+                            ch_input_flash_until = None;
+                        }
+                    }
+
+                    let _ = window.update_with_buffer(&display_buffers[i], *width, *height);
+                } else if debug {
+                    eprintln!(
+                        "[DEBUG] dropped frame on window {}: size {} != display {}",
+                        i,
+                        frame_u32.len(),
+                        display_buffers[i].len()
+                    );
+                }
+            } else {
+                window.update();
+            }
+
+            i += 1;
+        }
+
+        // One keypress → one toggle, regardless of how many windows are
+        // open. Workers pick the new state up on their next field; the
+        // model stays loaded either way, so the switch is instant.
+        if denoise_toggle_requested {
+            denoise_toggle_requested = false;
+            let now = !denoise_on.load(std::sync::atomic::Ordering::Relaxed);
+            denoise_on.store(now, std::sync::atomic::Ordering::Relaxed);
+            if cfg!(feature = "neural-vsr") {
+                println!("Denoiser {}", if now { "ON" } else { "OFF" });
+            } else {
+                println!(
+                    "Denoiser unavailable: rebuild with `--features neural-vsr` to enable it."
+                );
+            }
+        }
+
+        if panel_toggle_requested {
+            panel_toggle_requested = false;
+            panel_mode = panel_mode.next();
+            panel_mode.store();
+            println!("Band panel: {}", panel_mode.label());
+        }
+
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let final_reason = exit_reason.load(std::sync::atomic::Ordering::Relaxed);
+    match final_reason {
+        1 => Ok(RunLiveResult::SignalLost),
+        2 => Ok(RunLiveResult::TooManyOverruns),
+        3 => Ok(RunLiveResult::SkipFrequency),
+        4 => Ok(RunLiveResult::NextChannel),
+        5 => {
+            let freq = tune_freq.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(RunLiveResult::TuneToChannel(freq as f64))
+        }
+        _ => Ok(RunLiveResult::UserExit),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TEXT RENDERING
+// ═══════════════════════════════════════════════════════════════════
+
+fn get_fpv_channel_name(freq_mhz: f64) -> Option<&'static str> {
+    let freq_round = freq_mhz.round() as i32;
+    match freq_round {
+        // --- 5.8 GHz Band A (Boscam A) ---
+        5865 => Some("A1"),
+        5845 => Some("A2"),
+        5825 => Some("A3"),
+        5805 => Some("A4"),
+        5785 => Some("A5"),
+        5765 => Some("A6"),
+        5745 => Some("A7"),
+        5725 => Some("A8"),
+
+        // --- 5.8 GHz Band B (Boscam B) ---
+        5733 => Some("B1"),
+        5752 => Some("B2"),
+        5771 => Some("B3"),
+        5790 => Some("B4"),
+        5809 => Some("B5"),
+        5828 => Some("B6"),
+        5847 => Some("B7"),
+        5866 => Some("B8"),
+
+        // --- 5.8 GHz Band E (Boscam E) ---
+        5705 => Some("E1"),
+        5685 => Some("E2"),
+        5665 => Some("E3"),
+        5645 => Some("E4"),
+        5885 => Some("E5"),
+        5905 => Some("E6"),
+        5925 => Some("E7"),
+        5945 => Some("E8"),
+
+        // --- 5.8 GHz Band F (Fat Shark / ImmersionRC) ---
+        5740 => Some("F1"),
+        5760 => Some("F2"),
+        5780 => Some("F3"),
+        5800 => Some("F4"),
+        5820 => Some("F5"),
+        5840 => Some("F6"),
+        5860 => Some("F7"),
+
+        // --- 5.8 GHz Band R (Raceband) ---
+        5658 => Some("R1"),
+        5695 => Some("R2"),
+        5732 => Some("R3"),
+        5769 => Some("R4"),
+        5806 => Some("R5"),
+        5843 => Some("R6"),
+        5880 => Some("R7/F8"),
+        5917 => Some("R8"),
+
+        // --- 5.3 GHz Band D (Boscam D / "5.3G", 5362 + 37 MHz grid) ---
+        // The 37 MHz-spaced 5362 grid is the Boscam D band. The
+        // 48-channel VTX "L" lowband is the 40 MHz-spaced 5333 grid
+        // below; the two are 29 MHz apart at their first channel and
+        // are easily conflated.
+        5362 => Some("D1"),
+        5399 => Some("D2"),
+        5436 => Some("D3"),
+        // 5473 (D4) collides with U8 — see the shared arm below.
+        5510 => Some("D5"),
+        5547 => Some("D6"),
+        5584 => Some("D7"),
+        5621 => Some("D8"),
+
+        // --- 5.3 GHz Band L (Lowband, 5333 + 40 MHz grid) ---
+        5333 => Some("L1"),
+        // 5373 (L2) collides with U4 — see the shared arm below.
+        5413 => Some("L3"),
+        5453 => Some("L4"),
+        5493 => Some("L5"),
+        5533 => Some("L6"),
+        5573 => Some("L7"),
+        5613 => Some("L8"),
+
+        // --- 5.8 GHz Band U (Ultrabando) ---
+        5300 => Some("U1"),
+        5325 => Some("U2"),
+        5348 => Some("U3"),
+        5398 => Some("U5"),
+        5423 => Some("U6"),
+        5448 => Some("U7"),
+
+        // --- Overlapping/Duplicate 5.8 GHz channels ---
+        5373 => Some("U4/L2"),
+        5473 => Some("U8/D4"),
+
+        // --- 1.2 / 1.3 GHz Video Bands ---
+        1080 => Some("1.2G Ch1"),
+        1120 => Some("1.2G Ch2"),
+        1160 => Some("1.2G Ch3"),
+        1200 => Some("1.2G Ch4"),
+        1240 => Some("1.2G Ch5"),
+        1258 => Some("1.3G Ch9"),
+        1280 => Some("1.3G Ch6"),
+        1320 => Some("1.3G Ch7"),
+        1360 => Some("1.3G Ch8"),
+
+        // --- 2.4 GHz Video Bands ---
+        2410 => Some("2.4G Ch6"),
+        2414 => Some("2.4G Ch1"),
+        2430 => Some("2.4G Ch7"),
+        2432 => Some("2.4G Ch2"),
+        2450 => Some("2.4G Ch3/Ch8"),
+        2468 => Some("2.4G Ch4"),
+        2470 => Some("2.4G Ch9"),
+        2490 => Some("2.4G Ch5"),
+        _ => None,
+    }
+}
+
+/// Single source-of-truth for the FPV-channel snap & fine-tune
+/// candidate set used by `snap_to_nearest_fpv_channel` and
+/// `get_candidate_fpv_channels`. Centralising the array avoids the
+/// previous DRY violation where the two functions each inlined the
+/// same ~70-entry list and could drift out of sync.
+///
+/// Note: this list is a superset of
+/// `orecchiette_fpv_drone_analog_rs::bands::get_all_channels()`. The overlapping
+/// bands (A/B/E/F/R, L, and D) use identical anchor frequencies in
+/// both places — `bands.rs` models L as the standard 40 MHz-spaced
+/// 5333 lowband grid and D as the 37 MHz-spaced 5362 Boscam D grid,
+/// matching this table, so `--channel L1`/`D1` and the display labels
+/// agree. The "U" (Ultra-low) and 2.4 GHz video channels live only
+/// here because `bands.rs` doesn't model them yet (so `--channel U4`
+/// isn't resolvable — that's a separate gap, not a divergence). A
+/// follow-up unification pass should move this whole list into
+/// `bands.rs` and have both paths read it.
+const FPV_CHANNELS_MHZ: &[f64] = &[
+    // 5.8 GHz bands
+    5865.0, 5845.0, 5825.0, 5805.0, 5785.0, 5765.0, 5745.0, 5725.0, // A
+    5733.0, 5752.0, 5771.0, 5790.0, 5809.0, 5828.0, 5847.0, 5866.0, // B
+    5705.0, 5685.0, 5665.0, 5645.0, 5885.0, 5905.0, 5925.0, 5945.0, // E
+    5740.0, 5760.0, 5780.0, 5800.0, 5820.0, 5840.0,
+    5860.0, // F (Fatshark; F8 = 5880 in R row)
+    5658.0, 5695.0, 5732.0, 5769.0, 5806.0, 5843.0, 5880.0, 5917.0, // R (Raceband)
+    5362.0, 5399.0, 5436.0, 5473.0, 5510.0, 5547.0, 5584.0, 5621.0, // D (Boscam D / "5.3G")
+    5333.0, 5413.0, 5453.0, 5493.0, 5533.0, 5573.0, 5613.0, // L (Lowband; L2 = 5373 in U row)
+    5300.0, 5325.0, 5348.0, 5373.0, 5398.0, 5423.0, 5448.0, // U (Ultra-low)
+    // 1.2 / 1.3 GHz long-range analog FPV
+    1080.0, 1120.0, 1160.0, 1200.0, 1240.0, 1258.0, 1280.0, 1320.0, 1360.0,
+    // 2.4 GHz video channels (some overlap with Wi-Fi but legitimate analog FPV)
+    2410.0, 2414.0, 2430.0, 2432.0, 2450.0, 2468.0, 2470.0, 2490.0,
+];
+
+/// Max snap distance when collapsing a coarse-search hit to the
+/// nearest FPV channel. 15 MHz is one FPV channel's typical spacing
+/// — anything further off is more likely a different channel
+/// entirely than an off-tune of the same channel.
+const CHANNEL_SNAP_TOLERANCE_MHZ: f64 = 15.0;
+
+fn snap_to_nearest_fpv_channel(freq_hz: f64) -> f64 {
+    let freq_mhz = freq_hz / 1e6;
+    let mut best_mhz = freq_mhz;
+    let mut min_diff = CHANNEL_SNAP_TOLERANCE_MHZ;
+
+    for &ch in FPV_CHANNELS_MHZ {
+        let diff = (freq_mhz - ch).abs();
+        if diff < min_diff {
+            min_diff = diff;
+            best_mhz = ch;
+        }
+    }
+
+    best_mhz * 1e6
+}
+
+fn get_candidate_fpv_channels(freq_hz: f64) -> Vec<f64> {
+    let freq_mhz = freq_hz / 1e6;
+    let mut candidates: Vec<f64> = FPV_CHANNELS_MHZ
+        .iter()
+        .filter(|&&ch| (freq_mhz - ch).abs() <= CHANNEL_SNAP_TOLERANCE_MHZ)
+        .map(|&ch| ch * 1e6)
+        .collect();
+
+    // Sort by proximity to the coarse hit so the most likely
+    // candidates are checked/printed first by the fine-tune loop.
+    candidates.sort_by(|a, b| {
+        (freq_hz - *a)
+            .abs()
+            .partial_cmp(&(freq_hz - *b).abs())
+            .unwrap()
+    });
+
+    candidates
+}
+
+fn get_char_bitmap(c: char) -> [u8; 8] {
+    match c {
+        ' ' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x60, 0x00],
+        ':' => [0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00],
+        '/' => [0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00],
+        '+' => [0x00, 0x10, 0x10, 0x7c, 0x10, 0x10, 0x00, 0x00],
+        '-' => [0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00],
+        '·' | '*' => [0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00],
+        '0' => [0x3c, 0x66, 0x6e, 0x76, 0x66, 0x66, 0x3c, 0x00],
+        '1' => [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7e, 0x00],
+        '2' => [0x3c, 0x66, 0x06, 0x0c, 0x30, 0x60, 0x7e, 0x00],
+        '3' => [0x3c, 0x66, 0x06, 0x1c, 0x06, 0x66, 0x3c, 0x00],
+        '4' => [0x0c, 0x1c, 0x3c, 0x6c, 0x7e, 0x0c, 0x0c, 0x00],
+        '5' => [0x7e, 0x60, 0x7c, 0x06, 0x06, 0x66, 0x3c, 0x00],
+        '6' => [0x3c, 0x66, 0x60, 0x7c, 0x66, 0x66, 0x3c, 0x00],
+        '7' => [0x7e, 0x66, 0x0c, 0x18, 0x30, 0x30, 0x30, 0x00],
+        '8' => [0x3c, 0x66, 0x66, 0x3c, 0x66, 0x66, 0x3c, 0x00],
+        '9' => [0x3c, 0x66, 0x66, 0x3e, 0x06, 0x66, 0x3c, 0x00],
+        'A' | 'a' => [0x18, 0x3c, 0x66, 0x7e, 0x66, 0x66, 0x66, 0x00],
+        'B' | 'b' => [0x7c, 0x66, 0x66, 0x7c, 0x66, 0x66, 0x7c, 0x00],
+        'C' | 'c' => [0x3c, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3c, 0x00],
+        'D' | 'd' => [0x78, 0x6c, 0x66, 0x66, 0x66, 0x6c, 0x78, 0x00],
+        'E' | 'e' => [0x7e, 0x60, 0x60, 0x7c, 0x60, 0x60, 0x7e, 0x00],
+        'F' | 'f' => [0x7e, 0x60, 0x60, 0x7c, 0x60, 0x60, 0x60, 0x00],
+        'G' | 'g' => [0x3c, 0x66, 0x60, 0x6e, 0x66, 0x66, 0x3c, 0x00],
+        'H' | 'h' => [0x66, 0x66, 0x66, 0x7e, 0x66, 0x66, 0x66, 0x00],
+        'I' | 'i' => [0x7e, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7e, 0x00],
+        'J' | 'j' => [0x06, 0x06, 0x06, 0x06, 0x06, 0x66, 0x3c, 0x00],
+        'K' | 'k' => [0x66, 0x6c, 0x78, 0x70, 0x78, 0x6c, 0x66, 0x00],
+        'L' | 'l' => [0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7e, 0x00],
+        'M' | 'm' => [0x63, 0x77, 0x7f, 0x6b, 0x63, 0x63, 0x63, 0x00],
+        'N' | 'n' => [0x66, 0x76, 0x7e, 0x7e, 0x6e, 0x66, 0x66, 0x00],
+        'O' | 'o' => [0x3c, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x00],
+        'P' | 'p' => [0x7c, 0x66, 0x66, 0x7c, 0x60, 0x60, 0x60, 0x00],
+        'Q' | 'q' => [0x3c, 0x66, 0x66, 0x66, 0x6a, 0x6c, 0x3e, 0x00],
+        'R' | 'r' => [0x7c, 0x66, 0x66, 0x7c, 0x78, 0x6c, 0x66, 0x00],
+        'S' | 's' => [0x3c, 0x66, 0x60, 0x3c, 0x06, 0x66, 0x3c, 0x00],
+        'T' | 't' => [0x7e, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
+        'U' | 'u' => [0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x00],
+        'V' | 'v' => [0x66, 0x66, 0x66, 0x66, 0x66, 0x3c, 0x18, 0x00],
+        'W' | 'w' => [0x63, 0x63, 0x63, 0x6b, 0x7f, 0x77, 0x63, 0x00],
+        'X' | 'x' => [0x66, 0x66, 0x3c, 0x18, 0x3c, 0x66, 0x66, 0x00],
+        'Y' | 'y' => [0x66, 0x66, 0x66, 0x3c, 0x18, 0x18, 0x18, 0x00],
+        'Z' | 'z' => [0x7e, 0x06, 0x0c, 0x18, 0x30, 0x60, 0x7e, 0x00],
+        _ => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
+    for row in 0..h {
+        let row_y = y + row;
+        if row_y >= height {
+            break;
+        }
+        for col in 0..w {
+            let col_x = x + col;
+            if col_x >= width {
+                break;
+            }
+            buffer[row_y * width + col_x] = color;
+        }
+    }
+}
+
+fn draw_string(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    color: u32,
+) {
+    let mut current_x = x;
+    for c in text.chars() {
+        let bitmap = get_char_bitmap(c);
+        for (row, &val) in bitmap.iter().enumerate().take(8) {
+            let row_y = y + row;
+            if row_y >= height {
+                break;
+            }
+            let row_val = val;
+            for col in 0..8 {
+                let col_x = current_x + col;
+                if col_x >= width {
+                    break;
+                }
+                if (row_val & (0x80 >> col)) != 0 {
+                    buffer[row_y * width + col_x] = color;
+                }
+            }
+        }
+        current_x += 8;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_with_bg(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    text_color: u32,
+    bg_color: u32,
+) {
+    let w = text.len() * 8 + 4;
+    let h = 12;
+    draw_rect(buffer, width, height, x, y, w, h, bg_color);
+    draw_string(buffer, width, height, x + 2, y + 2, text, text_color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every channel must sit inside some planned window. This is the
+    /// property the whole planner exists for — a channel nobody tunes
+    /// close enough to is a drone the scan cannot see.
+    fn assert_covers(channels: &[f64], centers: &[f64], span: f64) {
+        for ch in channels {
+            let covered = centers.iter().any(|c| (ch - c).abs() <= span / 2.0 + 1.0);
+            assert!(
+                covered,
+                "channel {:.3} MHz not covered by any of {} tunes at {:.1} MHz span",
+                ch / 1e6,
+                centers.len(),
+                span / 1e6
+            );
+        }
+    }
+
+    /// The decode path may only shed bandwidth it has already filtered
+    /// away. Energy at `work_rate - cutoff` folds onto the passband
+    /// edge, so that frequency has to clear the filter's stopband edge.
+    ///
+    /// The rule has to be driven by the channel's own cutoff, not a
+    /// fixed target rate: file playback defaults to a 17 MHz deviation,
+    /// and "always decode at 15.36 MSPS" would fold a 19 MHz-wide
+    /// channel onto itself.
+    #[test]
+    fn decode_decimation_never_folds_a_channel_onto_itself() {
+        // A live channel (5 MHz deviation) and a file one (17 MHz).
+        for cutoff in [5e6f32 + LUMA_HEADROOM_HZ, 17e6 + LUMA_HEADROOM_HZ] {
+            for rate in [
+                7_680_000u32,
+                15_360_000,
+                20_000_000,
+                25_000_000,
+                30_720_000,
+                40_000_000,
+                50_000_000,
+                61_440_000,
+                100_000_000,
+            ] {
+                let decim = decode_decimation(rate, cutoff);
+                assert!(decim >= 1, "{rate} at {cutoff}: factor must be positive");
+                if decim == 1 {
+                    // Declining to decimate is always safe. Whether the
+                    // capture was wide enough for the channel in the
+                    // first place is not this function's business — at
+                    // 7.68 MSPS a 7 MHz cutoff is already undersampled,
+                    // and no stride fixes that.
+                    continue;
+                }
+                let work_rate = (rate / decim as u32) as f32;
+                // Nothing above the new Nyquist that could fold into
+                // the passband is still inside the filter's transition.
+                let stopband_edge =
+                    cutoff + FIR_TRANSITION_K * rate as f32 / DECODE_FIR_TAPS as f32;
+                assert!(
+                    work_rate - cutoff >= stopband_edge,
+                    "{:.2} MSPS at a {:.1} MHz cutoff decimated by {decim} to {:.2} MSPS: \
+                     energy at {:.2} MHz folds onto the passband edge but the filter is \
+                     still {:.2} MHz from its stopband",
+                    rate as f64 / 1e6,
+                    cutoff as f64 / 1e6,
+                    work_rate as f64 / 1e6,
+                    (work_rate - cutoff) as f64 / 1e6,
+                    stopband_edge as f64 / 1e6
+                );
+            }
+        }
+
+        // The live defaults, spelled out: both wide Aaronia spans land
+        // on the same working rate, and every rate a decoder already
+        // kept up with is left alone.
+        let live = 5e6f32 + LUMA_HEADROOM_HZ;
+        assert_eq!(decode_decimation(61_440_000, live), 4);
+        assert_eq!(decode_decimation(30_720_000, live), 2);
+        for unchanged in [25_000_000u32, 20_000_000, 15_360_000, 7_680_000] {
+            assert_eq!(
+                decode_decimation(unchanged, live),
+                1,
+                "{unchanged} has nothing to shed at a 7 MHz cutoff"
+            );
+        }
+
+        // A 19 MHz-wide file channel needs ~38 MSPS of working rate, so
+        // it must not decimate below that.
+        let file = 17e6f32 + LUMA_HEADROOM_HZ;
+        assert_eq!(decode_decimation(61_440_000, file), 1);
+        assert!(100_000_000 / decode_decimation(100_000_000, file) as u32 >= 38_000_000);
+
+        // Degenerate input must not divide by zero or panic.
+        assert_eq!(decode_decimation(0, live), 1);
+        assert_eq!(decode_decimation(61_440_000, 0.0), 1);
+        assert_eq!(decode_decimation(61_440_000, f32::NAN), 1);
+    }
+
+    #[test]
+    fn tune_planner_covers_every_channel_at_every_plausible_rate() {
+        for bands in [ScanBands::Band58, ScanBands::All] {
+            let channels = bands.channel_freqs_hz();
+            assert!(!channels.is_empty(), "{:?} yielded no channels", bands);
+            for rate in [15.36e6f64, 20e6, 25e6, 30.72e6, 40e6, 50e6, 61.44e6] {
+                let span = rate * USABLE_SPAN_FRACTION;
+                let hops = build_scan_hops(rate, bands);
+                assert_covers(&channels, &hops, span);
+                assert!(
+                    hops.len() <= channels.len(),
+                    "{:?} at {:.2} MSPS planned {} tunes for {} channels — never worse than one each",
+                    bands,
+                    rate / 1e6,
+                    hops.len(),
+                    channels.len()
+                );
+            }
+        }
+    }
+
+    /// A wide capture must actually collapse the table, otherwise the
+    /// planner is buying nothing over tuning each channel in turn.
+    #[test]
+    fn tune_planner_collapses_the_table_when_the_capture_is_wide() {
+        let channels = ScanBands::Band58.channel_freqs_hz();
+        let hops = build_scan_hops(61.44e6, ScanBands::Band58);
+        assert!(
+            hops.len() * 4 < channels.len(),
+            "61.44 MSPS should cover {} channels in far fewer than {} tunes, got {}",
+            channels.len(),
+            channels.len() / 4,
+            hops.len()
+        );
+    }
+
+    /// Hops ascend so synthesisers retune monotonically.
+    #[test]
+    fn tune_planner_emits_ascending_hops() {
+        let hops = build_scan_hops(25e6, ScanBands::All);
+        assert!(
+            hops.windows(2).all(|w| w[0] < w[1]),
+            "hop list must be strictly ascending, got {hops:?}"
+        );
+    }
+
+    /// A span too narrow to group anything must degrade to one tune per
+    /// channel rather than silently dropping channels — and must not
+    /// spin forever doing it.
+    #[test]
+    fn tune_planner_degrades_to_one_tune_per_channel_when_span_is_zero() {
+        let channels = vec![5_658e6, 5_695e6, 5_732e6];
+        let hops = plan_tune_centers(&channels, 0.0);
+        assert_eq!(hops, channels);
+    }
+
+    #[test]
+    fn tune_planner_handles_degenerate_input() {
+        assert!(plan_tune_centers(&[], 50e6).is_empty());
+        // Duplicates collapse rather than each claiming a tune.
+        assert_eq!(
+            plan_tune_centers(&[5_800e6, 5_800e6, 5_800e6], 0.0).len(),
+            1
+        );
+        // A non-finite entry must not poison the sort into an infinite loop.
+        let hops = plan_tune_centers(&[5_800e6, f64::NAN, 5_810e6], 50e6);
+        assert_eq!(hops.len(), 1);
+    }
+
+    /// Scanning everything must be a strict superset of scanning 5.8,
+    /// and must cost more tunes — that trade is the point of the flag.
+    #[test]
+    fn all_bands_is_a_superset_of_the_58_band() {
+        let band58 = ScanBands::Band58.channel_freqs_hz();
+        let all = ScanBands::All.channel_freqs_hz();
+        assert!(band58.iter().all(|f| all.contains(f)));
+        assert!(all.len() > band58.len());
+        assert!(
+            build_scan_hops(61.44e6, ScanBands::All).len()
+                > build_scan_hops(61.44e6, ScanBands::Band58).len()
+        );
+    }
+}
