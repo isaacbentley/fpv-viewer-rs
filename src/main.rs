@@ -311,48 +311,73 @@ const MARGINAL_PROBE_MARGIN_DB: f32 = 6.0;
 ///
 /// Scanning wants width: 61.44 MSPS covers 49.2 MHz of spectrum per
 /// tune, which is the whole point of hopping so few times. Decoding one
-/// channel wants none of that. The decode path already throws the extra
-/// away — `decode_decimation` picks 4 at 61.44 MSPS, so the DDC filters
-/// and discards three quarters of every stage — and the RTSA HTTP link
-/// carries 245 MB/s to deliver 61 MB/s of signal that survives.
+/// channel needs only the channel, and the RTSA HTTP link carries
+/// 245 MB/s to deliver a signal that fits in a quarter of it.
 ///
-/// Capturing at the rate the decoder would have decimated to gets the
-/// same samples for a quarter of the network and none of the DDC:
-/// measured on synthetic input, 0.61 CPU-seconds per second of signal
-/// against 3.93 for the undecimated path (`examples/profile_decode.rs`).
+/// This picks the **lowest supported rate whose usable span still holds
+/// the channel**, which is not the same as the rate the decoder would
+/// have decimated to. Two things make the difference matter:
+///
+/// - `decode_decimation` is a floor division, not a power of two. At
+///   6 MHz deviation it answers 3, and 61.44/3 is 20.48 MSPS — not a
+///   rate the hardware runs. Snapping that to the nearest supported
+///   rate lands on 15.36 MSPS, *below* the 17.1 MSPS its own ±8 MHz
+///   cutoff requires, and the capture aliases onto itself. An earlier
+///   version of this shipped that bug.
+/// - The hardware's usable span is narrower than its sample rate
+///   ([`USABLE_SPAN_FRACTION`]). Capturing at rate `r` is therefore
+///   *not* the same as capturing wide and decimating to `r` in
+///   software: the device's own filter shapes the band, so the channel
+///   has to fit the usable part, not merely Nyquist.
+///
+/// So the requirement is `USABLE_SPAN_FRACTION * rate >= 2 * cutoff`,
+/// checked against each supported rate from the bottom up. At the
+/// default 5 MHz deviation that gives 30.72 MSPS — half the network and
+/// half the DDC rather than a quarter, but a rate the signal actually
+/// fits inside.
 ///
 /// Two cases keep the scan rate:
 ///
 /// - `--demod pll`. The loop cannot track a 5 MHz deviation much below
 ///   20 MSPS, so `run_live` caps decimation for it, and the cap is not
-///   generally a rate the hardware runs (61.44/3 is not). Forcing PLL
-///   already costs the CPU the decimation would have saved; this does
-///   not also hand it a rate it cannot use.
+///   generally a rate the hardware runs. Forcing PLL already costs the
+///   CPU decimation would have saved; this does not also hand it a rate
+///   it cannot use.
 /// - An explicit `--sample-rate`. That is the operator naming a rate,
 ///   not a default to optimise.
 ///
-/// The cutoff used here is the widest `run_live` can choose —
-/// `bandwidth_hz / 2` is clamped to `fm_deviation + LUMA_HEADROOM_HZ`
-/// — so the rate is safe for whatever bandwidth the detector reports,
-/// which is not known until after the lock.
+/// The cutoff is the widest `run_live` can choose — `bandwidth_hz / 2`
+/// is clamped to `fm_deviation + LUMA_HEADROOM_HZ` — so the rate is
+/// safe for whatever bandwidth the detector reports, which is not known
+/// until after the lock.
+#[cfg(feature = "aaronia")]
 fn locked_capture_rate_hz(scan_rate_hz: f64, fm_deviation: f32, demod: DemodKind) -> f64 {
-    if matches!(demod, DemodKind::Pll) || scan_rate_hz <= 0.0 {
+    if matches!(demod, DemodKind::Pll) || !scan_rate_hz.is_finite() || scan_rate_hz <= 0.0 {
         return scan_rate_hz;
     }
-    let widest_cutoff = fm_deviation + LUMA_HEADROOM_HZ;
-    let decim = decode_decimation(scan_rate_hz as u32, widest_cutoff);
-    if decim <= 1 {
+    let widest_cutoff = (fm_deviation + LUMA_HEADROOM_HZ) as f64;
+    if !widest_cutoff.is_finite() || widest_cutoff <= 0.0 {
         return scan_rate_hz;
     }
-    let target = scan_rate_hz / decim as f64;
-    let snapped = sdr_aaronia_rs::nearest_iq_sample_rate(target);
-    // Never round *up* into a rate the decoder would decimate again,
-    // and never below the target: either way the point is lost.
-    if snapped > target {
-        scan_rate_hz
-    } else {
-        snapped
+    // Spectrum the channel occupies, expressed as the sample rate that
+    // holds it inside the part of the capture the hardware delivers
+    // flat.
+    let needed_rate = 2.0 * widest_cutoff / USABLE_SPAN_FRACTION;
+
+    // Walk down the supported grid (`scan_rate / 2^n`, which is what
+    // `nearest_iq_sample_rate` quantises to) and keep the lowest rate
+    // that still clears the requirement.
+    let mut chosen = scan_rate_hz;
+    let mut candidate = scan_rate_hz / 2.0;
+    while candidate >= needed_rate {
+        let supported = sdr_aaronia_rs::nearest_iq_sample_rate(candidate);
+        if (supported - candidate).abs() > 1.0 || supported < needed_rate {
+            break;
+        }
+        chosen = supported;
+        candidate /= 2.0;
     }
+    chosen
 }
 
 /// Which FPV bands the auto-scan covers.
@@ -736,6 +761,7 @@ const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 /// [`AARONIA_SCAN_DWELL_MAX`]. Cutting the floor without that would
 /// trade away weak-signal sensitivity that was never measured; the two
 /// belong together.
+#[cfg(feature = "aaronia")]
 const AARONIA_SCAN_DWELL: Duration = Duration::from_millis(25);
 
 /// Ceiling for a hop that earns it: probes showing energy above the
@@ -747,6 +773,7 @@ const AARONIA_SCAN_DWELL: Duration = Duration::from_millis(25);
 /// a candidate gets enough packets for [`DETECT_PACKETS_MARGINAL`].
 /// 150 ms covers that budget's ~64 ms of detector CPU at 61.44 MSPS
 /// with room for the packets to arrive.
+#[cfg(feature = "aaronia")]
 const AARONIA_SCAN_DWELL_MAX: Duration = Duration::from_millis(150);
 
 /// What a sweep may spend on one hop: the floor every hop pays, and the
@@ -781,6 +808,29 @@ const AARONIA_DWELL_EXTENSION: Duration = Duration::from_millis(40);
 /// Default Aaronia span when no --sample-rate is given (max complex span for 92.16 MHz clock).
 #[cfg(feature = "aaronia")]
 const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
+
+/// The one frame the display will show next.
+///
+/// A bounded channel cannot express "latest wins": the producer can
+/// only add to the back, so when it is full the choice is to block (the
+/// display paces the decoder, and dropped IQ follows) or to discard the
+/// frame just produced — which keeps the *stale* ones queued. Sixty
+/// frames produced during a stall left frame 1 as the newest available.
+///
+/// A slot the producer overwrites has neither problem. It also hands
+/// back whatever it displaced, so the buffer is reused rather than
+/// allocated, and the queue depth cannot add latency because there is
+/// no queue.
+type FrameSlot = Arc<std::sync::Mutex<Option<Vec<u32>>>>;
+
+/// Lock a [`FrameSlot`], ignoring poisoning.
+///
+/// A panicking producer or consumer says nothing about whether the
+/// pixels in the slot are usable, and refusing to show video because a
+/// previous frame's thread died is worse than showing it.
+fn lock_slot(slot: &FrameSlot) -> std::sync::MutexGuard<'_, Option<Vec<u32>>> {
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// One capture chunk on its way to the decoder, and whether the signal
 /// reaching it runs on from the last one.
@@ -2820,6 +2870,7 @@ where
 {
     let mut channel_txs = Vec::new();
     let mut frame_rxs = Vec::new();
+    let mut frame_slots: Vec<FrameSlot> = Vec::new();
     let mut recycle_txs = Vec::new();
     let mut windows = Vec::new();
     let mut display_buffers = Vec::new();
@@ -2838,7 +2889,12 @@ where
         #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
         let denoise_model = denoise_model.clone();
         let (iq_tx, iq_rx) = mpsc::sync_channel::<IqChunk>(10);
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u32>>(2);
+        // The channel is now only a wakeup, and the thing that still
+        // reports the UI going away: dropping the receiver is how the
+        // UI signals shutdown, and a mutex has no equivalent.
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<()>(1);
+        let frame_slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
+        let producer_slot = Arc::clone(&frame_slot);
         // Frame-buffer recycle pool: the UI hands spent frame buffers
         // back here so the decode worker can refill them in place
         // (`reconstruct_frame_into`) instead of allocating + zeroing a
@@ -2936,6 +2992,7 @@ where
         display_buffers.push(vec![0u32; width * height]);
         channel_txs.push(iq_tx);
         frame_rxs.push(frame_rx);
+        frame_slots.push(frame_slot);
         recycle_txs.push(recycle_tx);
 
         // Per-channel snapshot encoder thread. PNG encoding is tens of
@@ -3222,22 +3279,23 @@ where
                     // reader discards live IQ. A dropped *frame* costs
                     // one repeated picture; dropped *IQ* costs sync.
                     //
-                    // So when the UI is behind, drop the frame instead:
-                    // it is already superseded by the one being
-                    // decoded, and the display only ever shows the
-                    // newest. Its buffer becomes the next frame's,
-                    // which also keeps the steady state allocation-free
-                    // when the recycle pool has run dry.
-                    match frame_tx.try_send(std::mem::take(&mut frame_buf)) {
-                        Ok(()) => {
-                            frame_buf = recycle_rx
-                                .try_recv()
-                                .unwrap_or_else(|_| vec![0u32; width * height]);
-                        }
-                        Err(mpsc::TrySendError::Full(superseded)) => {
-                            frame_buf = superseded;
-                        }
-                        Err(mpsc::TrySendError::Disconnected(_)) => return,
+                    // So the frame goes into a slot the producer
+                    // overwrites: the UI always sees the newest one,
+                    // and whatever it had not taken yet comes back here
+                    // to be reused, which keeps the steady state
+                    // allocation-free even when the recycle pool has
+                    // run dry.
+                    let displaced =
+                        lock_slot(&producer_slot).replace(std::mem::take(&mut frame_buf));
+                    frame_buf = displaced
+                        .or_else(|| recycle_rx.try_recv().ok())
+                        .unwrap_or_else(|| vec![0u32; width * height]);
+                    // Wake the UI. `Full` just means it has not looked
+                    // since the last frame, which is exactly the case
+                    // the slot already handled.
+                    match frame_tx.try_send(()) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+                        Err(mpsc::TrySendError::Disconnected(())) => return,
                     }
                 }
 
@@ -3287,6 +3345,7 @@ where
         if reason != 0 {
             windows.clear();
             frame_rxs.clear();
+            frame_slots.clear();
             display_buffers.clear();
             break;
         }
@@ -3310,6 +3369,7 @@ where
             {
                 windows.remove(i);
                 frame_rxs.remove(i);
+                frame_slots.remove(i);
                 recycle_txs.remove(i);
                 display_buffers.remove(i);
                 continue;
@@ -3320,6 +3380,7 @@ where
                 exit_reason.store(3, std::sync::atomic::Ordering::Relaxed);
                 windows.clear();
                 frame_rxs.clear();
+                frame_slots.clear();
                 display_buffers.clear();
                 break;
             }
@@ -3344,6 +3405,7 @@ where
                 exit_reason.store(4, std::sync::atomic::Ordering::Relaxed);
                 windows.clear();
                 frame_rxs.clear();
+                frame_slots.clear();
                 display_buffers.clear();
                 break;
             }
@@ -3404,16 +3466,10 @@ where
                 ChannelInputState::Idle => {}
             }
 
-            // Latest-frame mailbox: drain to the newest frame the
-            // worker has produced and recycle everything it superseded,
-            // so a UI that fell behind shows current video rather than
-            // working through a backlog of stale fields.
-            let mut newest: Option<Vec<u32>> = None;
-            while let Ok(f) = frame_rxs[i].try_recv() {
-                if let Some(stale) = newest.replace(f) {
-                    let _ = recycle_txs[i].try_send(stale);
-                }
-            }
+            // Drain the wakeup tokens — the frame itself is in the
+            // slot, and there is only ever the newest one there.
+            while frame_rxs[i].try_recv().is_ok() {}
+            let newest = lock_slot(&frame_slots[i]).take();
             if let Some(frame_u32) = newest {
                 if frame_u32.len() == display_buffers[i].len() {
                     display_buffers[i].copy_from_slice(&frame_u32);
@@ -4146,24 +4202,56 @@ mod tests {
         ]));
     }
 
-    /// The whole point of #6: a locked channel is captured at the rate
-    /// the decoder would have decimated to, not the rate the sweep
-    /// needed.
+    /// A locked channel drops below the scan rate, but only to a rate
+    /// whose usable span still holds the channel.
+    #[cfg(feature = "aaronia")]
     #[test]
-    fn a_locked_channel_drops_to_the_decode_rate() {
-        let live_dev = 5_000_000.0;
+    fn a_locked_channel_drops_to_a_rate_that_fits_the_channel() {
+        // 5 MHz deviation -> 7 MHz cutoff -> needs 17.5 MSPS of usable
+        // span, so 30.72 is the lowest supported rate that holds it.
+        let r = locked_capture_rate_hz(61_440_000.0, 5_000_000.0, DemodKind::Auto);
+        assert_eq!(r, 30_720_000.0);
+        assert!(r < 61_440_000.0, "must still be a reduction");
+    }
+
+    /// The bug this function shipped with: `decode_decimation` answers
+    /// 3 at 6 MHz deviation, 61.44/3 is 20.48 MSPS which the hardware
+    /// does not run, and snapping to the nearest supported rate landed
+    /// on 15.36 — below the 17.1 MSPS its own cutoff requires. Every
+    /// rate this returns must hold its own channel.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn every_chosen_rate_satisfies_its_own_bandwidth_requirement() {
+        for dev in [3e6f32, 5e6, 6e6, 7e6, 9e6, 12e6, 17e6] {
+            let r = locked_capture_rate_hz(61_440_000.0, dev, DemodKind::Auto);
+            let cutoff = (dev + LUMA_HEADROOM_HZ) as f64;
+            assert!(
+                USABLE_SPAN_FRACTION * r >= 2.0 * cutoff,
+                "deviation {dev} chose {r}, whose usable span {} cannot hold {} Hz",
+                USABLE_SPAN_FRACTION * r,
+                2.0 * cutoff
+            );
+            assert!(r <= 61_440_000.0, "must never exceed the scan rate");
+        }
+    }
+
+    /// Specifically the two the review named.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn six_and_seven_mhz_deviation_no_longer_pick_15_36() {
         assert_eq!(
-            locked_capture_rate_hz(61_440_000.0, live_dev, DemodKind::Auto),
-            15_360_000.0
+            locked_capture_rate_hz(61_440_000.0, 6_000_000.0, DemodKind::Auto),
+            30_720_000.0
         );
         assert_eq!(
-            locked_capture_rate_hz(30_720_000.0, live_dev, DemodKind::Auto),
-            15_360_000.0
+            locked_capture_rate_hz(61_440_000.0, 7_000_000.0, DemodKind::Auto),
+            30_720_000.0
         );
     }
 
     /// Forcing the PLL keeps the scan rate: `run_live` caps decimation
     /// for it, and that cap is not generally a rate the hardware runs.
+    #[cfg(feature = "aaronia")]
     #[test]
     fn forcing_the_pll_keeps_the_scan_rate() {
         assert_eq!(
@@ -4172,23 +4260,24 @@ mod tests {
         );
     }
 
-    /// A capture already at the decode rate has nothing to give up.
+    /// A capture already at the narrowest rate that fits has nothing to
+    /// give up.
+    #[cfg(feature = "aaronia")]
     #[test]
     fn an_already_narrow_capture_is_left_alone() {
-        let r = locked_capture_rate_hz(15_360_000.0, 5_000_000.0, DemodKind::Auto);
-        assert_eq!(r, 15_360_000.0);
+        assert_eq!(
+            locked_capture_rate_hz(15_360_000.0, 5_000_000.0, DemodKind::Auto),
+            15_360_000.0
+        );
     }
 
-    /// A wide-deviation link must not be narrowed onto itself — the
-    /// same trap `decode_decimation` documents for file playback.
+    /// A wide-deviation link must not be narrowed onto itself.
+    #[cfg(feature = "aaronia")]
     #[test]
     fn a_wide_deviation_link_is_not_narrowed() {
-        let wide = 17_000_000.0;
+        let wide = 17_000_000.0f32;
         let r = locked_capture_rate_hz(61_440_000.0, wide, DemodKind::Auto);
-        assert!(
-            r >= 2.0 * (wide + LUMA_HEADROOM_HZ) as f64,
-            "{r} would fold a {wide} Hz deviation onto itself"
-        );
+        assert_eq!(r, 61_440_000.0, "nothing below the scan rate can hold it");
     }
 
     /// `flat` must read as non-adaptive, since that is how a backend
