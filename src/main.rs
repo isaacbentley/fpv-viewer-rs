@@ -782,6 +782,24 @@ const AARONIA_DWELL_EXTENSION: Duration = Duration::from_millis(40);
 #[cfg(feature = "aaronia")]
 const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
 
+/// One capture chunk on its way to the decoder, and whether the signal
+/// reaching it runs on from the last one.
+///
+/// The decoder carries state across chunk boundaries — a FIR delay
+/// line, a carried IQ sample, a field history — all of which assume the
+/// samples either side are adjacent. Two things break that, and neither
+/// used to reach the decoder: a source overrun (the flag was read once
+/// during standard classification and then dropped), and the reader
+/// discarding a chunk because the worker was behind.
+///
+/// Carrying it with the chunk rather than beside it means the decoder
+/// cannot act on the wrong one when it falls behind.
+struct IqChunk {
+    samples: Arc<orecchiette_sdr_source_rs::PooledIqBuffer>,
+    /// The stream broke immediately before this chunk.
+    discontinuous: bool,
+}
+
 // ── No-op dwell advice (single-channel, no hopping) ────────────────
 
 struct NoOpDwell;
@@ -1111,6 +1129,12 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         move |channel_txs, _exit_flag| {
             let _ = file.seek(SeekFrom::Start(0));
             let mut active_txs = channel_txs;
+            // Looping playback wraps to the start on EOF, and the last
+            // sample of the file is not adjacent to the first. Without
+            // this the decoder splices the seam and takes the phase
+            // difference across it as a frequency — the same spike a
+            // dropped chunk produces, once per loop.
+            let mut wrapped = false;
             loop {
                 if active_txs.is_empty() {
                     return;
@@ -1118,6 +1142,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                 match file.read(&mut buf) {
                     Ok(0) => {
                         let _ = file.seek(SeekFrom::Start(0));
+                        wrapped = true;
                     }
                     Ok(bytes_read) => {
                         let samples_read = bytes_read / 8;
@@ -1139,7 +1164,14 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                         let pooled =
                             orecchiette_sdr_source_rs::PooledIqBuffer::new_unpooled(iq_vec);
                         let arc_chunk = Arc::new(pooled);
-                        active_txs.retain(|tx| tx.send(Arc::clone(&arc_chunk)).is_ok());
+                        let breaks = std::mem::take(&mut wrapped);
+                        active_txs.retain(|tx| {
+                            tx.send(IqChunk {
+                                samples: Arc::clone(&arc_chunk),
+                                discontinuous: breaks,
+                            })
+                            .is_ok()
+                        });
                     }
                     Err(_) => break,
                 }
@@ -2571,7 +2603,14 @@ fn run_live(
         exit_reason.clone(),
         tune_freq,
         move |channel_txs, exit_flag| {
-            let mut active_txs = channel_txs;
+            // Each consumer carries its own "the stream broke before
+            // your next chunk" flag: a chunk dropped because one
+            // window's worker fell behind is a hole for that decoder
+            // and not for any other. Held across iterations, because
+            // the chunk that would have carried the flag can itself be
+            // the one that gets dropped.
+            let mut active_txs: Vec<(_, bool)> =
+                channel_txs.into_iter().map(|tx| (tx, false)).collect();
             // The lock check must integrate for the same reason the scan
             // does: one 65,536-sample packet is ~1-3 ms of signal, below
             // the length at which a single-shot detection finds anything
@@ -2599,10 +2638,18 @@ fn run_live(
             let mut overrun_count = 0;
             let mut last_overrun_clear = Instant::now();
 
-            // Send first chunk
+            // Send first chunk. The stream has just started, so
+            // nothing precedes it to be continuous with — the decoder's
+            // carried state is empty at this point anyway.
             {
                 let arc_chunk = Arc::new(first_samples);
-                active_txs.retain(|tx| tx.send(Arc::clone(&arc_chunk)).is_ok());
+                active_txs.retain(|(tx, _)| {
+                    tx.send(IqChunk {
+                        samples: Arc::clone(&arc_chunk),
+                        discontinuous: false,
+                    })
+                    .is_ok()
+                });
             }
 
             // Continue from SDR
@@ -2688,15 +2735,33 @@ fn run_live(
                             }
                         }
 
+                        // A packet flagged overrun follows a gap in
+                        // the stream: its first sample is not adjacent
+                        // to the last one the decoder saw.
+                        // A packet flagged overrun follows a gap in the
+                        // stream: its first sample is not adjacent to
+                        // the last one any decoder saw.
+                        let overran = packet.overrun;
                         let arc_chunk = Arc::new(packet.samples);
-                        active_txs.retain(|tx| {
-                            match tx.try_send(Arc::clone(&arc_chunk)) {
-                                Ok(_) => true,
+                        active_txs.retain_mut(|(tx, pending)| {
+                            let breaks = *pending || overran;
+                            match tx.try_send(IqChunk {
+                                samples: Arc::clone(&arc_chunk),
+                                discontinuous: breaks,
+                            }) {
+                                Ok(_) => {
+                                    // Handed over — this consumer is
+                                    // told, so stop telling it.
+                                    *pending = false;
+                                    true
+                                }
                                 // Worker behind: drop this chunk but keep
                                 // the channel. Dropping raw IQ breaks DDC
-                                // continuity (a visible glitch), so we
-                                // count it and surface the cost in debug.
+                                // continuity, so remember that this
+                                // consumer's stream now has a hole in it
+                                // and count the cost for debug.
                                 Err(mpsc::TrySendError::Full(_)) => {
+                                    *pending = true;
                                     dropped_chunks += 1;
                                     true
                                 }
@@ -2751,11 +2816,7 @@ fn run_viewer_pipeline<F>(
     reader_fn: F,
 ) -> anyhow::Result<RunLiveResult>
 where
-    F: FnOnce(
-            Vec<mpsc::SyncSender<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>>,
-            Arc<std::sync::atomic::AtomicU8>,
-        ) + Send
-        + 'static,
+    F: FnOnce(Vec<mpsc::SyncSender<IqChunk>>, Arc<std::sync::atomic::AtomicU8>) + Send + 'static,
 {
     let mut channel_txs = Vec::new();
     let mut frame_rxs = Vec::new();
@@ -2776,8 +2837,7 @@ where
         let denoise_on = Arc::clone(&denoise_on);
         #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
         let denoise_model = denoise_model.clone();
-        let (iq_tx, iq_rx) =
-            mpsc::sync_channel::<Arc<orecchiette_sdr_source_rs::PooledIqBuffer>>(10);
+        let (iq_tx, iq_rx) = mpsc::sync_channel::<IqChunk>(10);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u32>>(2);
         // Frame-buffer recycle pool: the UI hands spent frame buffers
         // back here so the decode worker can refill them in place
@@ -2961,6 +3021,43 @@ where
             let mut pal_debug_done = false;
 
             while let Ok(iq_chunk) = iq_rx.recv() {
+                if iq_chunk.discontinuous {
+                    // The stream broke before this chunk, so every
+                    // piece of state that spans a chunk boundary is now
+                    // describing a moment that no longer connects to
+                    // this one.
+                    //
+                    // The carry sample is the sharpest of them: the
+                    // discriminator takes the phase difference between
+                    // it and the first new sample, and across a gap
+                    // that difference is not a frequency — it is
+                    // whatever the signal did while nobody was looking,
+                    // rendered as one enormous spike. That reads
+                    // downstream as a sync edge, which is why a dropped
+                    // chunk could cost lock rather than a glitch.
+                    iq_carry = None;
+                    ddc.reset();
+                    if let Some(p) = pll.as_mut() {
+                        p.reset();
+                    }
+                    if let Some(d) = deemph.as_mut() {
+                        d.reset();
+                    }
+                    // Drop the partially decoded field: it now has the
+                    // far side of a gap spliced onto it.
+                    demod_buffer.clear();
+                    demod_start = 0;
+                    // Temporal denoise, dropout repair and the time-base
+                    // reference all assume consecutive views of one
+                    // scene. Holding the last good picture while sync
+                    // reacquires is better than blending across the
+                    // hole.
+                    reconstructor.forget_history();
+                    #[cfg(feature = "neural-vsr")]
+                    {
+                        reconstructor.hidden_state = None;
+                    }
+                }
                 shifted_iq.clear();
                 // The carry sample only serves the stateless
                 // discriminator; the PLL's loop state already spans
@@ -2971,7 +3068,7 @@ where
                 {
                     shifted_iq.push(prev);
                 }
-                ddc.process_into_decimated(&iq_chunk, &mut shifted_iq, decim);
+                ddc.process_into_decimated(&iq_chunk.samples, &mut shifted_iq, decim);
                 iq_carry = shifted_iq.last().copied();
                 match pll.as_mut() {
                     Some(p) => p.process_into(&shifted_iq, &mut demod_scratch),
