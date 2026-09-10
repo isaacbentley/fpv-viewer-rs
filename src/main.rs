@@ -15,7 +15,7 @@ use orecchiette_fpv_drone_analog_rs::levels::estimate_cnr_db;
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
 use orecchiette_fpv_drone_analog_rs::types::SignalType;
 use orecchiette_fpv_drone_analog_rs::video::{FrameReconstructor, detect_video_standard};
-use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig, freq_key_khz};
+use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -263,48 +263,43 @@ fn parse_standard(s: &str) -> Result<SignalType, String> {
 ///
 /// So two packets is the right *fast pass* and the wrong *verdict*: at
 /// σ 1.5 it finds a quarter of what eight finds. Hops that show energy
-/// the fast pass could not resolve earn [`DETECT_PACKETS_MARGINAL`]
-/// instead, via the adaptive dwell this used to leave switched off.
+/// So two packets is the right fast pass at a wide capture rate and the
+/// wrong verdict at a narrow one, where a packet is four times the
+/// signal for a third of the cost — see [`detect_packets_per_hop`].
 ///
 /// The cost is CPU, not time on air: two packets is ~5.2 ms of signal at
 /// 25 MSPS but ~18 ms of detection work, so a hop becomes CPU-bound
 /// rather than dwell-bound.
 const DETECT_PACKETS_PER_HOP: usize = 2;
 
-/// Packet budget for a hop whose probes showed energy the fast pass
-/// could not resolve into a detection.
+/// Packets fed to the detector on a hop at a *narrow* capture rate.
 ///
-/// Eight is where the σ 1.5 row above reaches 8/8 at 25 MSPS, and it is
-/// also about what the dwell can pay for: the detector costs ~8 ms per
-/// 65k packet at 61.44 MSPS, so eight passes is ~64 ms of CPU inside a
-/// [`AARONIA_SCAN_DWELL_MAX`] hop.
+/// A packet is a fixed 65,536 samples, so what it is worth depends
+/// entirely on the rate: 1.07 ms of signal at 61.44 MSPS against 4.27 ms
+/// at 15.36, and it costs 6.41 ms of detector against 2.49. Narrow
+/// captures are the case where more packets are both more useful and
+/// cheaper, and six of them is 14.9 ms of CPU inside a 25 ms dwell —
+/// where six at 61.44 MSPS would be 38.5 ms and miss the hop entirely.
 ///
-/// It is not a *field* of evidence at every rate. Eight packets is
-/// 34 ms at 15.36 MSPS but only 8.5 ms at 61.44 MSPS, against a 16.7 ms
-/// NTSC field — so at the scan's native rate this still confirms on less
-/// than one field, and cannot be fixed by spending more packets: the
-/// detector is 7.5x slower than real time there. Confirming on a whole
-/// field means scanning at a lower rate, not a bigger budget.
-const DETECT_PACKETS_MARGINAL: usize = 8;
+/// Six because integration needs the room. Measured against a real A1
+/// transmitter attenuated toward its cliff, a 15.36 MSPS capture that
+/// never confirms in two packets first detects on the fourth; the
+/// evidence is not present earlier, it is *built* by accumulating
+/// spectra. Two packets cannot see it however cleverly they are gated.
+const DETECT_PACKETS_NARROW: usize = 6;
 
-/// How far above a hop's own median probe energy a probe must sit before
-/// the hop is worth extending for.
-///
-/// The median across a hop's probes is the in-band noise floor: most
-/// probes on most hops see nothing.
-///
-/// The margin has to clear what noise alone produces. Probe energy is
-/// already a mean over the probe's decimated block, which tightens the
-/// distribution a long way past single-sample chi-square: simulating
-/// noise-only probes (20-80 probes, averaging depth 64-512) puts
-/// peak-over-median at ~1.1 dB median and ~1.8 dB at p99. 6 dB sits
-/// clear of that with room for a shallower block than modelled.
-///
-/// It is otherwise deliberately low, because the two errors are not
-/// symmetric: gating wrong costs one longer hop, missing costs the
-/// signal. If this proves to miss real candidates it should come down
-/// toward 3-4 dB, which the noise figures still allow.
-const MARGINAL_PROBE_MARGIN_DB: f32 = 6.0;
+/// Above this rate a packet is too little signal and too much detector
+/// to spend [`DETECT_PACKETS_NARROW`] of them on.
+const NARROW_CAPTURE_MAX_RATE_HZ: f64 = 30_720_000.0;
+
+/// How many packets one hop feeds the detector at `sample_rate`.
+fn detect_packets_per_hop(sample_rate_hz: f64) -> usize {
+    if sample_rate_hz > 0.0 && sample_rate_hz <= NARROW_CAPTURE_MAX_RATE_HZ {
+        DETECT_PACKETS_NARROW
+    } else {
+        DETECT_PACKETS_PER_HOP
+    }
+}
 
 /// The rate to capture a *locked* channel at, once the sweep has found
 /// one.
@@ -764,47 +759,6 @@ const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 #[cfg(feature = "aaronia")]
 const AARONIA_SCAN_DWELL: Duration = Duration::from_millis(25);
 
-/// Ceiling for a hop that earns it: probes showing energy above the
-/// floor that the fast pass could not resolve.
-///
-/// [`ScanDwell`] records such a hop, and `DwellController` pushes the
-/// deadline to the observation plus [`AARONIA_DWELL_EXTENSION`],
-/// clamped here — so a quiet band still sweeps at the 25 ms floor while
-/// a candidate gets enough packets for [`DETECT_PACKETS_MARGINAL`].
-/// 150 ms covers that budget's ~64 ms of detector CPU at 61.44 MSPS
-/// with room for the packets to arrive.
-#[cfg(feature = "aaronia")]
-const AARONIA_SCAN_DWELL_MAX: Duration = Duration::from_millis(150);
-
-/// What a sweep may spend on one hop: the floor every hop pays, and the
-/// ceiling one can earn by showing energy the fast pass could not
-/// resolve.
-///
-/// They travel together because setting them apart is what makes the
-/// sweep adaptive — `DwellController` reads `max <= min` as "every hop
-/// lasts exactly `min`", which is how the backends that want a flat
-/// dwell ask for one.
-#[derive(Clone, Copy)]
-struct HopDwell {
-    min: Duration,
-    max: Duration,
-}
-
-impl HopDwell {
-    /// Every hop lasts exactly `d`; no hop can earn more.
-    const fn flat(d: Duration) -> Self {
-        Self { min: d, max: d }
-    }
-    fn is_adaptive(&self) -> bool {
-        self.max > self.min
-    }
-}
-
-/// What one observation buys. Each fresh sighting on a hop pushes the
-/// deadline out again, so a candidate that keeps showing energy keeps
-/// its extension and one that was a transient falls back to the floor.
-const AARONIA_DWELL_EXTENSION: Duration = Duration::from_millis(40);
-
 /// Default Aaronia span when no --sample-rate is given (max complex span for 92.16 MHz clock).
 #[cfg(feature = "aaronia")]
 const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
@@ -857,74 +811,6 @@ impl DwellAdvice for NoOpDwell {
     fn latest_signal_at(&self, _: u64) -> Option<Instant> {
         None
     }
-}
-
-/// Dwell advice for the sweep: hold a hop that showed something.
-///
-/// The source polls this once per packet and re-derives the hop's
-/// deadline from it, so recording a sighting mid-hop extends *that* hop
-/// rather than the next visit to it. That is the whole point — a
-/// candidate is worth more samples now, while the tuner is still on it.
-///
-/// Keyed by the same kHz key the source hops on, so a sighting recorded
-/// from a packet's own capture frequency lands on the hop that produced
-/// it.
-#[derive(Default)]
-struct ScanDwell {
-    seen: std::sync::Mutex<std::collections::HashMap<u64, Instant>>,
-}
-
-impl ScanDwell {
-    /// Record that this hop is worth staying on.
-    fn mark(&self, freq_key_khz: u64) {
-        if let Ok(mut m) = self.seen.lock() {
-            m.insert(freq_key_khz, Instant::now());
-        }
-    }
-}
-
-impl DwellAdvice for ScanDwell {
-    fn latest_signal_at(&self, freq_key_khz: u64) -> Option<Instant> {
-        self.seen.lock().ok()?.get(&freq_key_khz).copied()
-    }
-}
-
-/// The planned hop nearest `captured_hz`.
-///
-/// A packet reports where the device was actually tuned, which since
-/// `sdr-aaronia-rs` v0.11.0 is not the frequency that was commanded:
-/// the reference is off by about -0.79 ppm, so a 5865 MHz hop arrives
-/// labelled 5864.995 MHz. The source keys its dwell on the *commanded*
-/// channel, so a sighting recorded under the captured frequency lands
-/// on a key nothing ever looks up — 5 kHz away, and silently inert.
-///
-/// Mapping back to the nearest planned hop is what keeps the two sides
-/// talking about the same channel. Hops are megahertz apart and the
-/// offset is kilohertz, so nearest-wins is unambiguous.
-fn nearest_hop_hz(hops: &[f64], captured_hz: f64) -> Option<f64> {
-    hops.iter().copied().min_by(|a, b| {
-        (a - captured_hz)
-            .abs()
-            .partial_cmp(&(b - captured_hz).abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-/// Does this hop's probe set look like it is hiding something?
-///
-/// The median is the in-band noise floor — most probes see nothing — so
-/// a probe sitting [`MARGINAL_PROBE_MARGIN_DB`] above it is energy the
-/// fast pass did not turn into a detection. Returns false for an empty
-/// probe set rather than treating "no evidence" as evidence.
-fn probes_look_marginal(probes: &[ProbeEnergy]) -> bool {
-    if probes.len() < 3 {
-        return false;
-    }
-    let mut e: Vec<f32> = probes.iter().map(|p| p.energy.max(1e-30)).collect();
-    e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = e[e.len() / 2];
-    let peak = *e.last().unwrap_or(&median);
-    10.0 * (peak / median.max(1e-30)).log10() >= MARGINAL_PROBE_MARGIN_DB
 }
 
 // ── Main ───────────────────────────────────────────────────────────
@@ -1878,7 +1764,7 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
                 // 20 MSPS ceiling makes packets the longest of any
                 // backend at 3.3 ms — 20 ms lands the per-hop budget
                 // with margin.
-                HopDwell::flat(Duration::from_millis(20)),
+                Duration::from_millis(20),
                 &skipped_freqs,
                 &mut sweep,
             )? {
@@ -2074,7 +1960,7 @@ fn scan_band_for_channel(
     backend_label: &str,
     sample_rate: f64,
     scan_bands: ScanBands,
-    dwell: HopDwell,
+    dwell: Duration,
     skipped_freqs: &std::collections::HashSet<u64>,
     sweep: &mut SweepState,
 ) -> anyhow::Result<ScanOutcome> {
@@ -2100,16 +1986,11 @@ fn scan_band_for_channel(
         // latency, or packets from one centre arrive tagged with the
         // next hop's frequency and every detection is reported at the
         // wrong absolute frequency. See the call sites.
-        dwell_min: dwell.min,
-        dwell_max: dwell.max,
-        dwell_extension: if dwell.is_adaptive() {
-            AARONIA_DWELL_EXTENSION
-        } else {
-            Duration::ZERO
-        },
+        dwell_min: dwell,
+        dwell_max: dwell,
+        dwell_extension: Duration::ZERO,
     };
-    let scan_dwell = Arc::new(ScanDwell::default());
-    let advice = scan_dwell.clone() as Arc<dyn DwellAdvice>;
+    let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
     let handle = source.start(config, advice)?;
     let detector = viewer_detector();
 
@@ -2118,8 +1999,8 @@ fn scan_band_for_channel(
     let mut seen = std::collections::HashSet::new();
     let mut last_freq = 0u64;
     let mut packets_this_hop = 0usize;
-    // Every hop starts on the fast pass and has to earn more.
-    let mut budget_this_hop = DETECT_PACKETS_PER_HOP;
+    // What a packet is worth here decides how many to spend.
+    let packets_per_hop = detect_packets_per_hop(sample_rate);
     let mut probes: Vec<ProbeEnergy> = Vec::new();
     let outcome = |hit: Option<(f64, f32, SignalType)>| match hit {
         Some((f, _, sig)) => ScanOutcome::Found(snap_to_nearest_fpv_channel(f), sig),
@@ -2145,13 +2026,12 @@ fn scan_band_for_channel(
                 // round again, so a one-tune plan finishes on its first
                 // packet and can never sit draining.
                 if center == last_freq {
-                    if packets_this_hop >= budget_this_hop {
+                    if packets_this_hop >= packets_per_hop {
                         continue;
                     }
                 } else {
                     last_freq = center;
                     packets_this_hop = 0;
-                    budget_this_hop = DETECT_PACKETS_PER_HOP;
                 }
                 packets_this_hop += 1;
                 seen.insert(center);
@@ -2166,20 +2046,6 @@ fn scan_band_for_channel(
                 sweep
                     .band
                     .record_hop(center as f64, packets_this_hop == 1, &probes, &results);
-
-                // Energy the fast pass could not resolve: hold this hop
-                // and spend the bigger budget on it. Recorded against
-                // the packet's own capture frequency, so the source
-                // extends the hop that produced it rather than the next
-                // visit. A hop that already detected needs no extension
-                // — the sweep has its answer and the tuner should move.
-                if results.is_empty()
-                    && probes_look_marginal(&probes)
-                    && let Some(hop) = nearest_hop_hz(&hop_freqs, center as f64)
-                {
-                    scan_dwell.mark(freq_key_khz(hop));
-                    budget_this_hop = DETECT_PACKETS_MARGINAL;
-                }
 
                 for res in results {
                     let snapped = snap_to_nearest_fpv_channel(res.frequency_hz as f64);
@@ -2206,7 +2072,7 @@ fn scan_band_for_channel(
                 // HackRF scan with a single detection pass — below the
                 // length at which the sweep finds anything — so that
                 // channel could never be reported.
-                if seen.len() >= hop_freqs.len() && packets_this_hop >= DETECT_PACKETS_PER_HOP {
+                if seen.len() >= hop_freqs.len() && packets_this_hop >= packets_per_hop {
                     sweep.band.end_sweep();
                     (handle.stop)();
                     std::thread::sleep(Duration::from_millis(150));
@@ -2331,10 +2197,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 &label,
                 sample_rate,
                 live.scan_bands,
-                HopDwell {
-                    min: AARONIA_SCAN_DWELL,
-                    max: AARONIA_SCAN_DWELL_MAX,
-                },
+                AARONIA_SCAN_DWELL,
                 &skipped_freqs,
                 &mut sweep,
             )? {
@@ -4135,71 +3998,47 @@ mod tests {
         );
     }
 
-    fn probe(offset_hz: f64, energy: f32) -> ProbeEnergy {
-        ProbeEnergy { offset_hz, energy }
+    /// A packet is a fixed 65,536 samples, so its worth depends on the
+    /// rate: 4.27 ms of signal at 15.36 MSPS against 1.07 at 61.44, for
+    /// 2.49 ms of detector against 6.41. Narrow captures get the
+    /// integration budget because there it is both more useful and
+    /// affordable.
+    #[test]
+    fn a_narrow_capture_gets_the_integration_budget() {
+        assert_eq!(detect_packets_per_hop(15_360_000.0), DETECT_PACKETS_NARROW);
+        assert_eq!(detect_packets_per_hop(30_720_000.0), DETECT_PACKETS_NARROW);
     }
 
-    /// A sighting must key on the hop the *source* is holding, not the
-    /// frequency the packet reports. Since sdr-aaronia-rs v0.11.0 those
-    /// differ by the device's -0.79 ppm reference offset, and a key 5 kHz
-    /// off is one nothing ever looks up — the dwell extension would go
-    /// silently dead rather than fail loudly.
+    /// Six passes at 61.44 MSPS is 38.5 ms of detector against a 25 ms
+    /// dwell — the hop would end before the budget was spent.
     #[test]
-    fn a_sighting_keys_on_the_commanded_hop_not_the_captured_frequency() {
-        let hops = vec![5_800e6, 5_865e6, 5_930e6];
-        // What a 5865 MHz hop actually reports at -0.79 ppm.
-        let captured = 5_864_995_294.0;
-        let hop = nearest_hop_hz(&hops, captured).expect("a hop is nearest");
-        assert_eq!(hop, 5_865e6);
-        assert_eq!(
-            freq_key_khz(hop),
-            freq_key_khz(5_865e6),
-            "must match the key the source dwells on"
-        );
-        assert_ne!(
-            freq_key_khz(captured),
-            freq_key_khz(5_865e6),
-            "the captured frequency alone keys somewhere else — the bug this guards"
+    fn a_wide_capture_keeps_the_fast_pass() {
+        assert_eq!(detect_packets_per_hop(61_440_000.0), DETECT_PACKETS_PER_HOP);
+        assert!(
+            detect_packets_per_hop(61_440_000.0) < detect_packets_per_hop(15_360_000.0),
+            "a wide capture must spend fewer passes than a narrow one"
         );
     }
 
+    /// A nonsense rate must not silently pick the expensive branch.
     #[test]
-    fn nearest_hop_is_none_without_a_plan() {
-        assert!(nearest_hop_hz(&[], 5_865e6).is_none());
+    fn a_degenerate_rate_keeps_the_fast_pass() {
+        assert_eq!(detect_packets_per_hop(0.0), DETECT_PACKETS_PER_HOP);
+        assert_eq!(detect_packets_per_hop(-1.0), DETECT_PACKETS_PER_HOP);
+        assert_eq!(detect_packets_per_hop(f64::NAN), DETECT_PACKETS_PER_HOP);
     }
 
-    /// Flat probes are the quiet-band case: nothing should be extended
-    /// for, or every hop pays the ceiling and the sweep is slower than
-    /// before adaptive dwell existed.
+    /// The budget must fit the dwell, or the hop ends mid-budget and
+    /// the extra packets are never read.
     #[test]
-    fn flat_probes_are_not_marginal() {
-        let probes: Vec<_> = (0..40).map(|i| probe(i as f64 * 1e6, 1.0)).collect();
-        assert!(!probes_look_marginal(&probes));
-    }
-
-    /// Noise-only wander stays well inside the margin: ~1.8 dB at p99
-    /// against a 6 dB gate. 2 dB here stands in for that worst case.
-    #[test]
-    fn noise_wander_is_not_marginal() {
-        let mut probes: Vec<_> = (0..40).map(|i| probe(i as f64 * 1e6, 1.0)).collect();
-        probes[7].energy = 1.585; // +2.0 dB
-        assert!(!probes_look_marginal(&probes));
-    }
-
-    #[test]
-    fn a_probe_above_the_margin_is_marginal() {
-        let mut probes: Vec<_> = (0..40).map(|i| probe(i as f64 * 1e6, 1.0)).collect();
-        probes[13].energy = 10.0; // +10 dB
-        assert!(probes_look_marginal(&probes));
-    }
-
-    /// Too few probes is no evidence, not weak evidence.
-    #[test]
-    fn a_tiny_probe_set_is_never_marginal() {
-        assert!(!probes_look_marginal(&[
-            probe(0.0, 1.0),
-            probe(1e6, 1000.0)
-        ]));
+    fn the_narrow_budget_fits_the_dwell() {
+        // 2.49 ms per pass, measured at 15.36 MSPS.
+        let cpu_ms = 2.49 * DETECT_PACKETS_NARROW as f64;
+        assert!(
+            cpu_ms < AARONIA_SCAN_DWELL.as_secs_f64() * 1e3,
+            "{cpu_ms} ms of detector does not fit a {:?} dwell",
+            AARONIA_SCAN_DWELL
+        );
     }
 
     /// A locked channel drops below the scan rate, but only to a rate
@@ -4278,19 +4117,5 @@ mod tests {
         let wide = 17_000_000.0f32;
         let r = locked_capture_rate_hz(61_440_000.0, wide, DemodKind::Auto);
         assert_eq!(r, 61_440_000.0, "nothing below the scan rate can hold it");
-    }
-
-    /// `flat` must read as non-adaptive, since that is how a backend
-    /// with its own tuning speed (HackRF, USRP) opts out.
-    #[test]
-    fn a_flat_dwell_is_not_adaptive() {
-        assert!(!HopDwell::flat(Duration::from_millis(20)).is_adaptive());
-        assert!(
-            HopDwell {
-                min: AARONIA_SCAN_DWELL,
-                max: AARONIA_SCAN_DWELL_MAX,
-            }
-            .is_adaptive()
-        );
     }
 }

@@ -902,6 +902,7 @@ mod tests {
             .map(|i| ProbeEnergy {
                 offset_hz: -20e6 + i as f64 * 5e6,
                 energy: 1e-8,
+                confidence: 0.0,
             })
             .collect()
     }

@@ -1907,7 +1907,7 @@ dependencies = [
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
 version = "0.8.0"
-source = "git+https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git?branch=main#b9c9cc9c9b6d614a594908e36405c08055492e01"
+source = "git+https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git?branch=main#077d564e0d8a7da272a8f9310fb831a987a79b81"
 dependencies = [
  "bytemuck",
  "log",
