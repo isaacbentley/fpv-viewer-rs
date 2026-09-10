@@ -272,6 +272,78 @@ fn parse_standard(s: &str) -> Result<SignalType, String> {
 /// rather than dwell-bound.
 const DETECT_PACKETS_PER_HOP: usize = 2;
 
+/// The lock check's running state, factored out so the rule is directly
+/// unit-testable rather than buried in the reader closure.
+///
+/// Three outcomes per check, and the distinction that matters is
+/// between the middle two:
+///
+/// - **Held**: our carrier is there and fields are coming out.
+/// - **Provisional**: our carrier is there and no field has come out
+///   since the last check. Acquisition looks like this; so does a
+///   horizontal-sync train with no vertical sync, which scores 0.8
+///   forever and reconstructs nothing. Bounded rather than trusted.
+/// - **Lost**: nothing, or only hits that are not ours.
+#[derive(Default)]
+struct LockState {
+    empty_checks: u32,
+    provisional_checks: u32,
+}
+
+impl LockState {
+    /// Fold one check in. `true` means release the channel.
+    fn observe(&mut self, on_carrier: bool, decoding: bool) -> bool {
+        match (on_carrier, decoding) {
+            (true, true) => {
+                self.empty_checks = 0;
+                self.provisional_checks = 0;
+                false
+            }
+            (true, false) => {
+                self.provisional_checks += 1;
+                self.provisional_checks >= LOCK_PROVISIONAL_CHECKS
+            }
+            _ => {
+                self.empty_checks += 1;
+                self.empty_checks >= LOCK_EMPTY_CHECKS
+            }
+        }
+    }
+}
+
+/// Consecutive checks finding nothing of ours before the channel is
+/// released.
+///
+/// Two, not four: the lock integrator holds ~4 checks of history, so an
+/// empty result already means several consecutive looks found nothing.
+/// Stacking a 4-check threshold on top made a dead channel linger for
+/// up to 8 checks.
+const LOCK_EMPTY_CHECKS: u32 = 2;
+
+/// How far a continuing detection may sit from the channel we tuned to
+/// and still count as *this* signal.
+///
+/// The lock check ran on whatever the capture held, so a transmitter
+/// elsewhere in the 49 MHz span kept the tuned channel's lock alive
+/// indefinitely. Sized like [`CHANNEL_SNAP_TOLERANCE_MHZ`]: past this,
+/// a hit is more likely a different channel than an off-tune of ours.
+const LOCK_CARRIER_TOLERANCE_HZ: f64 = 10e6;
+
+/// Lock checks a carrier may go on being detected without a single
+/// field coming out before we let it go.
+///
+/// A detection is not decodable video. A horizontal-sync pulse train
+/// with no vertical sync scores 0.8 on the sweep detector and
+/// reconstructs no frame at all, so "there is a hit" held the viewer on
+/// a picture it could never draw. Fields reconstructing is the
+/// confirmation; this is how long acquisition is allowed to take before
+/// the absence of one is treated as an answer.
+///
+/// Checks run about twice a second, so eight is ~4 s — long against
+/// standard classification plus a first field, short against staring at
+/// an undecodable carrier.
+const LOCK_PROVISIONAL_CHECKS: u32 = 8;
+
 /// Packets fed to the detector on a hop at a *narrow* capture rate.
 ///
 /// A packet is a fixed 65,536 samples, so what it is worth depends
@@ -1047,6 +1119,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
 
     let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let frames_decoded = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let _ = run_viewer_pipeline(
         resolved_channels,
@@ -1062,6 +1135,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         None,
         exit_reason,
         tune_freq,
+        frames_decoded.clone(),
         move |channel_txs, _exit_flag| {
             let _ = file.seek(SeekFrom::Start(0));
             let mut active_txs = channel_txs;
@@ -2500,6 +2574,7 @@ fn run_live(
 
     let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let frames_decoded = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let result = run_viewer_pipeline(
         resolved_channels,
@@ -2515,6 +2590,7 @@ fn run_live(
         band.cloned(),
         exit_reason.clone(),
         tune_freq,
+        frames_decoded.clone(),
         move |channel_txs, exit_flag| {
             // Each consumer carries its own "the stream broke before
             // your next chunk" flag: a chunk dropped because one
@@ -2545,7 +2621,11 @@ fn run_live(
                 .max(1.0) as usize;
 
             let mut packets = 0;
-            let mut consecutive_lost = 0;
+            let mut lock = LockState::default();
+            let mut frames_at_last_check: u64 = 0;
+            // The channel this run is holding. Detections elsewhere in
+            // the capture are somebody else's signal.
+            let tuned_carrier_hz = rf_center_freq;
             let mut dropped_chunks = 0u64;
 
             let mut overrun_count = 0;
@@ -2637,14 +2717,28 @@ fn run_live(
                                     .unwrap_or_default()
                                 );
                             }
-                            if hits.is_empty() {
-                                consecutive_lost += 1;
-                                if consecutive_lost >= 2 {
-                                    exit_flag.store(1, std::sync::atomic::Ordering::Relaxed);
-                                    break;
-                                }
-                            } else {
-                                consecutive_lost = 0;
+                            // A hit is provisional. Two things promote
+                            // it to "still locked": it has to be on the
+                            // carrier we tuned to, and the decoder has
+                            // to have produced a field since the last
+                            // check. Neither was required before, so a
+                            // transmitter elsewhere in the span kept
+                            // this channel alive, and a carrier with
+                            // horizontal sync but no vertical sync —
+                            // 0.8 confidence, no frame ever — held the
+                            // viewer indefinitely.
+                            let on_carrier = hits.iter().any(|h| {
+                                (h.frequency_hz as f64 - tuned_carrier_hz).abs()
+                                    <= LOCK_CARRIER_TOLERANCE_HZ
+                            });
+                            let produced =
+                                frames_decoded.load(std::sync::atomic::Ordering::Relaxed);
+                            let decoding = produced > frames_at_last_check;
+                            frames_at_last_check = produced;
+
+                            if lock.observe(on_carrier, decoding) {
+                                exit_flag.store(1, std::sync::atomic::Ordering::Relaxed);
+                                break;
                             }
                         }
 
@@ -2726,6 +2820,9 @@ fn run_viewer_pipeline<F>(
     band: Option<BandScan>,
     exit_reason: Arc<std::sync::atomic::AtomicU8>,
     tune_freq: Arc<std::sync::atomic::AtomicU64>,
+    // Fields the decoder has actually reconstructed. The reader thread
+    // watches this to tell a detection apart from decodable video.
+    frames_decoded: Arc<std::sync::atomic::AtomicU64>,
     reader_fn: F,
 ) -> anyhow::Result<RunLiveResult>
 where
@@ -2758,6 +2855,7 @@ where
         let (frame_tx, frame_rx) = mpsc::sync_channel::<()>(1);
         let frame_slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
         let producer_slot = Arc::clone(&frame_slot);
+        let worker_frames = Arc::clone(&frames_decoded);
         // Frame-buffer recycle pool: the UI hands spent frame buffers
         // back here so the decode worker can refill them in place
         // (`reconstruct_frame_into`) instead of allocating + zeroing a
@@ -3148,6 +3246,10 @@ where
                     // to be reused, which keeps the steady state
                     // allocation-free even when the recycle pool has
                     // run dry.
+                    // A field came out. This is the only evidence that
+                    // the signal is decodable rather than merely
+                    // present, and the lock check upstream needs it.
+                    worker_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let displaced =
                         lock_slot(&producer_slot).replace(std::mem::take(&mut frame_buf));
                     frame_buf = displaced
@@ -3996,6 +4098,64 @@ mod tests {
             build_scan_hops(61.44e6, ScanBands::All).len()
                 > build_scan_hops(61.44e6, ScanBands::Band58).len()
         );
+    }
+
+    /// A healthy decode must never be released.
+    #[test]
+    fn a_decoding_carrier_holds_lock_indefinitely() {
+        let mut lock = LockState::default();
+        for i in 0..1000 {
+            assert!(
+                !lock.observe(true, true),
+                "released a decoding carrier at check {i}"
+            );
+        }
+    }
+
+    /// The review's case: a horizontal-sync train with no vertical sync
+    /// scores 0.8 on the sweep detector forever and reconstructs no
+    /// frame. "There is a hit" held the viewer on a picture it could
+    /// never draw.
+    #[test]
+    fn a_detected_but_undecodable_carrier_is_eventually_released() {
+        let mut lock = LockState::default();
+        let mut checks = 0;
+        while !lock.observe(true, false) {
+            checks += 1;
+            assert!(checks < 100, "never released an undecodable carrier");
+        }
+        assert_eq!(checks + 1, LOCK_PROVISIONAL_CHECKS);
+    }
+
+    /// A hit that is not ours must not keep this channel alive — the
+    /// lock check ran on the whole capture, so a transmitter elsewhere
+    /// in a 49 MHz span did exactly that.
+    #[test]
+    fn a_hit_elsewhere_does_not_hold_our_channel() {
+        let mut lock = LockState::default();
+        // Someone else's strong, decodable signal.
+        for _ in 0..LOCK_EMPTY_CHECKS - 1 {
+            assert!(!lock.observe(false, true));
+        }
+        assert!(
+            lock.observe(false, true),
+            "another channel's detection kept ours locked"
+        );
+    }
+
+    /// Acquisition stutter must not accumulate toward release: a check
+    /// that sees both clears the provisional count.
+    #[test]
+    fn a_field_arriving_clears_the_provisional_count() {
+        let mut lock = LockState::default();
+        for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
+            assert!(!lock.observe(true, false));
+        }
+        assert!(!lock.observe(true, true), "a good check should recover");
+        // Full budget available again.
+        for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
+            assert!(!lock.observe(true, false));
+        }
     }
 
     /// A packet is a fixed 65,536 samples, so its worth depends on the
