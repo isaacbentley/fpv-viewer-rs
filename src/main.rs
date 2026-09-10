@@ -306,6 +306,55 @@ const DETECT_PACKETS_MARGINAL: usize = 8;
 /// toward 3-4 dB, which the noise figures still allow.
 const MARGINAL_PROBE_MARGIN_DB: f32 = 6.0;
 
+/// The rate to capture a *locked* channel at, once the sweep has found
+/// one.
+///
+/// Scanning wants width: 61.44 MSPS covers 49.2 MHz of spectrum per
+/// tune, which is the whole point of hopping so few times. Decoding one
+/// channel wants none of that. The decode path already throws the extra
+/// away — `decode_decimation` picks 4 at 61.44 MSPS, so the DDC filters
+/// and discards three quarters of every stage — and the RTSA HTTP link
+/// carries 245 MB/s to deliver 61 MB/s of signal that survives.
+///
+/// Capturing at the rate the decoder would have decimated to gets the
+/// same samples for a quarter of the network and none of the DDC:
+/// measured on synthetic input, 0.61 CPU-seconds per second of signal
+/// against 3.93 for the undecimated path (`examples/profile_decode.rs`).
+///
+/// Two cases keep the scan rate:
+///
+/// - `--demod pll`. The loop cannot track a 5 MHz deviation much below
+///   20 MSPS, so `run_live` caps decimation for it, and the cap is not
+///   generally a rate the hardware runs (61.44/3 is not). Forcing PLL
+///   already costs the CPU the decimation would have saved; this does
+///   not also hand it a rate it cannot use.
+/// - An explicit `--sample-rate`. That is the operator naming a rate,
+///   not a default to optimise.
+///
+/// The cutoff used here is the widest `run_live` can choose —
+/// `bandwidth_hz / 2` is clamped to `fm_deviation + LUMA_HEADROOM_HZ`
+/// — so the rate is safe for whatever bandwidth the detector reports,
+/// which is not known until after the lock.
+fn locked_capture_rate_hz(scan_rate_hz: f64, fm_deviation: f32, demod: DemodKind) -> f64 {
+    if matches!(demod, DemodKind::Pll) || scan_rate_hz <= 0.0 {
+        return scan_rate_hz;
+    }
+    let widest_cutoff = fm_deviation + LUMA_HEADROOM_HZ;
+    let decim = decode_decimation(scan_rate_hz as u32, widest_cutoff);
+    if decim <= 1 {
+        return scan_rate_hz;
+    }
+    let target = scan_rate_hz / decim as f64;
+    let snapped = sdr_aaronia_rs::nearest_iq_sample_rate(target);
+    // Never round *up* into a rate the decoder would decimate again,
+    // and never below the target: either way the point is lost.
+    if snapped > target {
+        scan_rate_hz
+    } else {
+        snapped
+    }
+}
+
 /// Which FPV bands the auto-scan covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ScanBands {
@@ -2225,18 +2274,38 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         let ch_name = get_fpv_channel_name(center_freq / 1e6)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{:.2} MHz", center_freq / 1e6));
-        println!(
-            "{}: {} ({:.3} MHz) at {:.2} MSPS",
-            label,
-            ch_name,
-            center_freq / 1e6,
-            sample_rate / 1e6
-        );
+        // The sweep is over; hold the channel at the rate the decoder
+        // would have decimated to rather than paying for spectrum the
+        // DDC is about to discard. Scanning keeps `sample_rate`, so
+        // losing the signal resumes the wide sweep unchanged.
+        let live_rate = if live.sample_rate.is_some() {
+            sample_rate
+        } else {
+            locked_capture_rate_hz(sample_rate, fm_deviation, live.demod)
+        };
+        if live_rate < sample_rate {
+            println!(
+                "{}: {} ({:.3} MHz) at {:.2} MSPS (scanned at {:.2})",
+                label,
+                ch_name,
+                center_freq / 1e6,
+                live_rate / 1e6,
+                sample_rate / 1e6
+            );
+        } else {
+            println!(
+                "{}: {} ({:.3} MHz) at {:.2} MSPS",
+                label,
+                ch_name,
+                center_freq / 1e6,
+                live_rate / 1e6
+            );
+        }
         // The picture window takes over from the scan window.
         sweep.ui = None;
         match run_live(
             make_source(center_freq),
-            sample_rate,
+            live_rate,
             fm_deviation,
             live.deemphasis_tau,
             live.demod,
@@ -3951,6 +4020,51 @@ mod tests {
             probe(0.0, 1.0),
             probe(1e6, 1000.0)
         ]));
+    }
+
+    /// The whole point of #6: a locked channel is captured at the rate
+    /// the decoder would have decimated to, not the rate the sweep
+    /// needed.
+    #[test]
+    fn a_locked_channel_drops_to_the_decode_rate() {
+        let live_dev = 5_000_000.0;
+        assert_eq!(
+            locked_capture_rate_hz(61_440_000.0, live_dev, DemodKind::Auto),
+            15_360_000.0
+        );
+        assert_eq!(
+            locked_capture_rate_hz(30_720_000.0, live_dev, DemodKind::Auto),
+            15_360_000.0
+        );
+    }
+
+    /// Forcing the PLL keeps the scan rate: `run_live` caps decimation
+    /// for it, and that cap is not generally a rate the hardware runs.
+    #[test]
+    fn forcing_the_pll_keeps_the_scan_rate() {
+        assert_eq!(
+            locked_capture_rate_hz(61_440_000.0, 5_000_000.0, DemodKind::Pll),
+            61_440_000.0
+        );
+    }
+
+    /// A capture already at the decode rate has nothing to give up.
+    #[test]
+    fn an_already_narrow_capture_is_left_alone() {
+        let r = locked_capture_rate_hz(15_360_000.0, 5_000_000.0, DemodKind::Auto);
+        assert_eq!(r, 15_360_000.0);
+    }
+
+    /// A wide-deviation link must not be narrowed onto itself — the
+    /// same trap `decode_decimation` documents for file playback.
+    #[test]
+    fn a_wide_deviation_link_is_not_narrowed() {
+        let wide = 17_000_000.0;
+        let r = locked_capture_rate_hz(61_440_000.0, wide, DemodKind::Auto);
+        assert!(
+            r >= 2.0 * (wide + LUMA_HEADROOM_HZ) as f64,
+            "{r} would fold a {wide} Hz deviation onto itself"
+        );
     }
 
     /// `flat` must read as non-adaptive, since that is how a backend
