@@ -597,6 +597,39 @@ fn decode_decimation(sample_rate: u32, ddc_cutoff_hz: f32) -> usize {
 #[cfg(feature = "aaronia")]
 const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 
+/// Dwell per hop for the Aaronia sweep, on top of the driver's own
+/// 75 ms post-retune drain (`RETUNE_SETTLE` in `sdr-aaronia-rs`, taken
+/// before the dwell clock starts — a hop costs settle + dwell).
+///
+/// A retune must be complete before any packet is attributed to the new
+/// centre: the driver stamps each `IqPacket` with the *commanded*
+/// channel, not the frequency in the RTSA packet header, so a stale
+/// packet is silently mislabelled and the sweep reports a real signal
+/// at the wrong frequency.
+///
+/// Measured against a Spectran V6 ECO over RTSA HTTP at 61.44 MSPS, by
+/// alternating between 869 MHz and 3500 MHz (a 23 dB power step) and
+/// timing the config PUT against the arrival of samples that actually
+/// carry the new centre, 24 hops:
+///
+/// ```text
+///   config PUT round-trip        median  4.8 ms   p95  6.0   max  6.1
+///   signal carries new centre    median 23.5 ms   p95 26.8   max 38.9
+///   two usable packets in hand   median 12.7 ms   p95 27.4   max 30.9
+/// ```
+///
+/// The header frequency and the signal transition agree to within ~1 ms,
+/// so the settle is genuinely that short — the previous 150-300 ms
+/// figure was not measured this way. 100 ms is ~3x the worst observed
+/// settle, and the driver's 75 ms drain covers it twice over before the
+/// dwell even begins.
+///
+/// Longer buys no sensitivity: the detector needs
+/// [`DETECT_PACKETS_PER_HOP`] packets, confidence plateaus at 0.80 from
+/// the second, and a weak signal's sigma cliff does not move with 12x
+/// the dwell.
+const AARONIA_SCAN_DWELL: Duration = Duration::from_millis(100);
+
 /// Default Aaronia span when no --sample-rate is given (max complex span for 92.16 MHz clock).
 #[cfg(feature = "aaronia")]
 const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
@@ -1970,17 +2003,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 &label,
                 sample_rate,
                 live.scan_bands,
-                // An RTSA HTTP retune is a config PUT plus a stream
-                // settle, measured at 150-300 ms — an order of magnitude
-                // above a synthesiser hop. With a dwell below that, the
-                // sweep detects real signals in stale samples and
-                // reports them at hop_centre - 25.72 MHz (the first
-                // probe position): a VTX on A1 was reported as NTSC at
-                // 5915.28 MHz on every sweep, the viewer tuned to empty
-                // spectrum, lost it, and rescanned in a loop. 500 ms
-                // keeps every packet attributable to its claimed centre
-                // at the cost of a ~3 s sweep.
-                Duration::from_millis(500),
+                AARONIA_SCAN_DWELL,
                 &skipped_freqs,
                 &mut sweep,
             )? {
