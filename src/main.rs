@@ -598,14 +598,17 @@ fn decode_decimation(sample_rate: u32, ddc_cutoff_hz: f32) -> usize {
 const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 
 /// Dwell per hop for the Aaronia sweep, on top of the driver's own
-/// 75 ms post-retune drain (`RETUNE_SETTLE` in `sdr-aaronia-rs`, taken
+/// 20 ms post-retune drain (`RETUNE_SETTLE` in `sdr-aaronia-rs`, taken
 /// before the dwell clock starts — a hop costs settle + dwell).
 ///
 /// A retune must be complete before any packet is attributed to the new
-/// centre: the driver stamps each `IqPacket` with the *commanded*
-/// channel, not the frequency in the RTSA packet header, so a stale
-/// packet is silently mislabelled and the sweep reports a real signal
-/// at the wrong frequency.
+/// centre, or the sweep reports a real signal at a frequency it was
+/// never received on. Since `sdr-aaronia-rs` v0.11.0 the driver stamps
+/// each `IqPacket` with the frequency the RTSA packet header reports,
+/// and drops any buffer whose capture frequency does not match the
+/// commanded channel — a stale packet is rejected rather than
+/// mislabelled. The drain is what keeps that rejection cheap; it is no
+/// longer what makes it correct.
 ///
 /// Measured against a Spectran V6 ECO over RTSA HTTP at 61.44 MSPS, by
 /// alternating between 869 MHz and 3500 MHz (a 23 dB power step) and
@@ -621,8 +624,7 @@ const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
 /// The header frequency and the signal transition agree to within ~1 ms,
 /// so the settle is genuinely that short — the previous 150-300 ms
 /// figure was not measured this way. 100 ms is ~3x the worst observed
-/// settle, and the driver's 75 ms drain covers it twice over before the
-/// dwell even begins.
+/// settle.
 ///
 /// Longer buys no sensitivity: the detector needs
 /// [`DETECT_PACKETS_PER_HOP`] packets, confidence plateaus at 0.80 from
@@ -1706,8 +1708,15 @@ enum OverrunPolicy {
 
 /// How long the RTSA HTTP server keeps delivering samples from the
 /// previous centre after acknowledging a retune, over and above the
-/// driver's own 75 ms drain: measured at 150–300 ms. Packets inside this
-/// window belong to the old channel, whatever their label says.
+/// driver's own 20 ms drain. Packets inside this window belong to the
+/// old channel, whatever their label says.
+///
+/// The 150–300 ms this once cited was never measured. On the hop path a
+/// retune is carried by the signal within 38.9 ms worst case over 24
+/// hops at 61.44 MSPS — but this guard is not that path. It covers
+/// entering live decode, cold stream startup included, which that
+/// measurement did not touch. It stays at 400 ms until startup is
+/// measured on its own.
 #[cfg(feature = "aaronia")]
 const AARONIA_HTTP_TUNE_SETTLE: Duration = Duration::from_millis(400);
 
