@@ -3114,16 +3114,33 @@ where
                     }
 
                     demod_start += consumed;
-                    // Swap in a recycled (or fresh) buffer and ship the
-                    // just-filled one to the UI.
-                    let next = recycle_rx
-                        .try_recv()
-                        .unwrap_or_else(|_| vec![0u32; width * height]);
-                    if frame_tx
-                        .send(std::mem::replace(&mut frame_buf, next))
-                        .is_err()
-                    {
-                        return;
+                    // Ship the just-filled frame to the UI, but never
+                    // wait for it.
+                    //
+                    // A blocking send here made the display the
+                    // decoder's pacer: two frames of queue, and a UI
+                    // that stalls stalls the decoder, which stops
+                    // draining the IQ queue, which is ten packets —
+                    // 10.7 ms of signal at 61.44 MSPS — after which the
+                    // reader discards live IQ. A dropped *frame* costs
+                    // one repeated picture; dropped *IQ* costs sync.
+                    //
+                    // So when the UI is behind, drop the frame instead:
+                    // it is already superseded by the one being
+                    // decoded, and the display only ever shows the
+                    // newest. Its buffer becomes the next frame's,
+                    // which also keeps the steady state allocation-free
+                    // when the recycle pool has run dry.
+                    match frame_tx.try_send(std::mem::take(&mut frame_buf)) {
+                        Ok(()) => {
+                            frame_buf = recycle_rx
+                                .try_recv()
+                                .unwrap_or_else(|_| vec![0u32; width * height]);
+                        }
+                        Err(mpsc::TrySendError::Full(superseded)) => {
+                            frame_buf = superseded;
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => return,
                     }
                 }
 
@@ -3290,7 +3307,17 @@ where
                 ChannelInputState::Idle => {}
             }
 
-            if let Ok(frame_u32) = frame_rxs[i].try_recv() {
+            // Latest-frame mailbox: drain to the newest frame the
+            // worker has produced and recycle everything it superseded,
+            // so a UI that fell behind shows current video rather than
+            // working through a backlog of stale fields.
+            let mut newest: Option<Vec<u32>> = None;
+            while let Ok(f) = frame_rxs[i].try_recv() {
+                if let Some(stale) = newest.replace(f) {
+                    let _ = recycle_txs[i].try_send(stale);
+                }
+            }
+            if let Some(frame_u32) = newest {
                 if frame_u32.len() == display_buffers[i].len() {
                     display_buffers[i].copy_from_slice(&frame_u32);
                     // Hand the buffer back to the worker's recycle pool
