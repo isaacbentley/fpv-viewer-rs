@@ -2715,13 +2715,40 @@ fn run_live(
                     Err(_) => break,
                 }
             }
-            // Re-localize on this record while we have it: it is the
-            // same signal, centred, at the rate we will decode at.
-            refined_carrier_hz = detector
-                .detect_from_iq(&record, actual_center as u64, sample_rate_u32)
-                .into_iter()
-                .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
-                .map(|h| h.frequency_hz as f64);
+            // Re-localize the carrier *we are decoding*, on the front
+            // of this record.
+            //
+            // Two things this must not do. It must not rank by
+            // confidence across the whole capture: a second transmitter
+            // 20 MHz away scores just as well, and labelling the picture
+            // after the neighbour is worse than labelling it after a
+            // mis-snapped channel. The decoder mixes DC down and keeps
+            // `ddc_cutoff` either side, so the only detection that can
+            // describe what is on screen is one inside that passband,
+            // and among those the one nearest DC.
+            //
+            // And it must not cost what a full pass over the record
+            // costs. `detect_from_iq` on 25 ms at 61.44 MSPS is ~315 ms
+            // — the window would sit blank for it. One 65,536-sample
+            // window is what the sweep itself localizes from, and the
+            // signal here is centred and strong: measured live, the
+            // estimate lands in a 0.13 MHz spread either way.
+            {
+                let refine_len = record.len().min(65_536);
+                let passband_hz = (fm_deviation + LUMA_HEADROOM_HZ) as f64;
+                refined_carrier_hz = carrier_for_decoded_channel(
+                    detector
+                        .detect_from_iq(
+                            &record[..refine_len],
+                            actual_center as u64,
+                            sample_rate_u32,
+                        )
+                        .into_iter()
+                        .map(|h| h.frequency_hz as f64),
+                    actual_center,
+                    passband_hz,
+                );
+            }
 
             let (detected, confidence) = detector.detect_sync_pulses(&record, sample_rate_u32);
             if debug {
@@ -3186,24 +3213,30 @@ where
         // and against the raw spectrum it reads about 1.3 MHz low — so
         // it is good enough to choose between candidate channels but not
         // to re-centre a capture that is already decoding.
-        let labelled_mhz = refined_carrier_hz
+        // What every piece of UI should call this channel. Distinct
+        // from the tuned frequency, which the sweep may have snapped to
+        // the wrong neighbour — the window title used this while the
+        // video overlay and the snapshot filename still used the tuned
+        // value, so one run showed "A1" in the title bar and "F7" on
+        // the picture.
+        let display_mhz = refined_carrier_hz
             .map(|hz| snap_to_nearest_fpv_channel(hz) / 1_000_000.0)
             .unwrap_or(absolute_freq_mhz);
-        let channel_name = get_fpv_channel_name(labelled_mhz);
+        let channel_name = get_fpv_channel_name(display_mhz);
         if let Some(refined) = refined_carrier_hz
-            && (labelled_mhz - absolute_freq_mhz).abs() > 0.5
+            && (display_mhz - absolute_freq_mhz).abs() > 0.5
         {
             println!(
                 "  → Measured carrier {:.3} MHz here: this is {}, not the {} the sweep snapped to",
                 refined / 1e6,
-                get_fpv_channel_name(labelled_mhz).unwrap_or("an unlisted channel"),
+                get_fpv_channel_name(display_mhz).unwrap_or("an unlisted channel"),
                 get_fpv_channel_name(absolute_freq_mhz).unwrap_or("frequency"),
             );
         }
         let window_title = if let Some(ch) = channel_name {
             format!("{} · Channel {}", type_name, ch)
         } else {
-            format!("{} · {:.2} MHz", type_name, absolute_freq_mhz)
+            format!("{} · {:.2} MHz", type_name, display_mhz)
         };
         // The band panel gets its own rows under the picture rather than
         // being painted over the bottom of it. The window is created
@@ -3242,7 +3275,7 @@ where
             },
         )?;
 
-        windows.push((window, width, height, is_pal, absolute_freq_mhz));
+        windows.push((window, width, height, is_pal, display_mhz));
         display_buffers.push(vec![0u32; width * (height + panel_h_max)]);
         channel_txs.push(iq_tx);
         frame_rxs.push(frame_rx);
@@ -3511,8 +3544,7 @@ where
                         // per-channel workers snapshot concurrently, and
                         // an undiscriminated `fpv_frame_{n}.png` had them
                         // racing to overwrite each other's files.
-                        let path =
-                            format!("fpv_frame_{:.0}MHz_{}.png", absolute_freq_mhz, frame_count);
+                        let path = format!("fpv_frame_{:.0}MHz_{}.png", display_mhz, frame_count);
                         let mut rgb_buf = vec![0u8; width * height * 3];
                         for (i, &pixel) in frame_buf.iter().enumerate() {
                             rgb_buf[i * 3] = ((pixel >> 16) & 0xFF) as u8;
@@ -3611,7 +3643,7 @@ where
 
         let mut i = 0;
         while i < windows.len() {
-            let (window, width, height, is_pal, absolute_freq_mhz) = &mut windows[i];
+            let (window, width, height, is_pal, display_mhz) = &mut windows[i];
 
             // Q / Escape / window close → quit the app. Gated on the
             // channel-input state machine being idle, and edge-triggered
@@ -3743,7 +3775,7 @@ where
                     let _ = recycle_txs[i].try_send(frame_u32);
 
                     let format_str = if *is_pal { "PAL" } else { "NTSC" };
-                    let channel_name = get_fpv_channel_name(*absolute_freq_mhz);
+                    let channel_name = get_fpv_channel_name(*display_mhz);
                     // Show the denoiser state so the operator can see what
                     // `D` did without hunting the console.
                     let dn = if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3754,7 +3786,7 @@ where
                     let display_text = if let Some(ch) = channel_name {
                         format!("{} · Channel {} [BW]{}", format_str, ch, dn)
                     } else {
-                        format!("{} · {:.2} MHz [BW]{}", format_str, absolute_freq_mhz, dn)
+                        format!("{} · {:.2} MHz [BW]{}", format_str, display_mhz, dn)
                     };
 
                     draw_text_with_bg(
@@ -4073,6 +4105,27 @@ const FPV_CHANNELS_MHZ: &[f64] = &[
 /// — anything further off is more likely a different channel
 /// entirely than an off-tune of the same channel.
 const CHANNEL_SNAP_TOLERANCE_MHZ: f64 = 15.0;
+
+/// Which detection describes the carrier being decoded.
+///
+/// Not the strongest one. The decoder mixes the tuned centre down to DC
+/// and keeps `passband_hz` either side, so a detection outside that is
+/// filtered out before anything is drawn — it cannot be what is on
+/// screen. Ranking by confidence instead picked a second transmitter
+/// 20 MHz away that scored just as well, and labelled the picture after
+/// the neighbour.
+///
+/// Among the candidates the decoder can actually see, the nearest to DC
+/// is the one it is centred on.
+fn carrier_for_decoded_channel(
+    hits: impl IntoIterator<Item = f64>,
+    tuned_hz: f64,
+    passband_hz: f64,
+) -> Option<f64> {
+    hits.into_iter()
+        .filter(|hz| (hz - tuned_hz).abs() <= passband_hz)
+        .min_by(|a, b| (a - tuned_hz).abs().total_cmp(&(b - tuned_hz).abs()))
+}
 
 fn snap_to_nearest_fpv_channel(freq_hz: f64) -> f64 {
     let freq_mhz = freq_hz / 1e6;
@@ -4609,6 +4662,53 @@ mod tests {
     fn a_narrow_capture_gets_the_integration_budget() {
         assert_eq!(detect_packets_per_hop(15_360_000.0), DETECT_PACKETS_NARROW);
         assert_eq!(detect_packets_per_hop(30_720_000.0), DETECT_PACKETS_NARROW);
+    }
+
+    /// The review's reproduction: two transmitters, 5800 and 5820 MHz,
+    /// captured at 5800. Both score 0.95. Ranking by confidence picked
+    /// 5820 and labelled the picture after a transmitter the DDC never
+    /// passes.
+    #[test]
+    fn refinement_labels_the_carrier_being_decoded_not_the_loudest() {
+        let tuned = 5_800e6;
+        let passband = 7e6; // 5 MHz deviation + luma headroom
+        assert_eq!(
+            carrier_for_decoded_channel(vec![5_800e6, 5_820e6], tuned, passband),
+            Some(5_800e6)
+        );
+    }
+
+    /// Order must not decide it either.
+    #[test]
+    fn refinement_is_independent_of_detection_order() {
+        let tuned = 5_800e6;
+        assert_eq!(
+            carrier_for_decoded_channel(vec![5_820e6, 5_800e6], tuned, 7e6),
+            carrier_for_decoded_channel(vec![5_800e6, 5_820e6], tuned, 7e6)
+        );
+    }
+
+    /// A real offset inside the passband is still adopted — the whole
+    /// point, since the sweep may have tuned a megahertz off.
+    #[test]
+    fn refinement_adopts_a_carrier_offset_inside_the_passband() {
+        // Tuned to F7 (5860) with the carrier really near A1 (5865).
+        let got = carrier_for_decoded_channel(vec![5_863.98e6], 5_860e6, 7e6);
+        assert_eq!(got, Some(5_863.98e6));
+        assert_eq!(snap_to_nearest_fpv_channel(got.unwrap()) / 1e6, 5865.0);
+    }
+
+    /// Nothing the decoder can see means no refinement, not a guess.
+    #[test]
+    fn refinement_declines_when_every_candidate_is_out_of_band() {
+        assert_eq!(
+            carrier_for_decoded_channel(vec![5_820e6, 5_780e6], 5_800e6, 7e6),
+            None
+        );
+        assert_eq!(
+            carrier_for_decoded_channel(Vec::<f64>::new(), 5_800e6, 7e6),
+            None
+        );
     }
 
     /// The review's case: a noisy fixture at 61.44 MSPS first detects
