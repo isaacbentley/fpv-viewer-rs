@@ -66,13 +66,15 @@ struct FileArgs {
     /// noisy.
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
-    /// FM demodulator. 'auto' (default) picks the PLL at or above
-    /// ~25 MSPS of *decode* rate and the discriminator below it,
-    /// matching where each is actually measured to win. Decoding runs
-    /// below the capture rate on a wide capture, so 'auto' normally
-    /// resolves to the discriminator; 'pll' holds the decode rate up
-    /// instead, at a CPU cost. Run with `--help` (long form, not `-h`)
-    /// to see per-value details.
+    /// FM demodulator. 'auto' (default) uses the PLL only where its
+    /// loop can track the deviation — a high enough decode rate *and* a
+    /// deviation inside the loop's bandwidth. At analog FPV's ~5 MHz
+    /// deviation that is never true at any rate the viewer decodes at,
+    /// so 'auto' resolves to the discriminator: measured, the PLL is
+    /// 9-25 dB worse there and also costs 6.49 dB at 4.2 MHz luma. On a
+    /// narrow deviation it is worth +12 dB and 'auto' will pick it.
+    /// 'pll' forces it regardless, at a CPU cost. Run with `--help`
+    /// (long form, not `-h`) to see per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
     /// Start with the neural temporal denoiser enabled (requires a
@@ -128,13 +130,15 @@ struct LiveArgs {
     /// noisy.
     #[arg(long, default_value_t = DEFAULT_DEEMPHASIS_TAU_S)]
     deemphasis_tau: f32,
-    /// FM demodulator. 'auto' (default) picks the PLL at or above
-    /// ~25 MSPS of *decode* rate and the discriminator below it,
-    /// matching where each is actually measured to win. Decoding runs
-    /// below the capture rate on a wide capture, so 'auto' normally
-    /// resolves to the discriminator; 'pll' holds the decode rate up
-    /// instead, at a CPU cost. Run with `--help` (long form, not `-h`)
-    /// to see per-value details.
+    /// FM demodulator. 'auto' (default) uses the PLL only where its
+    /// loop can track the deviation — a high enough decode rate *and* a
+    /// deviation inside the loop's bandwidth. At analog FPV's ~5 MHz
+    /// deviation that is never true at any rate the viewer decodes at,
+    /// so 'auto' resolves to the discriminator: measured, the PLL is
+    /// 9-25 dB worse there and also costs 6.49 dB at 4.2 MHz luma. On a
+    /// narrow deviation it is worth +12 dB and 'auto' will pick it.
+    /// 'pll' forces it regardless, at a CPU cost. Run with `--help`
+    /// (long form, not `-h`) to see per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
     /// Start with the neural temporal denoiser enabled (requires a
@@ -172,6 +176,13 @@ struct LiveArgs {
 /// resolves to the discriminator, which is both the cheaper and the
 /// better choice down there. `--demod pll` caps the decimation instead
 /// of being silently overruled.
+/// Loop bandwidth the PLL is built with.
+///
+/// Also the deviation it can track: a loop cannot follow an excursion
+/// faster than it can move. `PllFmDemod` clamps `wn` to 0.5 rad/sample,
+/// so the *effective* bandwidth is `min(this, fs / 4π)`.
+const PLL_LOOP_BW_HZ: f32 = 1.0e6;
+
 const PLL_AUTO_MIN_SAMPLE_RATE_HZ: u32 = 25_000_000;
 
 /// Which FM demodulator the decode worker runs.
@@ -205,11 +216,54 @@ impl DemodKind {
     /// Resolve to a concrete choice for the given decode rate in Hz —
     /// the rate *after* decimation, not the capture rate. `true`
     /// selects the PLL.
-    fn use_pll(self, decode_rate_hz: u32) -> bool {
+    /// Whether to demodulate with the PLL at this decode rate and
+    /// deviation.
+    ///
+    /// `Auto` used to decide on the rate alone, and that cannot be
+    /// right: what the loop has to survive is the *deviation*, and a
+    /// loop too slow for it does not merely perform worse, it stops
+    /// tracking. Measured at 25 MSPS against the discriminator, 1 MHz
+    /// modulation, output SNR:
+    ///
+    /// ```text
+    ///   deviation    PLL advantage
+    ///     100 kHz        +12.1 dB
+    ///       1 MHz        +12.1 dB
+    ///       5 MHz    -24.9 .. -9.3 dB
+    /// ```
+    ///
+    /// The benefit is real where the loop can follow — 12 dB is worth
+    /// having — and it inverts completely at the 5 MHz deviation analog
+    /// FPV actually uses, where the output is mostly tracking error.
+    /// The same setting also costs video bandwidth: against the
+    /// discriminator's flat response, the shipped 1 MHz loop reads
+    /// +2.25 dB at 1 MHz and **-6.49 dB at 4.2 MHz**, so the top of the
+    /// luma band is quietly lost.
+    ///
+    /// So the test is whether the loop can track. Its bandwidth is
+    /// clamped at `wn <= 0.5 rad/sample`, i.e. `fs / 4π`, which at
+    /// 25 MSPS is ~2 MHz — tracking 5 MHz would need a *decode* rate
+    /// above 60 MSPS, and the decode path decimates below that by
+    /// design. For FPV deviations this therefore resolves to the
+    /// discriminator at every rate the viewer runs, which is what the
+    /// measurements say it should do.
+    ///
+    /// `--demod pll` still forces it, for the narrow-deviation case and
+    /// for experiments.
+    fn use_pll(self, decode_rate_hz: u32, fm_deviation_hz: f32) -> bool {
         match self {
             DemodKind::Discriminator => false,
             DemodKind::Pll => true,
-            DemodKind::Auto => decode_rate_hz >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
+            DemodKind::Auto => {
+                if decode_rate_hz < PLL_AUTO_MIN_SAMPLE_RATE_HZ {
+                    return false;
+                }
+                // What the loop actually runs at, after its stability
+                // clamp.
+                let clamped_bw =
+                    (decode_rate_hz as f32 / (4.0 * std::f32::consts::PI)).min(PLL_LOOP_BW_HZ);
+                fm_deviation_hz > 0.0 && fm_deviation_hz <= clamped_bw
+            }
         }
     }
 }
@@ -2898,7 +2952,7 @@ where
             }
         }
         let work_rate = sample_rate / decim as u32;
-        let use_pll = demod_kind.use_pll(work_rate);
+        let use_pll = demod_kind.use_pll(work_rate, fm_deviation);
         if decim > 1 {
             println!(
                 "  → Decoding at {:.2} MSPS ({:.2} MSPS capture / {})",
@@ -3006,7 +3060,8 @@ where
             // 1 MHz loop bandwidth is an absolute figure and does not
             // scale with the rate; `use_pll` was resolved against the
             // working rate in the setup loop.
-            let mut pll = use_pll.then(|| PllFmDemod::new(work_rate, 1.0e6, fm_deviation * 1.2));
+            let mut pll =
+                use_pll.then(|| PllFmDemod::new(work_rate, PLL_LOOP_BW_HZ, fm_deviation * 1.2));
             let mut demod_buffer: Vec<f32> = Vec::new();
             // A field plus its blanking, the same bound the
             // reconstructor's own fallback path uses before it will
@@ -4156,6 +4211,58 @@ mod tests {
         for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
             assert!(!lock.observe(true, false));
         }
+    }
+
+    /// The auto rule has to be about the deviation, not the rate. At
+    /// FPV's 5 MHz the PLL measured 9-25 dB *worse* than the
+    /// discriminator, because its loop cannot track that excursion —
+    /// and it also costs 6.49 dB at 4.2 MHz luma.
+    #[test]
+    fn auto_does_not_pick_the_pll_at_an_fpv_deviation() {
+        for rate in [25_000_000u32, 30_720_000, 61_440_000] {
+            assert!(
+                !DemodKind::Auto.use_pll(rate, 5_000_000.0),
+                "auto chose the PLL at {rate} Hz for a 5 MHz deviation"
+            );
+        }
+    }
+
+    /// ...and must still pick it where it is worth +12 dB: a narrow
+    /// deviation the loop can follow, at a rate high enough to matter.
+    #[test]
+    fn auto_still_picks_the_pll_where_the_loop_can_track() {
+        assert!(DemodKind::Auto.use_pll(25_000_000, 500_000.0));
+        assert!(DemodKind::Auto.use_pll(25_000_000, 1_000_000.0));
+    }
+
+    /// Below the rate threshold the deviation is irrelevant.
+    #[test]
+    fn auto_keeps_the_discriminator_below_the_rate_threshold() {
+        assert!(!DemodKind::Auto.use_pll(15_360_000, 500_000.0));
+    }
+
+    /// The clamp is real: at a low rate the loop cannot reach its
+    /// nominal bandwidth, so a deviation it could otherwise track is
+    /// still out of reach.
+    #[test]
+    fn the_loop_bandwidth_clamp_is_respected() {
+        // fs / 4pi at 25 MSPS is ~1.99 MHz, so PLL_LOOP_BW_HZ binds.
+        assert!(!DemodKind::Auto.use_pll(25_000_000, 1_500_000.0));
+    }
+
+    /// Explicit flags keep meaning what they say.
+    #[test]
+    fn explicit_demod_choices_ignore_the_heuristic() {
+        assert!(DemodKind::Pll.use_pll(15_360_000, 5_000_000.0));
+        assert!(!DemodKind::Discriminator.use_pll(61_440_000, 100_000.0));
+    }
+
+    /// A degenerate deviation must not select the PLL by accident.
+    #[test]
+    fn a_degenerate_deviation_keeps_the_discriminator() {
+        assert!(!DemodKind::Auto.use_pll(25_000_000, 0.0));
+        assert!(!DemodKind::Auto.use_pll(25_000_000, -1.0));
+        assert!(!DemodKind::Auto.use_pll(25_000_000, f32::NAN));
     }
 
     /// A packet is a fixed 65,536 samples, so its worth depends on the
