@@ -3000,11 +3000,45 @@ where
         } else {
             format!("{} · {:.2} MHz", type_name, absolute_freq_mhz)
         };
-        println!("  → Window: {} ({}×{})", window_title, width, height);
-        let window = Window::new(&window_title, width, height, WindowOptions::default())?;
+        // The band panel gets its own rows under the picture rather than
+        // being painted over the bottom of it. The window is created
+        // tall enough for both; the buffer is sized for the largest
+        // panel so cycling `B` never reallocates mid-frame.
+        let panel_h_now = band
+            .as_ref()
+            .map(|b| b.below_height(PanelMode::load()))
+            .unwrap_or(0);
+        let panel_h_max = band
+            .as_ref()
+            .map(|b| b.below_height(PanelMode::Full))
+            .unwrap_or(0);
+        println!(
+            "  → Window: {} ({}×{}{})",
+            window_title,
+            width,
+            height + panel_h_now,
+            if panel_h_now > 0 {
+                format!(", {height} picture + {panel_h_now} band")
+            } else {
+                String::new()
+            }
+        );
+        let window = Window::new(
+            &window_title,
+            width,
+            height + panel_h_now,
+            WindowOptions {
+                // The composite changes height when `B` cycles the
+                // panel and minifb cannot resize a window, so let it
+                // letterbox rather than distort the picture.
+                resize: true,
+                scale_mode: minifb::ScaleMode::AspectRatioStretch,
+                ..WindowOptions::default()
+            },
+        )?;
 
         windows.push((window, width, height, is_pal, absolute_freq_mhz));
-        display_buffers.push(vec![0u32; width * height]);
+        display_buffers.push(vec![0u32; width * (height + panel_h_max)]);
         channel_txs.push(iq_tx);
         frame_rxs.push(frame_rx);
         frame_slots.push(frame_slot);
@@ -3491,8 +3525,12 @@ where
             while frame_rxs[i].try_recv().is_ok() {}
             let newest = lock_slot(&frame_slots[i]).take();
             if let Some(frame_u32) = newest {
-                if frame_u32.len() == display_buffers[i].len() {
-                    display_buffers[i].copy_from_slice(&frame_u32);
+                // The buffer is taller than the picture now — the band
+                // panel owns the rows underneath — so the frame fills
+                // the picture region rather than the whole buffer.
+                let picture_len = *width * *height;
+                if frame_u32.len() == picture_len && display_buffers[i].len() >= picture_len {
+                    display_buffers[i][..picture_len].copy_from_slice(&frame_u32);
                     // Hand the buffer back to the worker's recycle pool
                     // (drop it if the pool is full — the worker will just
                     // allocate). Done before drawing the overlays, which
@@ -3525,20 +3563,32 @@ where
                         0xff000000,
                     );
 
-                    // Band panel over the bottom of the picture; the key
-                    // hints sit just above it.
+                    // Band panel in its own rows *below* the picture.
+                    // Painting it over the bottom of the frame cost those
+                    // rows of video, which is the whole reason it moved.
+                    // Clamp to the rows the buffer actually has spare
+                    // beneath the picture, so a panel mode taller than
+                    // what was allocated cannot index past the end.
+                    let spare_rows =
+                        (display_buffers[i].len() / (*width).max(1)).saturating_sub(*height);
                     let panel_h = band
                         .as_ref()
-                        .map(|b| b.overlay_height(panel_mode, *height))
-                        .unwrap_or(0);
-                    if let Some(b) = band.as_ref() {
-                        b.draw_overlay(&mut display_buffers[i], *width, *height, panel_mode);
+                        .map(|b| b.below_height(panel_mode))
+                        .unwrap_or(0)
+                        .min(spare_rows);
+                    if panel_h > 0
+                        && let Some(b) = band.as_ref()
+                    {
+                        let picture_len = *width * *height;
+                        let panel =
+                            &mut display_buffers[i][picture_len..picture_len + *width * panel_h];
+                        b.draw_below(panel, *width, panel_h, panel_mode);
                     }
 
-                    // Keybinding hints at the bottom of the picture, just
-                    // above the band panel when one is shown. `B` is only
+                    // Keybinding hints at the bottom of the picture. They
+                    // no longer have to dodge the panel. `B` is only
                     // offered when there is a panel to cycle.
-                    let hint_y = (*height).saturating_sub(20 + panel_h);
+                    let hint_y = (*height).saturating_sub(20);
                     let hint = if band.is_some() {
                         "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise  B:Band"
                     } else {
@@ -3602,13 +3652,18 @@ where
                         }
                     }
 
-                    let _ = window.update_with_buffer(&display_buffers[i], *width, *height);
+                    let composite_h = *height + panel_h;
+                    let _ = window.update_with_buffer(
+                        &display_buffers[i][..*width * composite_h],
+                        *width,
+                        composite_h,
+                    );
                 } else if debug {
                     eprintln!(
-                        "[DEBUG] dropped frame on window {}: size {} != display {}",
+                        "[DEBUG] dropped frame on window {}: size {} != picture {}",
                         i,
                         frame_u32.len(),
-                        display_buffers[i].len()
+                        *width * *height
                     );
                 }
             } else {

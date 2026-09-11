@@ -417,21 +417,36 @@ impl BandScan {
             .unwrap_or_default()
     }
 
-    /// Pixels the overlay takes from the bottom of a frame in `mode`.
-    pub fn overlay_height(&self, mode: PanelMode, frame_h: usize) -> usize {
-        match mode {
-            PanelMode::Off => 0,
-            PanelMode::Strip => STRIP_H.min(frame_h),
-            PanelMode::Full => self.full_height().min(frame_h / 2),
+    /// Draw the panel into a buffer that holds nothing else — the strip
+    /// *below* the picture rather than over it.
+    ///
+    /// This used to be drawn over the bottom rows of the picture, which
+    /// cost exactly those rows of video. Given its own region below the
+    /// picture it draws the same panel without taking any.
+    pub fn draw_below(&self, buf: &mut [u32], w: usize, h: usize, mode: PanelMode) {
+        if h == 0 || buf.is_empty() {
+            return;
         }
-    }
-
-    /// Draw over the bottom of a `w × h` picture.
-    pub fn draw_overlay(&self, buf: &mut [u32], w: usize, h: usize, mode: PanelMode) {
+        buf.fill(BG);
         match mode {
             PanelMode::Off => {}
             PanelMode::Strip => self.draw_strip(buf, w, h),
-            PanelMode::Full => self.draw_full(buf, w, h, self.overlay_height(mode, h)),
+            // `h` is already the panel's own height here, so the panel
+            // fills it rather than sitting at the bottom of a frame.
+            PanelMode::Full => self.draw_full(buf, w, h, h),
+        }
+    }
+
+    /// Pixels a panel *below* the picture needs in `mode`.
+    ///
+    /// Not capped to a fraction of the frame the way the old overlay
+    /// height was: the panel no longer competes with the picture for
+    /// rows, so `Full` can be its natural height.
+    pub fn below_height(&self, mode: PanelMode) -> usize {
+        match mode {
+            PanelMode::Off => 0,
+            PanelMode::Strip => STRIP_H,
+            PanelMode::Full => self.full_height(),
         }
     }
 
@@ -972,16 +987,21 @@ mod tests {
         for (w, h) in [(720usize, 235usize), (720, 576), (320, 240), (64, 40)] {
             let mut buf = vec![0x00404040u32; w * h];
             b.draw_standalone(&mut buf, w, h);
-            b.draw_overlay(&mut buf, w, h, PanelMode::Strip);
-            b.draw_overlay(&mut buf, w, h, PanelMode::Full);
-            b.draw_overlay(&mut buf, w, h, PanelMode::Off);
+            b.draw_below(&mut buf, w, h, PanelMode::Strip);
+            b.draw_below(&mut buf, w, h, PanelMode::Full);
+            b.draw_below(&mut buf, w, h, PanelMode::Off);
         }
-        let mut buf = vec![0x00404040u32; 720 * 576];
-        b.draw_overlay(&mut buf, 720, 576, PanelMode::Strip);
-        // The strip touched the bottom rows and left the top alone.
-        assert!(buf[..720 * 100].iter().all(|p| *p == 0x00404040));
-        assert!(buf[720 * 560..].iter().any(|p| *p != 0x00404040));
-        assert_eq!(b.overlay_height(PanelMode::Strip, 576), STRIP_H);
-        assert!(b.overlay_height(PanelMode::Full, 576) <= 288);
+        // A panel-sized buffer is filled by the panel — it is not
+        // sharing the frame with a picture any more.
+        let h = STRIP_H;
+        let mut buf = vec![0x00404040u32; 720 * h];
+        b.draw_below(&mut buf, 720, h, PanelMode::Strip);
+        assert!(
+            buf.iter().any(|p| *p != 0x00404040),
+            "the strip drew nothing into its own region"
+        );
+        assert_eq!(b.below_height(PanelMode::Strip), STRIP_H);
+        assert_eq!(b.below_height(PanelMode::Off), 0);
+        assert_eq!(b.below_height(PanelMode::Full), b.full_height());
     }
 }
