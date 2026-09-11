@@ -71,10 +71,13 @@ struct FileArgs {
     /// deviation inside the loop's bandwidth. At analog FPV's ~5 MHz
     /// deviation that is never true at any rate the viewer decodes at,
     /// so 'auto' resolves to the discriminator: measured, the PLL is
-    /// 9-25 dB worse there and also costs 6.49 dB at 4.2 MHz luma. On a
-    /// narrow deviation it is worth +12 dB and 'auto' will pick it.
-    /// 'pll' forces it regardless, at a CPU cost. Run with `--help`
-    /// (long form, not `-h`) to see per-value details.
+    /// 9-25 dB worse there and also costs 6.49 dB at 4.2 MHz luma. A
+    /// narrow deviation does not change that: it is exactly what lets
+    /// the DDC decimate hard, and the loop's advantage falls with the
+    /// decode rate (+9.9 dB at 25 MSPS, +1.8 at 6.25). 'pll' forces it
+    /// and holds the decode rate up so the loop gets a rate it can use,
+    /// at a CPU cost. Run with `--help` (long form, not `-h`) to see
+    /// per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
     /// Start with the neural temporal denoiser enabled (requires a
@@ -135,10 +138,13 @@ struct LiveArgs {
     /// deviation inside the loop's bandwidth. At analog FPV's ~5 MHz
     /// deviation that is never true at any rate the viewer decodes at,
     /// so 'auto' resolves to the discriminator: measured, the PLL is
-    /// 9-25 dB worse there and also costs 6.49 dB at 4.2 MHz luma. On a
-    /// narrow deviation it is worth +12 dB and 'auto' will pick it.
-    /// 'pll' forces it regardless, at a CPU cost. Run with `--help`
-    /// (long form, not `-h`) to see per-value details.
+    /// 9-25 dB worse there and also costs 6.49 dB at 4.2 MHz luma. A
+    /// narrow deviation does not change that: it is exactly what lets
+    /// the DDC decimate hard, and the loop's advantage falls with the
+    /// decode rate (+9.9 dB at 25 MSPS, +1.8 at 6.25). 'pll' forces it
+    /// and holds the decode rate up so the loop gets a rate it can use,
+    /// at a CPU cost. Run with `--help` (long form, not `-h`) to see
+    /// per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
     /// Start with the neural temporal denoiser enabled (requires a
@@ -176,6 +182,46 @@ struct LiveArgs {
 /// resolves to the discriminator, which is both the cheaper and the
 /// better choice down there. `--demod pll` caps the decimation instead
 /// of being silently overruled.
+/// Decode rate and demodulator chosen together, the way `run_live`
+/// resolves them: decimate first, then ask about the rate that leaves.
+///
+/// Asking `use_pll` about the *capture* rate answers a question the
+/// pipeline never poses. A narrow deviation is exactly what lets the
+/// DDC decimate hard, and decimating is what removes the PLL's
+/// advantage, so the two cannot be decided apart:
+///
+/// ```text
+///   work rate    PLL gain over the discriminator (200-500 kHz dev)
+///     25.00        +9.9 dB
+///     15.36        +4.2 dB
+///      8.33        +1.6 dB
+///      6.25        +1.8 dB
+/// ```
+///
+/// The loop's noise advantage comes from its bandwidth being narrow
+/// *relative to the sample rate*, and `PllFmDemod` clamps `wn` to
+/// 0.5 rad/sample — so at a low rate the loop is forced wide and the
+/// advantage goes. At 25 MSPS input a 500 kHz deviation decimates by 4
+/// to 6.25 MSPS, where the PLL is worth +1.8 dB and costs a
+/// non-flat video response.
+///
+/// So `Auto` resolves to the discriminator in every configuration the
+/// pipeline can reach, and that is the right answer rather than an
+/// oversight. `--demod pll` is how to ask for it anyway; it holds the
+/// decode rate up instead of decimating, which is the only way the
+/// loop gets a rate it can use.
+#[cfg(test)]
+fn select_decode(capture_rate_hz: u32, fm_deviation: f32, demod: DemodKind) -> (u32, bool) {
+    let cutoff = (fm_deviation + LUMA_HEADROOM_HZ).max(fm_deviation);
+    let mut decim = decode_decimation(capture_rate_hz, cutoff);
+    if matches!(demod, DemodKind::Pll) {
+        let cap = (capture_rate_hz / PLL_AUTO_MIN_SAMPLE_RATE_HZ).max(1) as usize;
+        decim = decim.min(cap);
+    }
+    let work_rate = capture_rate_hz / decim as u32;
+    (work_rate, demod.use_pll(work_rate, fm_deviation))
+}
+
 /// Loop bandwidth the PLL is built with.
 ///
 /// Also the deviation it can track: a loop cannot follow an excursion
@@ -244,12 +290,17 @@ impl DemodKind {
     /// clamped at `wn <= 0.5 rad/sample`, i.e. `fs / 4π`, which at
     /// 25 MSPS is ~2 MHz — tracking 5 MHz would need a *decode* rate
     /// above 60 MSPS, and the decode path decimates below that by
-    /// design. For FPV deviations this therefore resolves to the
-    /// discriminator at every rate the viewer runs, which is what the
-    /// measurements say it should do.
+    /// design.
     ///
-    /// `--demod pll` still forces it, for the narrow-deviation case and
-    /// for experiments.
+    /// A narrow deviation does not rescue it either, and that is the
+    /// part which is easy to get wrong: asking this function about the
+    /// *capture* rate suggests the PLL is reachable, but the pipeline
+    /// decimates first, and a narrow deviation is precisely what allows
+    /// hard decimation. See [`select_decode`] — through the real
+    /// ordering this resolves to the discriminator everywhere.
+    ///
+    /// `--demod pll` still forces it, and holds the decode rate up so
+    /// the loop gets a rate it can use.
     fn use_pll(self, decode_rate_hz: u32, fm_deviation_hz: f32) -> bool {
         match self {
             DemodKind::Discriminator => false,
@@ -354,6 +405,13 @@ impl LockState {
                 false
             }
             (true, false) => {
+                // Our carrier is there. That answers the "is it still
+                // ours" question regardless of whether a field came out,
+                // so the miss counter resets — leaving it standing made
+                // miss -> recovery -> miss release the channel on two
+                // misses that were never consecutive, which is the one
+                // thing `LOCK_EMPTY_CHECKS` is counting.
+                self.empty_checks = 0;
                 self.provisional_checks += 1;
                 self.provisional_checks >= LOCK_PROVISIONAL_CHECKS
             }
@@ -367,6 +425,12 @@ impl LockState {
 
 /// Consecutive checks finding nothing of ours before the channel is
 /// released.
+///
+/// Strictly consecutive: any check that sees our carrier clears this,
+/// including one that saw no decoded field. That case is counted by
+/// [`LOCK_PROVISIONAL_CHECKS`] instead — "the carrier is gone" and "the
+/// carrier is here but undecodable" are different failures and are
+/// timed separately.
 ///
 /// Two, not four: the lock integrator holds ~4 checks of history, so an
 /// empty result already means several consecutive looks found nothing.
@@ -418,12 +482,88 @@ const DETECT_PACKETS_NARROW: usize = 6;
 /// to spend [`DETECT_PACKETS_NARROW`] of them on.
 const NARROW_CAPTURE_MAX_RATE_HZ: f64 = 30_720_000.0;
 
+/// What one sweep may spend per hop.
+///
+/// Bundled because they are one decision: packets cost detector time,
+/// and the dwell has to be long enough to pay for them.
+#[derive(Clone, Copy)]
+struct SweepBudget {
+    dwell: Duration,
+    packets_per_hop: usize,
+}
+
+/// One sweep in this many is a *sensitive* sweep.
+///
+/// The fast pass reads two packets at 61.44 MSPS, which is 2.1 ms of
+/// signal, and some signals simply are not detectable in that: a noisy
+/// NTSC fixture at that rate first detects on packet **3**, so no
+/// per-hop decision taken at packet 2 can reach it — the evidence does
+/// not exist yet, it is built by accumulating spectra.
+///
+/// An earlier attempt gated extra packets on a probe's energy margin.
+/// That could not work: measured against a real transmitter attenuated
+/// toward its cliff, the margin falls at the same rate as detectability,
+/// so the gate shut exactly where integration would have paid. Nor does
+/// sub-threshold confidence help — on that ladder it is only ever 0.00,
+/// 0.60 or 0.80, never inside the band a gate could use.
+///
+/// So nothing is predicted. Most sweeps stay fast, and every fourth one
+/// spends the sensitive budget on every hop. A signal that needs
+/// integration is found within four sweeps instead of never, and the
+/// average sweep costs about 15% more rather than 60%.
+#[cfg(feature = "aaronia")]
+const AARONIA_SENSITIVE_EVERY: u32 = 4;
+
+/// Dwell for a sensitive sweep: long enough to pay for
+/// [`DETECT_PACKETS_NARROW`] passes at the scan's own rate, where the
+/// detector costs ~6.4 ms a packet.
+#[cfg(feature = "aaronia")]
+const AARONIA_SENSITIVE_DWELL: Duration = Duration::from_millis(60);
+
 /// How many packets one hop feeds the detector at `sample_rate`.
 fn detect_packets_per_hop(sample_rate_hz: f64) -> usize {
     if sample_rate_hz > 0.0 && sample_rate_hz <= NARROW_CAPTURE_MAX_RATE_HZ {
         DETECT_PACKETS_NARROW
     } else {
         DETECT_PACKETS_PER_HOP
+    }
+}
+
+impl SweepBudget {
+    /// The budget for sweep number `n` at `sample_rate_hz`.
+    ///
+    /// Aaronia-only: the cadence is argued from that backend's retune
+    /// and detector costs, and says nothing about a synthesiser that
+    /// tunes in under a millisecond.
+    ///
+    /// A narrow capture already reads the sensitive number of packets
+    /// every sweep — there a packet is four times the signal for a
+    /// third of the cost — so its budget never changes and the cadence
+    /// costs it nothing.
+    #[cfg(feature = "aaronia")]
+    fn for_sweep(n: u32, sample_rate_hz: f64) -> Self {
+        let fast = detect_packets_per_hop(sample_rate_hz);
+        let sensitive = n % AARONIA_SENSITIVE_EVERY == AARONIA_SENSITIVE_EVERY - 1
+            && fast < DETECT_PACKETS_NARROW;
+        if sensitive {
+            Self {
+                dwell: AARONIA_SENSITIVE_DWELL,
+                packets_per_hop: DETECT_PACKETS_NARROW,
+            }
+        } else {
+            Self {
+                dwell: AARONIA_SCAN_DWELL,
+                packets_per_hop: fast,
+            }
+        }
+    }
+
+    /// A flat budget for a backend with its own tuning economics.
+    fn flat(dwell: Duration, packets_per_hop: usize) -> Self {
+        Self {
+            dwell,
+            packets_per_hop,
+        }
     }
 }
 
@@ -1892,7 +2032,10 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
                 // 20 MSPS ceiling makes packets the longest of any
                 // backend at 3.3 ms — 20 ms lands the per-hop budget
                 // with margin.
-                Duration::from_millis(20),
+                SweepBudget::flat(
+                    Duration::from_millis(20),
+                    detect_packets_per_hop(sample_rate),
+                ),
                 &skipped_freqs,
                 &mut sweep,
             )? {
@@ -2088,10 +2231,11 @@ fn scan_band_for_channel(
     backend_label: &str,
     sample_rate: f64,
     scan_bands: ScanBands,
-    dwell: Duration,
+    budget: SweepBudget,
     skipped_freqs: &std::collections::HashSet<u64>,
     sweep: &mut SweepState,
 ) -> anyhow::Result<ScanOutcome> {
+    let dwell = budget.dwell;
     let hop_freqs = build_scan_hops(sample_rate, scan_bands);
     sweep
         .band
@@ -2128,7 +2272,7 @@ fn scan_band_for_channel(
     let mut last_freq = 0u64;
     let mut packets_this_hop = 0usize;
     // What a packet is worth here decides how many to spend.
-    let packets_per_hop = detect_packets_per_hop(sample_rate);
+    let packets_per_hop = budget.packets_per_hop;
     let mut probes: Vec<ProbeEnergy> = Vec::new();
     let outcome = |hit: Option<(f64, f32, SignalType)>| match hit {
         Some((f, _, sig)) => ScanOutcome::Found(snap_to_nearest_fpv_channel(f), sig),
@@ -2313,6 +2457,8 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
     // See the HackRF caller for why the sweep's PAL/NTSC verdict rides
     // along instead of being re-derived at the tuned centre.
     let mut scan_standard: Option<SignalType> = None;
+    // Which sweep this is, for the sensitive-sweep cadence.
+    let mut sweep_n: u32 = 0;
 
     loop {
         let center_freq = match explicit_freq {
@@ -2325,7 +2471,15 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                 &label,
                 sample_rate,
                 live.scan_bands,
-                AARONIA_SCAN_DWELL,
+                {
+                    // Most sweeps are fast; every fourth spends the
+                    // sensitive budget on every hop, so a signal that
+                    // only appears after several packets of integration
+                    // is found within four sweeps rather than never.
+                    let b = SweepBudget::for_sweep(sweep_n, sample_rate);
+                    sweep_n = sweep_n.wrapping_add(1);
+                    b
+                },
                 &skipped_freqs,
                 &mut sweep,
             )? {
@@ -4253,6 +4407,54 @@ mod tests {
         );
     }
 
+    /// The review's sequence: a miss, then the carrier returns without
+    /// a field, then another miss. Those two misses are not consecutive
+    /// and must not release the channel.
+    #[test]
+    fn non_consecutive_misses_do_not_release_the_channel() {
+        // miss -> carrier back but no field yet -> miss. Two misses,
+        // not consecutive. `LOCK_EMPTY_CHECKS` counts consecutive ones,
+        // so this must survive; before the fix the second miss released.
+        let mut lock = LockState::default();
+        assert!(!lock.observe(false, true), "a single miss released");
+        assert!(!lock.observe(true, false), "a provisional check released");
+        assert!(
+            !lock.observe(false, true),
+            "two non-consecutive misses released the channel"
+        );
+
+        // A decoded field clears both counters, so an isolated miss
+        // between good checks can repeat indefinitely without drifting
+        // toward release. (Good check first: the sequence above already
+        // ended on a miss, and two in a row *should* release.)
+        for _ in 0..50 {
+            assert!(!lock.observe(true, true));
+            assert!(!lock.observe(false, true), "an isolated miss released");
+        }
+    }
+
+    /// Strictly consecutive misses still release, on the documented
+    /// count — the fix must not make the channel un-releasable.
+    #[test]
+    fn consecutive_misses_still_release() {
+        let mut lock = LockState::default();
+        for _ in 0..LOCK_EMPTY_CHECKS - 1 {
+            assert!(!lock.observe(false, false));
+        }
+        assert!(lock.observe(false, false));
+    }
+
+    /// And an undecodable carrier still runs out its own budget even
+    /// though it keeps clearing the miss counter.
+    #[test]
+    fn a_provisional_carrier_still_times_out() {
+        let mut lock = LockState::default();
+        for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
+            assert!(!lock.observe(true, false));
+        }
+        assert!(lock.observe(true, false));
+    }
+
     /// Acquisition stutter must not accumulate toward release: a check
     /// that sees both clears the provisional count.
     #[test]
@@ -4282,12 +4484,39 @@ mod tests {
         }
     }
 
-    /// ...and must still pick it where it is worth +12 dB: a narrow
-    /// deviation the loop can follow, at a rate high enough to matter.
+    /// Through the *pipeline's* ordering — decimate, then choose —
+    /// `Auto` resolves to the discriminator everywhere.
+    ///
+    /// This replaces a test that asked `use_pll(25_000_000, 500_000.0)`
+    /// directly and concluded the PLL was reachable. The pipeline never
+    /// poses that question: a 500 kHz deviation at 25 MSPS decimates by
+    /// 4 first, so what `Auto` is actually asked about is 6.25 MSPS,
+    /// where the loop is worth +1.8 dB rather than +9.9 and the rate
+    /// gate correctly declines.
     #[test]
-    fn auto_still_picks_the_pll_where_the_loop_can_track() {
-        assert!(DemodKind::Auto.use_pll(25_000_000, 500_000.0));
-        assert!(DemodKind::Auto.use_pll(25_000_000, 1_000_000.0));
+    fn auto_resolves_to_the_discriminator_through_the_real_ordering() {
+        for capture in [15_360_000u32, 25_000_000, 30_720_000, 61_440_000] {
+            for dev in [200_000.0f32, 500_000.0, 1_000_000.0, 5_000_000.0] {
+                let (work, pll) = select_decode(capture, dev, DemodKind::Auto);
+                assert!(
+                    !pll,
+                    "auto chose the PLL at capture {capture} dev {dev} \
+                     (work rate {work})"
+                );
+            }
+        }
+    }
+
+    /// `--demod pll` still gets the PLL, and gets it at a rate the loop
+    /// can use rather than a decimated one.
+    #[test]
+    fn forcing_the_pll_holds_the_decode_rate_up() {
+        let (work, pll) = select_decode(25_000_000, 500_000.0, DemodKind::Pll);
+        assert!(pll, "--demod pll must force it");
+        assert!(
+            work >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
+            "forced PLL decoded at {work}, below the rate its loop needs"
+        );
     }
 
     /// Below the rate threshold the deviation is irrelevant.
@@ -4329,6 +4558,70 @@ mod tests {
     fn a_narrow_capture_gets_the_integration_budget() {
         assert_eq!(detect_packets_per_hop(15_360_000.0), DETECT_PACKETS_NARROW);
         assert_eq!(detect_packets_per_hop(30_720_000.0), DETECT_PACKETS_NARROW);
+    }
+
+    /// The review's case: a noisy fixture at 61.44 MSPS first detects
+    /// on packet 3, which a two-packet fast pass can never reach. Some
+    /// sweep has to spend more, and no per-hop prediction can decide
+    /// which — so the cadence does it unconditionally.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn a_sensitive_sweep_comes_round_and_reaches_packet_three() {
+        let wide = 61_440_000.0;
+        let budgets: Vec<usize> = (0..AARONIA_SENSITIVE_EVERY * 2)
+            .map(|n| SweepBudget::for_sweep(n, wide).packets_per_hop)
+            .collect();
+        assert!(
+            budgets.iter().any(|&p| p >= 3),
+            "no sweep in two full cycles could see packet 3: {budgets:?}"
+        );
+        assert_eq!(
+            budgets
+                .iter()
+                .filter(|&&p| p == DETECT_PACKETS_NARROW)
+                .count(),
+            2,
+            "expected one sensitive sweep per cycle: {budgets:?}"
+        );
+    }
+
+    /// A sensitive sweep must be able to pay for its own packets, or
+    /// the hop ends mid-budget and the extra passes are never read.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn the_sensitive_dwell_pays_for_its_packets() {
+        let b = SweepBudget::for_sweep(AARONIA_SENSITIVE_EVERY - 1, 61_440_000.0);
+        // 6.41 ms per pass, measured at 61.44 MSPS.
+        let cpu_ms = 6.41 * b.packets_per_hop as f64;
+        assert!(
+            cpu_ms < b.dwell.as_secs_f64() * 1e3,
+            "{cpu_ms} ms of detector does not fit a {:?} dwell",
+            b.dwell
+        );
+    }
+
+    /// Most sweeps stay fast — the point is a bounded cost, not a
+    /// slower scanner.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn most_sweeps_keep_the_fast_budget() {
+        let wide = 61_440_000.0;
+        let fast = (0..AARONIA_SENSITIVE_EVERY)
+            .filter(|&n| SweepBudget::for_sweep(n, wide).packets_per_hop == DETECT_PACKETS_PER_HOP)
+            .count();
+        assert_eq!(fast as u32, AARONIA_SENSITIVE_EVERY - 1);
+    }
+
+    /// A narrow capture already reads the sensitive count every sweep,
+    /// so the cadence must not make it slower.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn a_narrow_capture_is_unaffected_by_the_cadence() {
+        for n in 0..AARONIA_SENSITIVE_EVERY * 2 {
+            let b = SweepBudget::for_sweep(n, 15_360_000.0);
+            assert_eq!(b.packets_per_hop, DETECT_PACKETS_NARROW);
+            assert_eq!(b.dwell, AARONIA_SCAN_DWELL);
+        }
     }
 
     /// Six passes at 61.44 MSPS is 38.5 ms of detector against a 25 ms
