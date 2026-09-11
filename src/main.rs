@@ -1317,6 +1317,10 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
 
     let _ = run_viewer_pipeline(
         resolved_channels,
+        // File playback tunes nothing, so there is no tuned centre to
+        // re-measure against; the channel comes from the file's own
+        // stated frequency.
+        None,
         sample_rate,
         fm_deviation,
         args.deemphasis_tau,
@@ -2669,6 +2673,16 @@ fn run_live(
     // Resolve the single channel at DC. (Wideband multi-signal scan
     // lives in the pre-tune sweeps — scan_band_for_channel and the USRP
     // scan loop — so by the time run_live starts, the centre is chosen.)
+    // The carrier, re-measured once we are tuned to it.
+    //
+    // The sweep's estimate named this channel, and at a low probe SNR it
+    // is not good enough to: measured live, the sweep put a 5865 MHz
+    // signal at 5871.775 and the nearest-channel snap called it B8
+    // (5866) rather than A1 (5865), which sit 1 MHz apart. The same
+    // signal seen centred in its own capture localizes to within about
+    // 0.1 MHz of a consistent value, because the probe is looking
+    // straight at it instead of off the side of a sweep bin.
+    let mut refined_carrier_hz: Option<f64> = None;
     let resolved_channels = {
         // Single channel at DC
         let sig_type = if let Some(st) = forced_standard {
@@ -2701,6 +2715,14 @@ fn run_live(
                     Err(_) => break,
                 }
             }
+            // Re-localize on this record while we have it: it is the
+            // same signal, centred, at the rate we will decode at.
+            refined_carrier_hz = detector
+                .detect_from_iq(&record, actual_center as u64, sample_rate_u32)
+                .into_iter()
+                .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+                .map(|h| h.frequency_hz as f64);
+
             let (detected, confidence) = detector.detect_sync_pulses(&record, sample_rate_u32);
             if debug {
                 eprintln!(
@@ -2786,6 +2808,7 @@ fn run_live(
 
     let result = run_viewer_pipeline(
         resolved_channels,
+        refined_carrier_hz,
         sample_rate_u32,
         fm_deviation,
         deemphasis_tau,
@@ -3016,6 +3039,9 @@ fn run_live(
 #[allow(clippy::too_many_arguments)]
 fn run_viewer_pipeline<F>(
     resolved_channels: Vec<(SignalType, f32, f32)>,
+    // The carrier re-measured at the tuned centre, if it was. Names the
+    // channel; see the use site for why it does not re-tune.
+    refined_carrier_hz: Option<f64>,
     sample_rate: u32,
     fm_deviation: f32,
     deemphasis_tau: f32,
@@ -3148,7 +3174,32 @@ where
 
         let type_name = if is_pal { "PAL" } else { "NTSC" };
         let absolute_freq_mhz = (rf_center_freq + freq_offset as f64) / 1_000_000.0;
-        let channel_name = get_fpv_channel_name(absolute_freq_mhz);
+        // Name the channel from what the signal measured *here*, not
+        // from the frequency the sweep told us to tune to. Those are the
+        // same thing only when the sweep's localization was good enough
+        // to pick between channels a megahertz apart, and at a low probe
+        // SNR it is not: a 5865 MHz signal localized to 5871.775 and was
+        // labelled B8 (5866) instead of A1 (5865).
+        //
+        // The tuning itself is left alone. The refined estimate carries
+        // its own bias — localization assumes a particular FM deviation,
+        // and against the raw spectrum it reads about 1.3 MHz low — so
+        // it is good enough to choose between candidate channels but not
+        // to re-centre a capture that is already decoding.
+        let labelled_mhz = refined_carrier_hz
+            .map(|hz| snap_to_nearest_fpv_channel(hz) / 1_000_000.0)
+            .unwrap_or(absolute_freq_mhz);
+        let channel_name = get_fpv_channel_name(labelled_mhz);
+        if let Some(refined) = refined_carrier_hz
+            && (labelled_mhz - absolute_freq_mhz).abs() > 0.5
+        {
+            println!(
+                "  → Measured carrier {:.3} MHz here: this is {}, not the {} the sweep snapped to",
+                refined / 1e6,
+                get_fpv_channel_name(labelled_mhz).unwrap_or("an unlisted channel"),
+                get_fpv_channel_name(absolute_freq_mhz).unwrap_or("frequency"),
+            );
+        }
         let window_title = if let Some(ch) = channel_name {
             format!("{} · Channel {}", type_name, ch)
         } else {
