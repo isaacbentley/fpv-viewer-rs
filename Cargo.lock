@@ -680,7 +680,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1907,7 +1907,7 @@ dependencies = [
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
 version = "0.8.0"
-source = "git+https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git?branch=main#612a5905c5298d9801a04fa503c31a45ee1aacf3"
+source = "git+https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git?branch=main#4dba1cdca454460ca4ae2fe777f173b28a27a6d6"
 dependencies = [
  "bytemuck",
  "log",
@@ -2218,7 +2218,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2554,7 +2554,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2611,7 +2611,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2696,8 +2696,8 @@ dependencies = [
 
 [[package]]
 name = "sdr-aaronia-rs"
-version = "0.11.0"
-source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.11.0#38eaa113002be35dc146e937a63a185b120dedc9"
+version = "0.11.1"
+source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.11.1#4c481c03d8013a73aecc8b8446e312e6b932d859"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -2971,10 +2971,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3640,7 +3640,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
