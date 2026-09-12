@@ -1,13 +1,13 @@
 [package]
 name = "fpv-viewer"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-orecchiette-fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git", branch = "main" }
+orecchiette-fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git", tag = "v0.9.0" }
 orecchiette-sdr-source-rs = "0.1.3"
 orecchiette-sdr-usrp-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-usrp-rs.git", branch = "main" }
 orecchiette-sdr-hackrf-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-hackrf-rs.git", branch = "main" }
@@ -43,7 +43,3 @@ aaronia = ["dep:sdr-aaronia-rs"]
 # impairment but a small cost on a clean signal — see the analog crate's
 # DESIGN.md §12 for the measured A/B.
 neural-vsr = ["orecchiette-fpv-drone-analog-rs/neural-vsr"]
-
-[patch."https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git"]
-orecchiette-fpv-drone-analog-rs = { path = "../orecchiette-fpv-drone-analog-rs" }
-

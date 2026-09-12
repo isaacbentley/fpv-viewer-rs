@@ -9,7 +9,11 @@ playback of recorded files.
 
 Signal processing is provided by
 [orecchiette-fpv-drone-analog-rs](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs);
-this repository is the application around it.
+this repository is the application around it. The crate owns decode planning,
+streaming IQ-to-field processing, acquisition/lock policy, scan planning and
+channel identity. This application owns hardware adapters, deadlines, queues,
+frame recycling, windows and snapshots. The profiler calls the same
+`StreamingFpvDecoder` as the live worker.
 
 ## Features
 
@@ -23,7 +27,7 @@ this repository is the application around it.
   1.080–5.945 GHz. Tune centres are planned against the channel list
   rather than stepped uniformly, so the sweep spends tunes only where
   channels are: at 61.44 MSPS, 6 tunes for the 40 channels of the
-  5.8 GHz band, 48 for all 137. The sweep's PAL/NTSC verdict carries
+  5.8 GHz band, 51 for all 154. The sweep's PAL/NTSC verdict carries
   into the decoder, so the standard measured on air is the one the
   picture is decoded with.
 - **Band panel.** While sweeping, a window shows what the detector is
@@ -36,10 +40,11 @@ this repository is the application around it.
   The video inside a capture is about 14 MHz wide, so the
   down-converter decimates as far as the channel allows before anything
   else touches the samples. A 61.44 MSPS capture decodes at 15.36 MSPS;
-  a capture already that narrow is left alone. On one core of an Apple
-  M4 that is 3.93 CPU-seconds per second of signal undecimated against
-  0.61 decimated (`cargo run --release --example profile_decode`).
-  Anything above 1.0 cannot keep up, and the live path drops chunks.
+  a capture already that narrow is left alone. Run
+  `cargo run --release --example profile_decode` to measure the actual
+  decoder stages for PAL and NTSC on your machine. The reported s/s is
+  elapsed processing time per second of signal; above 1.0, sustained
+  decoding cannot keep up on that worker.
 - **Live monochrome rendering** in a desktop window.
 - **Weak-signal decoding**, enabled by default:
   - Matched-filter sync acquisition, a line-locked clock for straight
@@ -159,7 +164,7 @@ subcommand:
 
 | Option | Description |
 | :--- | :--- |
-| `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` adds the 5.3 GHz L/D bands and 1.2 GHz, at proportionally more tunes per sweep. |
+| `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` includes L/D/U, both 1.2 GHz grids, 2.4 GHz and 3.3 GHz, at proportionally more tunes per sweep. |
 | `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. The RTSA server discards data once its outbound buffer passes 8 MB, so the link sets the ceiling: measured over Wi-Fi, 15.36 MSPS (61 MB/s) fell a few percent short and dropped most packets, while a wired link measured 61.44 MSPS sustained in both formats at 98–100% of nominal (484 MB/s in `f32`). This is a network limit only — decoding decimates to a fixed working rate, so a wide capture costs no more CPU than a narrow one. |
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
@@ -206,3 +211,17 @@ slightly softer, as there is no pre-emphasis to invert.
 ## License
 
 GNU General Public License v3.0 or later (GPL-3.0-or-later).
+
+Channel names come from the shared catalog: A/B/E/F/R/L/D/U plus `N` (narrow
+1.2 GHz), `W` (wide 1.2 GHz), `T` (2.4 GHz) and `S` (3.3 GHz). In the `C`
+channel-entry prompt, a prefix such as `S6` waits for a second digit; press
+Enter for S6 or continue typing S60–S64. Backspace edits the entry.
+
+The release manifest pins the analog crate to `v0.9.0`. For local co-development,
+pass a Cargo command-line patch instead of committing a machine-specific path:
+
+```bash
+cargo check --config 'patch."https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git".orecchiette-fpv-drone-analog-rs.path="../orecchiette-fpv-drone-analog-rs"'
+```
+
+Restore `Cargo.lock` after local patch experiments before building a release.

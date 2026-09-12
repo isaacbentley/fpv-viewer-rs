@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "fpv-viewer"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1906,7 +1906,8 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
-version = "0.8.0"
+version = "0.9.0"
+source = "git+https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git?tag=v0.9.0#98c5a678f43cfb7723d725c1097ac32738e158b9"
 dependencies = [
  "bytemuck",
  "log",

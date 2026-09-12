@@ -6,14 +6,24 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use decode_worker::{DecodeWorker, DecodeWorkerConfig, FrameSlot, IqChunk, lock_slot};
 use minifb::{Key, Window, WindowOptions};
 use num_complex::Complex;
-use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
-use orecchiette_fpv_drone_analog_rs::demod::{DEFAULT_DEEMPHASIS_TAU_S, fm_demod};
-use orecchiette_fpv_drone_analog_rs::detector::{
-    AnalogFpvDetector, FpvDetector, ProbeEnergy, SpectralIntegrator,
+use orecchiette_fpv_drone_analog_rs::acquisition::{
+    AcquisitionRecord, LockState, analyze_channel_standard, analyze_tuned_channel,
 };
+use orecchiette_fpv_drone_analog_rs::bands::{get_fpv_channel_name, snap_to_nearest_fpv_channel};
+use orecchiette_fpv_drone_analog_rs::decode::{
+    DecodePlan, DecoderConfig, DemodulationMode, LUMA_HEADROOM_HZ, decode_decimation,
+};
+use orecchiette_fpv_drone_analog_rs::demod::DEFAULT_DEEMPHASIS_TAU_S;
+use orecchiette_fpv_drone_analog_rs::detector::{FpvDetector, ProbeEnergy, SpectralIntegrator};
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
+use orecchiette_fpv_drone_analog_rs::scanner::{
+    CandidatePolicy, DETECT_PACKETS_PER_HOP, FineTuneSelector, ScanProgress, ScanSelector,
+    SweepBudget, plan_tune_centers,
+};
+#[cfg(any(test, feature = "aaronia"))]
+use orecchiette_fpv_drone_analog_rs::scanner::{DETECT_PACKETS_NARROW, detect_packets_per_hop};
 use orecchiette_fpv_drone_analog_rs::types::SignalType;
-use orecchiette_fpv_drone_analog_rs::video::{FrameReconstructor, detect_video_standard};
+use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
 use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -102,7 +112,7 @@ struct FileArgs {
 #[derive(ClapArgs, Debug, Clone)]
 struct LiveArgs {
     /// FPV channel name (A1–A8, B1–B8, E1–E8, F1–F8, R1–R8, L1–L8,
-    /// D1–D8) or raw frequency in Hz (e.g. 5865000000).
+    /// D1–D8, U1–U8, N1–N8, W1–W9, T1–T9, S1–S64) or raw frequency in Hz (e.g. 5865000000).
     ///
     /// Omit to auto-scan: the viewer captures wideband, detects all
     /// active analog FPV signals, and opens a window for each.
@@ -169,67 +179,6 @@ struct LiveArgs {
     temporal_window: usize,
 }
 
-/// Decode rate at/above which `DemodKind::Auto` selects the PLL, and
-/// below which it selects the discriminator — the measured ~25 MSPS
-/// crossover documented on [`DemodKind::Pll`] and in the library's
-/// `weak_signal_sweep` example (below it the loop can't track a
-/// typical ~5 MHz FPV deviation).
-///
-/// This is compared against the *decode* rate, which since the worker
-/// started decimating (see [`decode_decimation`]) is normally well
-/// below the capture rate — so on a wide live capture `Auto` now
-/// resolves to the discriminator, which is both the cheaper and the
-/// better choice down there. `--demod pll` caps the decimation instead
-/// of being silently overruled.
-/// Decode rate and demodulator chosen together, the way `run_live`
-/// resolves them: decimate first, then ask about the rate that leaves.
-///
-/// Asking `use_pll` about the *capture* rate answers a question the
-/// pipeline never poses. A narrow deviation is exactly what lets the
-/// DDC decimate hard, and decimating is what removes the PLL's
-/// advantage, so the two cannot be decided apart:
-///
-/// ```text
-///   work rate    PLL gain over the discriminator (200-500 kHz dev)
-///     25.00        +9.9 dB
-///     15.36        +4.2 dB
-///      8.33        +1.6 dB
-///      6.25        +1.8 dB
-/// ```
-///
-/// The loop's noise advantage comes from its bandwidth being narrow
-/// *relative to the sample rate*, and `PllFmDemod` clamps `wn` to
-/// 0.5 rad/sample — so at a low rate the loop is forced wide and the
-/// advantage goes. At 25 MSPS input a 500 kHz deviation decimates by 4
-/// to 6.25 MSPS, where the PLL is worth +1.8 dB and costs a
-/// non-flat video response.
-///
-/// So `Auto` resolves to the discriminator in every configuration the
-/// pipeline can reach, and that is the right answer rather than an
-/// oversight. `--demod pll` is how to ask for it anyway; it holds the
-/// decode rate up instead of decimating, which is the only way the
-/// loop gets a rate it can use.
-#[cfg(test)]
-fn select_decode(capture_rate_hz: u32, fm_deviation: f32, demod: DemodKind) -> (u32, bool) {
-    let cutoff = (fm_deviation + LUMA_HEADROOM_HZ).max(fm_deviation);
-    let mut decim = decode_decimation(capture_rate_hz, cutoff);
-    if matches!(demod, DemodKind::Pll) {
-        let cap = (capture_rate_hz / PLL_AUTO_MIN_SAMPLE_RATE_HZ).max(1) as usize;
-        decim = decim.min(cap);
-    }
-    let work_rate = capture_rate_hz / decim as u32;
-    (work_rate, demod.use_pll(work_rate, fm_deviation))
-}
-
-/// Loop bandwidth the PLL is built with.
-///
-/// Also the deviation it can track: a loop cannot follow an excursion
-/// faster than it can move. `PllFmDemod` clamps `wn` to 0.5 rad/sample,
-/// so the *effective* bandwidth is `min(this, fs / 4π)`.
-const PLL_LOOP_BW_HZ: f32 = 1.0e6;
-
-const PLL_AUTO_MIN_SAMPLE_RATE_HZ: u32 = 25_000_000;
-
 /// Which FM demodulator the decode worker runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum DemodKind {
@@ -257,63 +206,12 @@ enum DemodKind {
     Pll,
 }
 
-impl DemodKind {
-    /// Resolve to a concrete choice for the given decode rate in Hz —
-    /// the rate *after* decimation, not the capture rate. `true`
-    /// selects the PLL.
-    /// Whether to demodulate with the PLL at this decode rate and
-    /// deviation.
-    ///
-    /// `Auto` used to decide on the rate alone, and that cannot be
-    /// right: what the loop has to survive is the *deviation*, and a
-    /// loop too slow for it does not merely perform worse, it stops
-    /// tracking. Measured at 25 MSPS against the discriminator, 1 MHz
-    /// modulation, output SNR:
-    ///
-    /// ```text
-    ///   deviation    PLL advantage
-    ///     100 kHz        +12.1 dB
-    ///       1 MHz        +12.1 dB
-    ///       5 MHz    -24.9 .. -9.3 dB
-    /// ```
-    ///
-    /// The benefit is real where the loop can follow — 12 dB is worth
-    /// having — and it inverts completely at the 5 MHz deviation analog
-    /// FPV actually uses, where the output is mostly tracking error.
-    /// The same setting also costs video bandwidth: against the
-    /// discriminator's flat response, the shipped 1 MHz loop reads
-    /// +2.25 dB at 1 MHz and **-6.49 dB at 4.2 MHz**, so the top of the
-    /// luma band is quietly lost.
-    ///
-    /// So the test is whether the loop can track. Its bandwidth is
-    /// clamped at `wn <= 0.5 rad/sample`, i.e. `fs / 4π`, which at
-    /// 25 MSPS is ~2 MHz — tracking 5 MHz would need a *decode* rate
-    /// above 60 MSPS, and the decode path decimates below that by
-    /// design.
-    ///
-    /// A narrow deviation does not rescue it either, and that is the
-    /// part which is easy to get wrong: asking this function about the
-    /// *capture* rate suggests the PLL is reachable, but the pipeline
-    /// decimates first, and a narrow deviation is precisely what allows
-    /// hard decimation. See [`select_decode`] — through the real
-    /// ordering this resolves to the discriminator everywhere.
-    ///
-    /// `--demod pll` still forces it, and holds the decode rate up so
-    /// the loop gets a rate it can use.
-    fn use_pll(self, decode_rate_hz: u32, fm_deviation_hz: f32) -> bool {
-        match self {
-            DemodKind::Discriminator => false,
-            DemodKind::Pll => true,
-            DemodKind::Auto => {
-                if decode_rate_hz < PLL_AUTO_MIN_SAMPLE_RATE_HZ {
-                    return false;
-                }
-                // What the loop actually runs at, after its stability
-                // clamp.
-                let clamped_bw =
-                    (decode_rate_hz as f32 / (4.0 * std::f32::consts::PI)).min(PLL_LOOP_BW_HZ);
-                fm_deviation_hz > 0.0 && fm_deviation_hz <= clamped_bw
-            }
+impl From<DemodKind> for DemodulationMode {
+    fn from(mode: DemodKind) -> Self {
+        match mode {
+            DemodKind::Auto => Self::Auto,
+            DemodKind::Discriminator => Self::Discriminator,
+            DemodKind::Pll => Self::Pll,
         }
     }
 }
@@ -332,163 +230,6 @@ fn parse_standard(s: &str) -> Result<SignalType, String> {
             s
         )),
     }
-}
-
-/// How many capture packets per hop get fed to the detector before the
-/// rest of the dwell is drained.
-///
-/// `detect_from_iq_integrated` accumulates magnitude spectra per
-/// frequency, and a single 65,536-sample packet is below the length at
-/// which the sweep detects anything: with one packet per hop the first
-/// sweep finds nothing and detection lands only on the second visit,
-/// once the integrator holds two batches. Consecutive packets from one
-/// hop show where it turns over (`--` = no detection, else confidence):
-///
-/// ```text
-///   25.00 MSPS  packets 1..8:  --  0.80 0.80 0.80 0.80 0.80  --  0.80
-///   61.44 MSPS  packets 1..8:  --  0.80 0.80 0.80 0.80 0.80 0.80 0.80
-/// ```
-///
-/// Two gives first-visit detection, and on a *clean* signal beyond two
-/// measures no better: confidence plateaus at 0.80 and never promotes.
-/// The table above is exactly that case, which is why it reads as a
-/// plateau.
-///
-/// It does not hold under noise. Resetting the integrator between trials
-/// and varying capture position, synthetic centred NTSC gives:
-///
-/// ```text
-///                                  within 2 packets   within 8
-///   25 MSPS,    component σ 1.0          7/8             8/8
-///   25 MSPS,    component σ 1.5          2/8             8/8
-///   61.44 MSPS, component σ 1.0          5/8             8/8
-///   61.44 MSPS, component σ 1.5          4/8             4/8
-/// ```
-///
-/// So two packets is the right *fast pass* and the wrong *verdict*: at
-/// σ 1.5 it finds a quarter of what eight finds. Hops that show energy
-/// So two packets is the right fast pass at a wide capture rate and the
-/// wrong verdict at a narrow one, where a packet is four times the
-/// signal for a third of the cost — see [`detect_packets_per_hop`].
-///
-/// The cost is CPU, not time on air: two packets is ~5.2 ms of signal at
-/// 25 MSPS but ~18 ms of detection work, so a hop becomes CPU-bound
-/// rather than dwell-bound.
-const DETECT_PACKETS_PER_HOP: usize = 2;
-
-/// The lock check's running state, factored out so the rule is directly
-/// unit-testable rather than buried in the reader closure.
-///
-/// Three outcomes per check, and the distinction that matters is
-/// between the middle two:
-///
-/// - **Held**: our carrier is there and fields are coming out.
-/// - **Provisional**: our carrier is there and no field has come out
-///   since the last check. Acquisition looks like this; so does a
-///   horizontal-sync train with no vertical sync, which scores 0.8
-///   forever and reconstructs nothing. Bounded rather than trusted.
-/// - **Lost**: nothing, or only hits that are not ours.
-#[derive(Default)]
-struct LockState {
-    empty_checks: u32,
-    provisional_checks: u32,
-}
-
-impl LockState {
-    /// Fold one check in. `true` means release the channel.
-    fn observe(&mut self, on_carrier: bool, decoding: bool) -> bool {
-        match (on_carrier, decoding) {
-            (true, true) => {
-                self.empty_checks = 0;
-                self.provisional_checks = 0;
-                false
-            }
-            (true, false) => {
-                // Our carrier is there. That answers the "is it still
-                // ours" question regardless of whether a field came out,
-                // so the miss counter resets — leaving it standing made
-                // miss -> recovery -> miss release the channel on two
-                // misses that were never consecutive, which is the one
-                // thing `LOCK_EMPTY_CHECKS` is counting.
-                self.empty_checks = 0;
-                self.provisional_checks += 1;
-                self.provisional_checks >= LOCK_PROVISIONAL_CHECKS
-            }
-            _ => {
-                self.empty_checks += 1;
-                self.empty_checks >= LOCK_EMPTY_CHECKS
-            }
-        }
-    }
-}
-
-/// Consecutive checks finding nothing of ours before the channel is
-/// released.
-///
-/// Strictly consecutive: any check that sees our carrier clears this,
-/// including one that saw no decoded field. That case is counted by
-/// [`LOCK_PROVISIONAL_CHECKS`] instead — "the carrier is gone" and "the
-/// carrier is here but undecodable" are different failures and are
-/// timed separately.
-///
-/// Two, not four: the lock integrator holds ~4 checks of history, so an
-/// empty result already means several consecutive looks found nothing.
-/// Stacking a 4-check threshold on top made a dead channel linger for
-/// up to 8 checks.
-const LOCK_EMPTY_CHECKS: u32 = 2;
-
-/// How far a continuing detection may sit from the channel we tuned to
-/// and still count as *this* signal.
-///
-/// The lock check ran on whatever the capture held, so a transmitter
-/// elsewhere in the 49 MHz span kept the tuned channel's lock alive
-/// indefinitely. Sized like [`CHANNEL_SNAP_TOLERANCE_MHZ`]: past this,
-/// a hit is more likely a different channel than an off-tune of ours.
-const LOCK_CARRIER_TOLERANCE_HZ: f64 = 10e6;
-
-/// Lock checks a carrier may go on being detected without a single
-/// field coming out before we let it go.
-///
-/// A detection is not decodable video. A horizontal-sync pulse train
-/// with no vertical sync scores 0.8 on the sweep detector and
-/// reconstructs no frame at all, so "there is a hit" held the viewer on
-/// a picture it could never draw. Fields reconstructing is the
-/// confirmation; this is how long acquisition is allowed to take before
-/// the absence of one is treated as an answer.
-///
-/// Checks run about twice a second, so eight is ~4 s — long against
-/// standard classification plus a first field, short against staring at
-/// an undecodable carrier.
-const LOCK_PROVISIONAL_CHECKS: u32 = 8;
-
-/// Packets fed to the detector on a hop at a *narrow* capture rate.
-///
-/// A packet is a fixed 65,536 samples, so what it is worth depends
-/// entirely on the rate: 1.07 ms of signal at 61.44 MSPS against 4.27 ms
-/// at 15.36, and it costs 6.41 ms of detector against 2.49. Narrow
-/// captures are the case where more packets are both more useful and
-/// cheaper, and six of them is 14.9 ms of CPU inside a 25 ms dwell —
-/// where six at 61.44 MSPS would be 38.5 ms and miss the hop entirely.
-///
-/// Six because integration needs the room. Measured against a real A1
-/// transmitter attenuated toward its cliff, a 15.36 MSPS capture that
-/// never confirms in two packets first detects on the fourth; the
-/// evidence is not present earlier, it is *built* by accumulating
-/// spectra. Two packets cannot see it however cleverly they are gated.
-const DETECT_PACKETS_NARROW: usize = 6;
-
-/// Above this rate a packet is too little signal and too much detector
-/// to spend [`DETECT_PACKETS_NARROW`] of them on.
-const NARROW_CAPTURE_MAX_RATE_HZ: f64 = 30_720_000.0;
-
-/// What one sweep may spend per hop.
-///
-/// Bundled because they are one decision: packets cost detector time,
-/// and the dwell has to be long enough to pay for them.
-#[derive(Clone, Copy)]
-struct SweepBudget {
-    dwell: Duration,
-    packets_per_hop: usize,
 }
 
 /// One sweep in this many is a *sensitive* sweep.
@@ -519,51 +260,17 @@ const AARONIA_SENSITIVE_EVERY: u32 = 4;
 #[cfg(feature = "aaronia")]
 const AARONIA_SENSITIVE_DWELL: Duration = Duration::from_millis(60);
 
-/// How many packets one hop feeds the detector at `sample_rate`.
-fn detect_packets_per_hop(sample_rate_hz: f64) -> usize {
-    if sample_rate_hz > 0.0 && sample_rate_hz <= NARROW_CAPTURE_MAX_RATE_HZ {
-        DETECT_PACKETS_NARROW
-    } else {
-        DETECT_PACKETS_PER_HOP
+/// Aaronia's measured tuning costs, supplied to the shared sweep policy.
+#[cfg(feature = "aaronia")]
+fn aaronia_sweep_budget(n: u32, sample_rate_hz: f64) -> SweepBudget {
+    orecchiette_fpv_drone_analog_rs::scanner::SweepPolicy {
+        fast: SweepBudget::flat(AARONIA_SCAN_DWELL, DETECT_PACKETS_PER_HOP),
+        sensitive: SweepBudget::flat(AARONIA_SENSITIVE_DWELL, DETECT_PACKETS_NARROW),
+        sensitive_every: AARONIA_SENSITIVE_EVERY,
+        narrow_capture_max_rate_hz:
+            orecchiette_fpv_drone_analog_rs::scanner::NARROW_CAPTURE_MAX_RATE_HZ,
     }
-}
-
-impl SweepBudget {
-    /// The budget for sweep number `n` at `sample_rate_hz`.
-    ///
-    /// Aaronia-only: the cadence is argued from that backend's retune
-    /// and detector costs, and says nothing about a synthesiser that
-    /// tunes in under a millisecond.
-    ///
-    /// A narrow capture already reads the sensitive number of packets
-    /// every sweep — there a packet is four times the signal for a
-    /// third of the cost — so its budget never changes and the cadence
-    /// costs it nothing.
-    #[cfg(feature = "aaronia")]
-    fn for_sweep(n: u32, sample_rate_hz: f64) -> Self {
-        let fast = detect_packets_per_hop(sample_rate_hz);
-        let sensitive = n % AARONIA_SENSITIVE_EVERY == AARONIA_SENSITIVE_EVERY - 1
-            && fast < DETECT_PACKETS_NARROW;
-        if sensitive {
-            Self {
-                dwell: AARONIA_SENSITIVE_DWELL,
-                packets_per_hop: DETECT_PACKETS_NARROW,
-            }
-        } else {
-            Self {
-                dwell: AARONIA_SCAN_DWELL,
-                packets_per_hop: fast,
-            }
-        }
-    }
-
-    /// A flat budget for a backend with its own tuning economics.
-    fn flat(dwell: Duration, packets_per_hop: usize) -> Self {
-        Self {
-            dwell,
-            packets_per_hop,
-        }
-    }
+    .budget(n, sample_rate_hz)
 }
 
 /// The rate to capture a *locked* channel at, once the sweep has found
@@ -615,14 +322,12 @@ fn locked_capture_rate_hz(scan_rate_hz: f64, fm_deviation: f32, demod: DemodKind
     if matches!(demod, DemodKind::Pll) || !scan_rate_hz.is_finite() || scan_rate_hz <= 0.0 {
         return scan_rate_hz;
     }
-    let widest_cutoff = (fm_deviation + LUMA_HEADROOM_HZ) as f64;
-    if !widest_cutoff.is_finite() || widest_cutoff <= 0.0 {
+    let Some(needed_rate) = orecchiette_fpv_drone_analog_rs::decode::required_capture_rate(
+        fm_deviation,
+        USABLE_SPAN_FRACTION,
+    ) else {
         return scan_rate_hz;
-    }
-    // Spectrum the channel occupies, expressed as the sample rate that
-    // holds it inside the part of the capture the hardware delivers
-    // flat.
-    let needed_rate = 2.0 * widest_cutoff / USABLE_SPAN_FRACTION;
+    };
 
     // Walk down the supported grid (`scan_rate / 2^n`, which is what
     // `nearest_iq_sample_rate` quantises to) and keep the lowest rate
@@ -661,34 +366,25 @@ impl ScanBands {
         }
     }
 
-    /// Channel centre frequencies this setting covers, in Hz.
+    fn selection(self) -> orecchiette_fpv_drone_analog_rs::bands::BandSelection {
+        match self {
+            Self::Band58 => orecchiette_fpv_drone_analog_rs::bands::BandSelection::Band58,
+            Self::All => orecchiette_fpv_drone_analog_rs::bands::BandSelection::All,
+        }
+    }
     fn channel_freqs_hz(self) -> Vec<f64> {
-        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
-            .iter()
+        self.selection()
+            .channels()
             .map(|c| c.frequency_hz as f64)
-            .filter(|f| match self {
-                ScanBands::Band58 => (5_645e6..=5_945e6).contains(f),
-                ScanBands::All => true,
-            })
             .collect()
     }
-
-    /// The same channels with their names and band letters, for the
-    /// band panel.
     fn channels(self) -> Vec<band_scan::Channel> {
-        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
-            .into_iter()
-            .filter(|c| match self {
-                ScanBands::Band58 => (5_645e6..=5_945e6).contains(&(c.frequency_hz as f64)),
-                ScanBands::All => true,
-            })
-            .map(|c| {
-                let band = band_scan::band_letter(c.band);
-                band_scan::Channel {
-                    name: format!("{}{}", band, c.channel),
-                    band,
-                    hz: c.frequency_hz as f64,
-                }
+        self.selection()
+            .channels()
+            .map(|c| band_scan::Channel {
+                name: c.name(),
+                band: c.band.code(),
+                hz: c.frequency_hz as f64,
             })
             .collect()
     }
@@ -717,59 +413,6 @@ impl ScanBands {
 /// where both hold.
 const USABLE_SPAN_FRACTION: f64 = 0.8;
 
-/// Plan the fewest tune centres that put every channel in `channels_hz`
-/// inside some capture window of width `span_hz`.
-///
-/// Greedy interval cover, the same shape as `orecchiette`'s
-/// `plan_tune_centers`: walk the sorted channels, anchor on the leftmost
-/// one not yet covered, absorb every channel within `span_hz` of it, and
-/// emit the **midpoint of the group actually absorbed** rather than the
-/// anchor, which holds the absorbed channels as far from the window
-/// edges — where localisation degrades — as the group allows. Anchoring
-/// left and taking as much as fits is optimal in the number of windows
-/// for covering points on a line with a fixed width.
-///
-/// The coverage test is on channel *centres*, not whole channel widths.
-/// `orecchiette` subtracts a 20 MHz allowance from the reach because it
-/// needs a whole DJI channel inside one window to demodulate it. Here the
-/// window only has to be good enough to *detect and localise* a carrier,
-/// which the measurements behind [`USABLE_SPAN_FRACTION`] show needs the
-/// carrier centre inside the span and nothing more. Charging every narrow
-/// analog channel a 20 MHz guard would roughly halve the reach at
-/// 25 MSPS for no gain.
-fn plan_tune_centers(channels_hz: &[f64], span_hz: f64) -> Vec<f64> {
-    let mut sorted: Vec<f64> = channels_hz
-        .iter()
-        .copied()
-        .filter(|f| f.is_finite())
-        .collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    sorted.dedup();
-
-    let reach = span_hz.max(0.0);
-    let mut centers = Vec::new();
-    let mut i = 0;
-    while i < sorted.len() {
-        let first = sorted[i];
-        let mut last = first;
-        let mut j = i;
-        while j < sorted.len() && sorted[j] - first <= reach {
-            last = sorted[j];
-            j += 1;
-        }
-        // `j > i` always holds: the anchor satisfies the window test
-        // (distance 0), so the inner loop advances at least once and the
-        // outer loop cannot spin. This guards only a NaN-poisoned
-        // comparison ordering escaping the filter above.
-        if j == i {
-            j = i + 1;
-        }
-        centers.push((first + last) * 0.5);
-        i = j;
-    }
-    centers
-}
-
 /// Build the hop list for the auto-scan loop, covering every channel in
 /// `bands` with as few tunes as the SDR's instantaneous bandwidth allows.
 ///
@@ -778,11 +421,11 @@ fn plan_tune_centers(channels_hz: &[f64], span_hz: f64) -> Vec<f64> {
 ///
 /// ```text
 ///                        5.8 GHz    all bands
-///                    (40 channels) (137 channels)
-///     20.00 MSPS            16          101
-///     25.00 MSPS            11           93
-///     40.00 MSPS             8           56
-///     61.44 MSPS             6           48
+///                    (40 channels) (154 channels)
+///     20.00 MSPS            16          108
+///     25.00 MSPS            11          100
+///     40.00 MSPS             8           60
+///     61.44 MSPS             6           51
 /// ```
 ///
 /// Revisit interval is `tunes × (retune + dwell)`, so those tune counts
@@ -808,7 +451,7 @@ fn resolve_channel(ch: &str) -> anyhow::Result<f64> {
         return Ok(freq);
     }
     anyhow::bail!(
-        "unrecognised channel '{}'; expected A1–A8, B1–B8, E1–E8, F1–F8, R1–R8, L1–L8, D1–D8, or a frequency in Hz",
+        "unrecognised channel '{}'; expected a catalog channel (A/B/E/F/R/L/D/U/N/W/T/S) or a frequency in Hz",
         ch
     );
 }
@@ -922,60 +565,6 @@ struct AaroniaSdkArgs {
 
 // ── Constants ──────────────────────────────────────────────────────
 
-/// DDC cutoff is the FM deviation plus enough chroma headroom for PAL.
-const LUMA_HEADROOM_HZ: f32 = 2_000_000.0;
-
-/// Taps the decode down-converter uses when it decimates.
-///
-/// The 63-tap default is not sharp enough to decimate a wide capture.
-/// Decimating by N folds everything above the new Nyquist back onto the
-/// signal, and the frequency landing on the passband edge is
-/// `work_rate - cutoff` — 8.36 MHz out, for a 61.44 MSPS capture at 4x.
-/// That is where a neighbouring VTX sits, and 63 taps attenuate it by
-/// only 24 dB. 127 taps give 75 dB. The longer filter still costs less
-/// than today because the convolution runs only on the samples the
-/// stride keeps: 127 taps on a quarter of them is half the work of 63
-/// taps on all of them. Pinned by the analog crate's
-/// `a_decimated_down_conversion_still_decodes`, which puts a
-/// transmitter 20 dB up at that offset and watches sync quality fall to
-/// 0.01 on the default filter.
-const DECODE_FIR_TAPS: usize = 127;
-
-/// Width of the down-converter's transition band, as a fraction of the
-/// input rate times the tap count: `transition_hz ≈ K · fs / taps`.
-/// Fitted to the crate's Blackman design between its −6 dB and −50 dB
-/// points.
-const FIR_TRANSITION_K: f32 = 2.33;
-
-/// How far the decode path may decimate a capture and stay alias-free.
-///
-/// The video occupies `2 · cutoff` of the capture — about 14 MHz for a
-/// 5 MHz-deviation channel — so a 61.44 MSPS capture spends three
-/// quarters of every stage on spectrum the down-converter's filter
-/// already emptied. Decimating there lets the demodulator, deemphasis
-/// and frame reconstructor all run at the lower rate: 3.93 against 0.61
-/// CPU-seconds per second of signal on one core of an Apple M4
-/// (`examples/profile_decode.rs`). Above 1.0 the worker drops chunks.
-///
-/// The limit is aliasing: energy at `work_rate - cutoff` folds onto the
-/// passband edge, so that frequency has to clear the filter's stopband
-/// edge, one transition band above the cutoff.
-///
-/// It cannot be a fixed target rate. File playback defaults to a 17 MHz
-/// deviation, so a "always decimate to 15.36 MSPS" rule would fold a
-/// 19 MHz-wide channel onto itself.
-fn decode_decimation(sample_rate: u32, ddc_cutoff_hz: f32) -> usize {
-    if sample_rate == 0 || !ddc_cutoff_hz.is_finite() || ddc_cutoff_hz <= 0.0 {
-        return 1;
-    }
-    let transition = FIR_TRANSITION_K * sample_rate as f32 / DECODE_FIR_TAPS as f32;
-    let min_work_rate = 2.0 * ddc_cutoff_hz + transition;
-    if min_work_rate <= 0.0 {
-        return 1;
-    }
-    ((sample_rate as f32 / min_work_rate).floor() as usize).max(1)
-}
-
 /// Default centre of the 5.8 GHz FPV band for wideband scanning.
 /// (Only the Aaronia backend scans a single fixed span; USRP/HackRF
 /// hop through `build_scan_hops` instead.)
@@ -1060,44 +649,6 @@ fn main() -> anyhow::Result<()> {
 // ═══════════════════════════════════════════════════════════════════
 //  FILE MODE — unchanged from before, now behind `file` subcommand
 // ═══════════════════════════════════════════════════════════════════
-
-/// Turn a detector classification into the concrete PAL-or-NTSC choice
-/// a `FrameReconstructor` needs.
-///
-/// `detect_sync_pulses` / `detect_from_iq` can legitimately return
-/// [`SignalType::AnalogVideoUnknown`] — "this is analog video but the
-/// FFT couldn't resolve the 109 Hz PAL/NTSC line-rate gap" (common on
-/// the first wideband chunk). The library's docs explicitly warn
-/// callers not to act on a PAL-vs-NTSC tag in that state; treating it
-/// as NTSC (what `== AnalogVideoPal` comparisons silently did) builds
-/// a reconstructor with the wrong line rate and geometry for a PAL
-/// signal → rolling, torn video with no hint why. Instead, measure the
-/// median sync-tip interval directly on the demodulated baseband via
-/// `detect_video_standard`, and only fall back to `default` when even
-/// that is inconclusive.
-fn concretize_standard(
-    tagged: SignalType,
-    baseband_iq: &[Complex<f32>],
-    sample_rate: u32,
-    default: SignalType,
-) -> SignalType {
-    match tagged {
-        SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => tagged,
-        _ => {
-            let demod = fm_demod(baseband_iq);
-            match detect_video_standard(&demod, sample_rate) {
-                s @ (SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc) => {
-                    println!("  → Standard ambiguous; time-domain line-rate check says {s:?}");
-                    s
-                }
-                _ => {
-                    println!("  → Standard ambiguous and undecidable; defaulting to {default:?}");
-                    default
-                }
-            }
-        }
-    }
-}
 
 fn run_file(args: FileArgs) -> anyhow::Result<()> {
     // Attempt to load SigMF metadata
@@ -1219,7 +770,6 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         })
         .collect();
 
-    let detector = AnalogFpvDetector::default();
     let mut resolved_channels: Vec<(SignalType, f32, f32)> = Vec::new();
     for (maybe_type, freq_offset, label) in &channels_to_spawn {
         let sig_type = if let Some(t) = maybe_type {
@@ -1236,31 +786,20 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                 label,
                 freq_offset / 1e6
             );
-            let mut probe_ddc =
-                StreamingDDC::new(*freq_offset, sample_rate, fm_deviation + LUMA_HEADROOM_HZ);
-            let probe_iq = probe_ddc.process(&first_iq);
-            let (detected_type, confidence) = detector.detect_sync_pulses(&probe_iq, sample_rate);
-            if matches!(
-                detected_type,
-                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
-            ) {
-                println!(
-                    "  → Auto-detected: {:?} (confidence {:.0}%)",
-                    detected_type,
-                    confidence * 100.0
-                );
-                detected_type
-            } else if detected_type == SignalType::Unknown {
-                println!("  → Could not detect standard, defaulting to NTSC");
-                SignalType::AnalogVideoNtsc
-            } else {
-                concretize_standard(
-                    detected_type,
-                    &probe_iq,
-                    sample_rate,
-                    SignalType::AnalogVideoNtsc,
-                )
-            }
+            let (standard, confidence) = analyze_channel_standard(
+                &first_iq,
+                *freq_offset,
+                sample_rate,
+                fm_deviation,
+                SignalType::AnalogVideoNtsc,
+            )?;
+            println!(
+                "  → Standard {:?}: {:?} ({:.0}% classifier confidence)",
+                standard.evidence,
+                standard.standard,
+                confidence * 100.0
+            );
+            standard.standard
         };
         resolved_channels.push((
             sig_type,
@@ -1415,8 +954,8 @@ enum ChannelInputState {
     Idle,
     /// Waiting for first character (the band letter).
     WaitingFirst,
-    /// Got the first character, waiting for second (the channel number).
-    WaitingSecond(char),
+    /// Collecting a channel number; Enter accepts an ambiguous prefix such as S6.
+    Typing(String),
 }
 
 fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
@@ -1516,13 +1055,12 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                 });
 
                 let handle = source.start(config, advice.clone())?;
-                let detector = viewer_detector();
-                let mut best_hit: Option<(f64, f32, SignalType)> = None;
-                let mut seen_freqs = std::collections::HashSet::new();
+                let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
+                let mut selector =
+                    ScanSelector::new(&skipped_freqs, CandidatePolicy::AnyUnskippedChannel);
+                let mut progress = ScanProgress::new(&hop_freqs, DETECT_PACKETS_PER_HOP);
                 let mut sweeps_completed = 0;
                 let mut last_progress_msg = Instant::now();
-                let mut last_processed_freq = 0;
-                let mut packets_this_hop = 0usize;
                 let multi_hop = hop_freqs.len() > 1;
                 let mut probes: Vec<ProbeEnergy> = Vec::new();
 
@@ -1571,17 +1109,9 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         // With a single tune the source never retunes, so
                         // there is no boundary to observe and no hop to
                         // drain for; every packet is processed.
-                        if multi_hop && center == last_processed_freq {
-                            if packets_this_hop >= DETECT_PACKETS_PER_HOP {
-                                continue;
-                            }
-                        } else if center != last_processed_freq {
-                            last_processed_freq = center;
-                            packets_this_hop = 0;
-                        }
-                        packets_this_hop += 1;
-
-                        seen_freqs.insert(center);
+                        let Some(hop) = progress.observe(center) else {
+                            continue;
+                        };
 
                         let results = detector.detect_from_iq_integrated_with_probes(
                             &packet.samples,
@@ -1594,7 +1124,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         // look, so every packet replaces the last.
                         sweep.band.record_hop(
                             center as f64,
-                            packets_this_hop == 1 || !multi_hop,
+                            hop.first_packet || !multi_hop,
                             &probes,
                             &results,
                         );
@@ -1609,40 +1139,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                 res.confidence * 100.0,
                                 res.rssi_dbm
                             );
-                            // A hit is selectable unless the user
-                            // blacklisted everything it could tune to.
-                            // Off-table bands (3.3 GHz, 6-7 GHz) have no
-                            // channel-table candidates at all; those tune
-                            // to the detection frequency itself (the
-                            // `candidates.is_empty()` snap below), so
-                            // they are gated on that frequency's own skip
-                            // key rather than on having a candidate.
-                            let candidates = get_candidate_fpv_channels(res.frequency_hz as f64);
-                            let selectable = if candidates.is_empty() {
-                                // Off-table hits tune to (and get
-                                // blacklisted at) their raw detection
-                                // frequency, which jitters by up to a
-                                // probe step (~2.5 MHz) between sweeps —
-                                // an exact u64 match would never
-                                // re-recognise a skipped signal. Match
-                                // within the same tolerance the channel
-                                // snap uses.
-                                !skipped_freqs.iter().any(|&s| {
-                                    (s as f64 - res.frequency_hz as f64).abs()
-                                        <= CHANNEL_SNAP_TOLERANCE_MHZ * 1e6
-                                })
-                            } else {
-                                candidates
-                                    .iter()
-                                    .any(|&c| !skipped_freqs.contains(&(c.round() as u64)))
-                            };
-                            let better = best_hit
-                                .map(|(_, best_rssi, _)| res.rssi_dbm > best_rssi)
-                                .unwrap_or(true);
-                            if selectable && better {
-                                best_hit =
-                                    Some((res.frequency_hz as f64, res.rssi_dbm, res.signal_type));
-                            }
+                            selector.consider(&res);
                         }
                         // Sweep is complete once every hop has been visited
                         // *and* the current one has had its full packet
@@ -1652,20 +1149,18 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         // needs to detect anything and clears `seen_freqs`
                         // mid-hop, sliding the sweep boundary one hop
                         // earlier on every subsequent pass.
-                        if seen_freqs.len() >= hop_freqs.len()
-                            && packets_this_hop >= DETECT_PACKETS_PER_HOP
-                        {
+                        if hop.sweep_complete {
                             sweep.band.end_sweep();
-                            if let Some((freq, _rssi, _sig_type)) = best_hit {
+                            if let Some((freq, _rssi, _sig_type)) = selector.best() {
                                 // Found something, break out of the infinite scan loop
                                 (handle.stop)();
                                 std::thread::sleep(Duration::from_millis(200));
 
-                                let mut candidates = get_candidate_fpv_channels(freq);
-                                candidates
-                                    .retain(|&c| !skipped_freqs.contains(&(c.round() as u64)));
+                                let candidates = selector.refinement_candidates(freq);
                                 if candidates.is_empty() {
-                                    let snapped_freq = snap_to_nearest_fpv_channel(freq);
+                                    let snapped_freq = selector
+                                        .fallback_frequency(freq)
+                                        .expect("selected hit has an unskipped fallback");
                                     let ch_name = get_fpv_channel_name(snapped_freq / 1e6)
                                         .unwrap_or("Unknown");
                                     println!(
@@ -1699,9 +1194,8 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                 });
                                 let ft_handle = ft_source.start(ft_config, advice.clone())?;
 
-                                let mut ft_best_hit: Option<(f64, f32, f32)> = None;
-                                let mut ft_seen = std::collections::HashSet::new();
-                                let mut ft_last_freq = 0;
+                                let mut ft_selector = FineTuneSelector::default();
+                                let mut ft_progress = ScanProgress::new(&candidates, 1);
 
                                 loop {
                                     let packet = match ft_handle
@@ -1724,13 +1218,9 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                     {
                                         let center = packet.center_frequency_hz as u64;
 
-                                        // Drain duplicates to stay real-time
-                                        if center == ft_last_freq {
+                                        let Some(ft_hop) = ft_progress.observe(center) else {
                                             continue;
-                                        }
-                                        ft_last_freq = center;
-
-                                        ft_seen.insert(center);
+                                        };
 
                                         let (_sig_type, conf) = detector.detect_sync_pulses(
                                             &packet.samples,
@@ -1758,23 +1248,14 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                             rssi
                                         );
 
-                                        if let Some((_, best_conf, best_rssi)) = ft_best_hit {
-                                            // Use confidence first, RSSI as a tie-breaker or fallback if confidences are similar
-                                            if conf > best_conf + 0.05
-                                                || (conf > best_conf - 0.05 && rssi > best_rssi)
-                                            {
-                                                ft_best_hit = Some((center as f64, conf, rssi));
-                                            }
-                                        } else {
-                                            ft_best_hit = Some((center as f64, conf, rssi));
-                                        }
+                                        ft_selector.consider(center as f64, conf, rssi);
 
-                                        if ft_seen.len() >= candidates.len() {
+                                        if ft_hop.sweep_complete {
                                             (ft_handle.stop)();
                                             std::thread::sleep(Duration::from_millis(200));
 
-                                            if let Some((best_freq, best_conf, _)) = ft_best_hit
-                                                && best_conf > 0.1
+                                            if let Some((best_freq, _best_conf, _)) =
+                                                ft_selector.best()
                                             {
                                                 println!(
                                                     "Fine-tuning complete. Selected exact channel: {} ({:.3} MHz)",
@@ -1788,7 +1269,9 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                             println!(
                                                 "Fine-tuning didn't find clear sync pulses. Falling back to simple snap."
                                             );
-                                            let snapped_freq = snap_to_nearest_fpv_channel(freq);
+                                            let snapped_freq = selector
+                                                .fallback_frequency(freq)
+                                                .expect("selected hit has an unskipped fallback");
                                             let ch_name = get_fpv_channel_name(snapped_freq / 1e6)
                                                 .unwrap_or("Unknown");
                                             println!(
@@ -1819,7 +1302,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                     last_progress_msg = Instant::now();
                                 }
                                 // Reset for the next sweep.
-                                seen_freqs.clear();
+                                progress.reset_sweep();
                             }
                         }
                     }
@@ -2137,34 +1620,9 @@ enum OverrunPolicy {
 #[cfg(feature = "aaronia")]
 const AARONIA_HTTP_TUNE_SETTLE: Duration = Duration::from_millis(400);
 
-/// Length of contiguous signal the standard is decided on. PAL and NTSC
-/// line rates are 109 Hz apart, so the FFT separates them only past
-/// ~9.2 ms of record; one 65,536-sample packet is 1–4 ms at the live
-/// rates, and on that the library can only answer "analog video,
-/// standard unknown" — measured on a clean 20 dB NTSC link, which then
-/// decoded as PAL. 25 ms puts the two rates 2.6 bins apart.
-const STANDARD_DETECT_RECORD: Duration = Duration::from_millis(25);
 /// Give up waiting for a clean record after this long and decide on
 /// whatever was gathered.
 const STANDARD_DETECT_PATIENCE: Duration = Duration::from_millis(1500);
-
-/// Confidence floor for the sweep and the lock check. Both ask whether
-/// analog video is present, not which standard it is: the standard is
-/// settled afterwards on a long record (`STANDARD_DETECT_RECORD`). Their
-/// 1–4 ms packets cannot resolve PAL from NTSC, and the library reports
-/// that honestly as `AnalogVideoUnknown` at 0.6 — a hit that has passed
-/// the harmonic and cepstral gates — which the detector's default 0.7
-/// floor discarded. Measured on a 20 dB NTSC link at 15.36 MSPS: the
-/// sweep reported an empty band on every pass, and a decoder with
-/// perfect vertical sync "lost" its signal on every check.
-const VIEWER_MIN_CONFIDENCE: f32 = 0.55;
-
-/// The detector every live path uses, with the floor above.
-fn viewer_detector() -> AnalogFpvDetector {
-    let mut d = AnalogFpvDetector::default();
-    d.min_confidence = VIEWER_MIN_CONFIDENCE;
-    d
-}
 
 /// What a coarse sweep came back with.
 enum ScanOutcome {
@@ -2228,15 +1686,10 @@ fn scan_band_for_channel(
     };
     let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
     let handle = source.start(config, advice)?;
-    let detector = viewer_detector();
+    let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
 
-    // (raw freq Hz, rssi dBm, what the sweep classified it as)
-    let mut best_hit: Option<(f64, f32, SignalType)> = None;
-    let mut seen = std::collections::HashSet::new();
-    let mut last_freq = 0u64;
-    let mut packets_this_hop = 0usize;
-    // What a packet is worth here decides how many to spend.
-    let packets_per_hop = budget.packets_per_hop;
+    let mut selector = ScanSelector::new(skipped_freqs, CandidatePolicy::NearestChannel);
+    let mut progress = ScanProgress::new(&hop_freqs, budget.packets_per_hop);
     let mut probes: Vec<ProbeEnergy> = Vec::new();
     let outcome = |hit: Option<(f64, f32, SignalType)>| match hit {
         Some((f, _, sig)) => ScanOutcome::Found(snap_to_nearest_fpv_channel(f), sig),
@@ -2261,16 +1714,9 @@ fn scan_band_for_channel(
                 // sweep is complete rather than clearing `seen` and going
                 // round again, so a one-tune plan finishes on its first
                 // packet and can never sit draining.
-                if center == last_freq {
-                    if packets_this_hop >= packets_per_hop {
-                        continue;
-                    }
-                } else {
-                    last_freq = center;
-                    packets_this_hop = 0;
-                }
-                packets_this_hop += 1;
-                seen.insert(center);
+                let Some(hop) = progress.observe(center) else {
+                    continue;
+                };
 
                 let results = detector.detect_from_iq_integrated_with_probes(
                     &packet.samples,
@@ -2281,16 +1727,10 @@ fn scan_band_for_channel(
                 );
                 sweep
                     .band
-                    .record_hop(center as f64, packets_this_hop == 1, &probes, &results);
+                    .record_hop(center as f64, hop.first_packet, &probes, &results);
 
                 for res in results {
-                    let snapped = snap_to_nearest_fpv_channel(res.frequency_hz as f64);
-                    if skipped_freqs.contains(&(snapped.round() as u64)) {
-                        continue;
-                    }
-                    let better = best_hit.map(|(_, r, _)| res.rssi_dbm > r).unwrap_or(true);
-                    if better {
-                        best_hit = Some((res.frequency_hz as f64, res.rssi_dbm, res.signal_type));
+                    if selector.consider(&res) {
                         println!(
                             "  → {:?} at {:.3} MHz ({}), rssi {:.1} dBm",
                             res.signal_type,
@@ -2308,17 +1748,17 @@ fn scan_band_for_channel(
                 // HackRF scan with a single detection pass — below the
                 // length at which the sweep finds anything — so that
                 // channel could never be reported.
-                if seen.len() >= hop_freqs.len() && packets_this_hop >= packets_per_hop {
+                if hop.sweep_complete {
                     sweep.band.end_sweep();
                     (handle.stop)();
                     std::thread::sleep(Duration::from_millis(150));
-                    return Ok(outcome(best_hit));
+                    return Ok(outcome(selector.best()));
                 }
             }
             Err(_) => {
                 // SDR went quiet — return whatever we found this sweep.
                 (handle.stop)();
-                return Ok(outcome(best_hit));
+                return Ok(outcome(selector.best()));
             }
         }
     }
@@ -2440,7 +1880,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                     // sensitive budget on every hop, so a signal that
                     // only appears after several packets of integration
                     // is found within four sweeps rather than never.
-                    let b = SweepBudget::for_sweep(sweep_n, sample_rate);
+                    let b = aaronia_sweep_budget(sweep_n, sample_rate);
                     sweep_n = sweep_n.wrapping_add(1);
                     b
                 },
@@ -2650,127 +2090,53 @@ fn run_live(
             st
         } else {
             println!("Auto-detecting video standard...");
-            let detector = AnalogFpvDetector::default();
-            // Decide on one contiguous record long enough for the FFT to
-            // tell the line rates apart (see `STANDARD_DETECT_RECORD`).
-            // A packet flagged overrun follows a gap in the stream, so
-            // the record restarts from it rather than splicing across
-            // the hole. The packets consumed here are not fed to the
-            // decoder; the pipeline starts from the last one.
-            let want = (sample_rate_u32 as f64 * STANDARD_DETECT_RECORD.as_secs_f64()) as usize;
-            let mut record: Vec<Complex<f32>> =
-                Vec::with_capacity(want + first_packet.samples.len());
-            record.extend_from_slice(&first_packet.samples);
+            let mut record = AcquisitionRecord::new(sample_rate_u32);
+            record.push(&first_packet.samples, false);
             let t0 = Instant::now();
-            while record.len() < want && t0.elapsed() < STANDARD_DETECT_PATIENCE {
+            while !record.is_ready() && t0.elapsed() < STANDARD_DETECT_PATIENCE {
                 let left = STANDARD_DETECT_PATIENCE.saturating_sub(t0.elapsed());
                 match handle.receiver.recv_timeout(left) {
                     Ok(p) => {
-                        if p.overrun {
-                            record.clear();
+                        if p.sample_rate_hz as u32 != sample_rate_u32
+                            || (p.center_frequency_hz - actual_center).abs() > 1.0
+                        {
+                            (handle.stop)();
+                            anyhow::bail!("SDR rate or centre changed during channel acquisition");
                         }
-                        record.extend_from_slice(&p.samples);
+                        record.push(&p.samples, p.overrun);
                         first_packet = p;
                     }
                     Err(_) => break,
                 }
             }
-            // Re-localize the carrier *we are decoding*, on the front
-            // of this record.
-            //
-            // Two things this must not do. It must not rank by
-            // confidence across the whole capture: a second transmitter
-            // 20 MHz away scores just as well, and labelling the picture
-            // after the neighbour is worse than labelling it after a
-            // mis-snapped channel. The decoder mixes DC down and keeps
-            // `ddc_cutoff` either side, so the only detection that can
-            // describe what is on screen is one inside that passband,
-            // and among those the one nearest DC.
-            //
-            // And it must not cost what a full pass over the record
-            // costs. `detect_from_iq` on 25 ms at 61.44 MSPS is ~315 ms
-            // — the window would sit blank for it. One 65,536-sample
-            // window is what the sweep itself localizes from, and the
-            // signal here is centred and strong: measured live, the
-            // estimate lands in a 0.13 MHz spread either way.
-            {
-                let refine_len = record.len().min(65_536);
-                let passband_hz = (fm_deviation + LUMA_HEADROOM_HZ) as f64;
-                refined_carrier_hz = carrier_for_decoded_channel(
-                    detector
-                        .detect_from_iq(
-                            &record[..refine_len],
-                            actual_center as u64,
-                            sample_rate_u32,
+            let acquisition = analyze_tuned_channel(
+                record.samples(),
+                actual_center,
+                sample_rate_u32,
+                fm_deviation,
+                scan_hint
+                    .filter(|hint| {
+                        matches!(
+                            hint,
+                            SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc
                         )
-                        .into_iter()
-                        .map(|h| h.frequency_hz as f64),
-                    actual_center,
-                    passband_hz,
-                );
-            }
-
-            let (detected, confidence) = detector.detect_sync_pulses(&record, sample_rate_u32);
+                    })
+                    .unwrap_or(SignalType::AnalogVideoPal),
+            )?;
+            refined_carrier_hz = acquisition.measured_carrier_hz;
+            println!(
+                "  → Standard {:?}: {:?} ({:.0}% classifier confidence)",
+                acquisition.standard.evidence,
+                acquisition.standard.standard,
+                acquisition.classifier_confidence * 100.0
+            );
             if debug {
                 eprintln!(
-                    "[DEBUG] standard decided on {:.1} ms of signal: {detected:?} {confidence:.2}",
-                    record.len() as f64 / sample_rate_u32 as f64 * 1e3
+                    "[DEBUG] standard record: {:.1} ms",
+                    record.samples().len() as f64 / sample_rate_u32 as f64 * 1e3
                 );
             }
-            match detected {
-                SignalType::AnalogVideoPal | SignalType::AnalogVideoNtsc => {
-                    println!(
-                        "  → Detected: {:?} ({:.0}% confidence)",
-                        detected,
-                        confidence * 100.0
-                    );
-                    detected
-                }
-                // Nothing found at the tuned centre. Prefer what the
-                // sweep measured over a blind default: the sweep
-                // integrates several looks and classified this very
-                // signal, while this re-detect gets one centre and a
-                // few chunks. It is a *fallback*, not an override — a
-                // confident re-detect above still wins, so a sweep
-                // verdict formed from mislabelled samples cannot
-                // outrank direct evidence at the tuned frequency.
-                SignalType::Unknown => match scan_hint {
-                    Some(hint) => {
-                        println!(
-                            "  → No standard detected here; using the sweep's verdict: {hint:?}"
-                        );
-                        hint
-                    }
-                    None => {
-                        println!("  → No standard detected, defaulting to PAL");
-                        SignalType::AnalogVideoPal
-                    }
-                },
-                // AnalogVideoUnknown (and any future variant):
-                // definitely analog video, but the classifier
-                // couldn't tell PAL from NTSC — resolve it in the
-                // time domain rather than silently guessing.
-                other => {
-                    // Band-limit first: the capture can be tens of
-                    // MHz wide, and demodulating the full span
-                    // buries the video baseband in out-of-band
-                    // noise, all but guaranteeing an inconclusive
-                    // measurement. Same probe filter Scan mode
-                    // uses, at 0 Hz offset (signal is at DC).
-                    let mut probe_ddc =
-                        StreamingDDC::new(0.0, sample_rate_u32, fm_deviation + LUMA_HEADROOM_HZ);
-                    let probe_iq = probe_ddc.process(&record);
-                    // Same fallback order as above: time-domain
-                    // measurement first, then the sweep's verdict,
-                    // then PAL.
-                    concretize_standard(
-                        other,
-                        &probe_iq,
-                        sample_rate_u32,
-                        scan_hint.unwrap_or(SignalType::AnalogVideoPal),
-                    )
-                }
-            }
+            acquisition.standard.standard
         };
         // Signal is at DC (SDR tuned directly); size the decode
         // bandwidth so the worker's DDC cutoff lands at
@@ -2829,7 +2195,7 @@ fn run_live(
             // relocked in a loop — 44 times in four minutes on a live
             // Aaronia link before crashing.
             let mut lock_integ = SpectralIntegrator::new(4);
-            let detector = viewer_detector();
+            let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
             // Check cadence in wall time, not packets: a fixed 400-packet
             // interval was 0.43 s at 61.44 MSPS but 1.3 s at HackRF's
             // 20 MSPS, and the integrator's 4-batch memory plus the miss
@@ -2947,16 +2313,13 @@ fn run_live(
                             // horizontal sync but no vertical sync —
                             // 0.8 confidence, no frame ever — held the
                             // viewer indefinitely.
-                            let on_carrier = hits.iter().any(|h| {
-                                (h.frequency_hz as f64 - tuned_carrier_hz).abs()
-                                    <= LOCK_CARRIER_TOLERANCE_HZ
-                            });
+
                             let produced =
                                 observed_timing_fields.load(std::sync::atomic::Ordering::Relaxed);
                             let decoding = produced > frames_at_last_check;
                             frames_at_last_check = produced;
 
-                            if lock.observe(on_carrier, decoding) {
+                            if lock.observe_detections(&hits, tuned_carrier_hz, decoding) {
                                 exit_flag.store(1, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -3100,30 +2463,18 @@ where
         // `bandwidth_hz` comes from the detector, and an implausibly
         // small detected bandwidth would otherwise collapse the FIR
         // passband and render a black/garbage frame with no clue why.
-        let ddc_cutoff = (bandwidth_hz / 2.0)
-            .min(fm_deviation + LUMA_HEADROOM_HZ)
-            .max(fm_deviation);
-        let mut decim = decode_decimation(sample_rate, ddc_cutoff);
-        // The PLL cannot track a 5 MHz deviation much below 20 MSPS —
-        // its loop-bandwidth stability clamp caps ωₙ at 0.5 rad/sample,
-        // i.e. fs/4π (analog crate DESIGN.md §11). Asking for it
-        // explicitly therefore caps how far we may decimate, at the
-        // cost of the CPU the decimation would have saved.
-        if matches!(demod_kind, DemodKind::Pll) {
-            let cap = (sample_rate / PLL_AUTO_MIN_SAMPLE_RATE_HZ).max(1) as usize;
-            if decim > cap {
-                println!(
-                    "  → --demod pll holds the decode rate at {:.2} MSPS (the loop cannot \
-                     track this deviation below ~20 MSPS); it may not keep up. Drop the \
-                     flag to decode at {:.2} MSPS.",
-                    (sample_rate / cap as u32) as f64 / 1e6,
-                    (sample_rate / decim as u32) as f64 / 1e6
-                );
-                decim = cap;
-            }
+        let plan = DecodePlan::new(sample_rate, fm_deviation, bandwidth_hz, demod_kind.into())?;
+        let decim = plan.decimation();
+        let work_rate = plan.work_rate();
+        let use_pll = plan.use_pll();
+        let unconstrained = decode_decimation(sample_rate, plan.ddc_cutoff_hz());
+        if decim < unconstrained {
+            println!(
+                "  → --demod pll holds the decode rate at {:.2} MSPS instead of {:.2} MSPS",
+                work_rate as f64 / 1e6,
+                (sample_rate / unconstrained as u32) as f64 / 1e6
+            );
         }
-        let work_rate = sample_rate / decim as u32;
-        let use_pll = demod_kind.use_pll(work_rate, fm_deviation);
         if decim > 1 {
             println!(
                 "  → Decoding at {:.2} MSPS ({:.2} MSPS capture / {})",
@@ -3241,20 +2592,15 @@ where
         });
 
         let config = DecodeWorkerConfig {
-            sample_rate,
-            freq_offset,
-            ddc_cutoff,
-            decim,
-            work_rate,
-            use_pll,
-            pll_loop_bw_hz: PLL_LOOP_BW_HZ,
-            fm_deviation,
-            deemphasis_tau,
-            is_pal,
-            temporal_window,
-            debug,
+            decoder: DecoderConfig {
+                plan,
+                frequency_offset_hz: freq_offset,
+                standard: orecchiette_fpv_drone_analog_rs::timing::Standard::from_is_pal(is_pal),
+                deemphasis_tau_s: deemphasis_tau,
+                temporal_window,
+                debug,
+            },
             display_mhz,
-            decode_fir_taps: DECODE_FIR_TAPS,
             denoise_model: Some(denoise_model),
         };
 
@@ -3269,7 +2615,7 @@ where
             snap_tx,
             #[cfg(feature = "neural-vsr")]
             denoise_on,
-        );
+        )?;
     }
 
     if channel_txs.is_empty() {
@@ -3387,34 +2733,54 @@ where
                         if let Some(c) = key_to_char(k)
                             && c.is_ascii_alphabetic()
                         {
-                            ch_input = ChannelInputState::WaitingSecond(c);
+                            ch_input = ChannelInputState::Typing(c.to_string());
                             break;
                         }
                     }
                 }
-                ChannelInputState::WaitingSecond(first) => {
+                ChannelInputState::Typing(mut name) => {
                     let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
-                    for k in keys {
-                        if k == Key::Escape {
+                    for key in keys {
+                        if key == Key::Escape {
                             ch_input = ChannelInputState::Idle;
                             break;
                         }
-                        if let Some(c) = key_to_char(k) {
-                            let ch_name = format!("{}{}", first, c);
-                            if let Some(freq) = lookup_channel_by_name(&ch_name) {
-                                // Found it! Store the frequency and signal exit.
-                                tune_freq.store(freq, std::sync::atomic::Ordering::Relaxed);
-                                exit_reason.store(5, std::sync::atomic::Ordering::Relaxed);
-                                break;
+                        if key == Key::Backspace {
+                            name.pop();
+                            ch_input = if name.is_empty() {
+                                ChannelInputState::WaitingFirst
                             } else {
-                                // Invalid channel name, flash error and reset
-                                ch_input_flash_msg = format!("Unknown channel: {}", ch_name);
-                                ch_input_flash_until =
-                                    Some(std::time::Instant::now() + Duration::from_secs(2));
-                                ch_input = ChannelInputState::Idle;
-                                break;
-                            }
+                                ChannelInputState::Typing(name)
+                            };
+                            break;
                         }
+                        let submit = key == Key::Enter;
+                        if !submit {
+                            let Some(c) = key_to_char(key) else {
+                                continue;
+                            };
+                            name.push(c);
+                        }
+                        let exact = lookup_channel_by_name(&name);
+                        let has_longer = orecchiette_fpv_drone_analog_rs::bands::channel_catalog()
+                            .iter()
+                            .any(|channel| {
+                                let full = channel.name();
+                                full.len() > name.len() && full.starts_with(&name)
+                            });
+                        if !submit && has_longer {
+                            ch_input = ChannelInputState::Typing(name);
+                            break;
+                        }
+                        if let Some(freq) = exact {
+                            tune_freq.store(freq, std::sync::atomic::Ordering::Relaxed);
+                            exit_reason.store(5, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            ch_input_flash_msg = format!("Unknown channel: {name}");
+                            ch_input_flash_until = Some(Instant::now() + Duration::from_secs(2));
+                            ch_input = ChannelInputState::Idle;
+                        }
+                        break;
                     }
                 }
                 ChannelInputState::Idle => {}
@@ -3519,14 +2885,14 @@ where
                                 0xcc000000,
                             );
                         }
-                        ChannelInputState::WaitingSecond(first) => {
+                        ChannelInputState::Typing(name) => {
                             draw_text_with_bg(
                                 &mut display_buffers[i],
                                 *width,
                                 *height,
                                 10,
                                 30,
-                                &format!("CH: {}_", first),
+                                &format!("CH: {name}_  ENTER TO TUNE"),
                                 0xffffff00,
                                 0xcc000000,
                             );
@@ -3616,215 +2982,6 @@ where
 // ═══════════════════════════════════════════════════════════════════
 //  TEXT RENDERING
 // ═══════════════════════════════════════════════════════════════════
-
-fn get_fpv_channel_name(freq_mhz: f64) -> Option<&'static str> {
-    let freq_round = freq_mhz.round() as i32;
-    match freq_round {
-        // --- 5.8 GHz Band A (Boscam A) ---
-        5865 => Some("A1"),
-        5845 => Some("A2"),
-        5825 => Some("A3"),
-        5805 => Some("A4"),
-        5785 => Some("A5"),
-        5765 => Some("A6"),
-        5745 => Some("A7"),
-        5725 => Some("A8"),
-
-        // --- 5.8 GHz Band B (Boscam B) ---
-        5733 => Some("B1"),
-        5752 => Some("B2"),
-        5771 => Some("B3"),
-        5790 => Some("B4"),
-        5809 => Some("B5"),
-        5828 => Some("B6"),
-        5847 => Some("B7"),
-        5866 => Some("B8"),
-
-        // --- 5.8 GHz Band E (Boscam E) ---
-        5705 => Some("E1"),
-        5685 => Some("E2"),
-        5665 => Some("E3"),
-        5645 => Some("E4"),
-        5885 => Some("E5"),
-        5905 => Some("E6"),
-        5925 => Some("E7"),
-        5945 => Some("E8"),
-
-        // --- 5.8 GHz Band F (Fat Shark / ImmersionRC) ---
-        5740 => Some("F1"),
-        5760 => Some("F2"),
-        5780 => Some("F3"),
-        5800 => Some("F4"),
-        5820 => Some("F5"),
-        5840 => Some("F6"),
-        5860 => Some("F7"),
-
-        // --- 5.8 GHz Band R (Raceband) ---
-        5658 => Some("R1"),
-        5695 => Some("R2"),
-        5732 => Some("R3"),
-        5769 => Some("R4"),
-        5806 => Some("R5"),
-        5843 => Some("R6"),
-        5880 => Some("R7/F8"),
-        5917 => Some("R8"),
-
-        // --- 5.3 GHz Band D (Boscam D / "5.3G", 5362 + 37 MHz grid) ---
-        // The 37 MHz-spaced 5362 grid is the Boscam D band. The
-        // 48-channel VTX "L" lowband is the 40 MHz-spaced 5333 grid
-        // below; the two are 29 MHz apart at their first channel and
-        // are easily conflated.
-        5362 => Some("D1"),
-        5399 => Some("D2"),
-        5436 => Some("D3"),
-        // 5473 (D4) collides with U8 — see the shared arm below.
-        5510 => Some("D5"),
-        5547 => Some("D6"),
-        5584 => Some("D7"),
-        5621 => Some("D8"),
-
-        // --- 5.3 GHz Band L (Lowband, 5333 + 40 MHz grid) ---
-        5333 => Some("L1"),
-        // 5373 (L2) collides with U4 — see the shared arm below.
-        5413 => Some("L3"),
-        5453 => Some("L4"),
-        5493 => Some("L5"),
-        5533 => Some("L6"),
-        5573 => Some("L7"),
-        5613 => Some("L8"),
-
-        // --- 5.8 GHz Band U (Ultrabando) ---
-        5300 => Some("U1"),
-        5325 => Some("U2"),
-        5348 => Some("U3"),
-        5398 => Some("U5"),
-        5423 => Some("U6"),
-        5448 => Some("U7"),
-
-        // --- Overlapping/Duplicate 5.8 GHz channels ---
-        5373 => Some("U4/L2"),
-        5473 => Some("U8/D4"),
-
-        // --- 1.2 / 1.3 GHz Video Bands ---
-        1080 => Some("1.2G Ch1"),
-        1120 => Some("1.2G Ch2"),
-        1160 => Some("1.2G Ch3"),
-        1200 => Some("1.2G Ch4"),
-        1240 => Some("1.2G Ch5"),
-        1258 => Some("1.3G Ch9"),
-        1280 => Some("1.3G Ch6"),
-        1320 => Some("1.3G Ch7"),
-        1360 => Some("1.3G Ch8"),
-
-        // --- 2.4 GHz Video Bands ---
-        2410 => Some("2.4G Ch6"),
-        2414 => Some("2.4G Ch1"),
-        2430 => Some("2.4G Ch7"),
-        2432 => Some("2.4G Ch2"),
-        2450 => Some("2.4G Ch3/Ch8"),
-        2468 => Some("2.4G Ch4"),
-        2470 => Some("2.4G Ch9"),
-        2490 => Some("2.4G Ch5"),
-        _ => None,
-    }
-}
-
-/// Single source-of-truth for the FPV-channel snap & fine-tune
-/// candidate set used by `snap_to_nearest_fpv_channel` and
-/// `get_candidate_fpv_channels`. Centralising the array avoids the
-/// previous DRY violation where the two functions each inlined the
-/// same ~70-entry list and could drift out of sync.
-///
-/// Note: this list is a superset of
-/// `orecchiette_fpv_drone_analog_rs::bands::get_all_channels()`. The overlapping
-/// bands (A/B/E/F/R, L, and D) use identical anchor frequencies in
-/// both places — `bands.rs` models L as the standard 40 MHz-spaced
-/// 5333 lowband grid and D as the 37 MHz-spaced 5362 Boscam D grid,
-/// matching this table, so `--channel L1`/`D1` and the display labels
-/// agree. The "U" (Ultra-low) and 2.4 GHz video channels live only
-/// here because `bands.rs` doesn't model them yet (so `--channel U4`
-/// isn't resolvable — that's a separate gap, not a divergence). A
-/// follow-up unification pass should move this whole list into
-/// `bands.rs` and have both paths read it.
-const FPV_CHANNELS_MHZ: &[f64] = &[
-    // 5.8 GHz bands
-    5865.0, 5845.0, 5825.0, 5805.0, 5785.0, 5765.0, 5745.0, 5725.0, // A
-    5733.0, 5752.0, 5771.0, 5790.0, 5809.0, 5828.0, 5847.0, 5866.0, // B
-    5705.0, 5685.0, 5665.0, 5645.0, 5885.0, 5905.0, 5925.0, 5945.0, // E
-    5740.0, 5760.0, 5780.0, 5800.0, 5820.0, 5840.0,
-    5860.0, // F (Fatshark; F8 = 5880 in R row)
-    5658.0, 5695.0, 5732.0, 5769.0, 5806.0, 5843.0, 5880.0, 5917.0, // R (Raceband)
-    5362.0, 5399.0, 5436.0, 5473.0, 5510.0, 5547.0, 5584.0, 5621.0, // D (Boscam D / "5.3G")
-    5333.0, 5413.0, 5453.0, 5493.0, 5533.0, 5573.0, 5613.0, // L (Lowband; L2 = 5373 in U row)
-    5300.0, 5325.0, 5348.0, 5373.0, 5398.0, 5423.0, 5448.0, // U (Ultra-low)
-    // 1.2 / 1.3 GHz long-range analog FPV
-    1080.0, 1120.0, 1160.0, 1200.0, 1240.0, 1258.0, 1280.0, 1320.0, 1360.0,
-    // 2.4 GHz video channels (some overlap with Wi-Fi but legitimate analog FPV)
-    2410.0, 2414.0, 2430.0, 2432.0, 2450.0, 2468.0, 2470.0, 2490.0,
-];
-
-/// Max snap distance when collapsing a coarse-search hit to the
-/// nearest FPV channel. 15 MHz is one FPV channel's typical spacing
-/// — anything further off is more likely a different channel
-/// entirely than an off-tune of the same channel.
-const CHANNEL_SNAP_TOLERANCE_MHZ: f64 = 15.0;
-
-/// Which detection describes the carrier being decoded.
-///
-/// Not the strongest one. The decoder mixes the tuned centre down to DC
-/// and keeps `passband_hz` either side, so a detection outside that is
-/// filtered out before anything is drawn — it cannot be what is on
-/// screen. Ranking by confidence instead picked a second transmitter
-/// 20 MHz away that scored just as well, and labelled the picture after
-/// the neighbour.
-///
-/// Among the candidates the decoder can actually see, the nearest to DC
-/// is the one it is centred on.
-fn carrier_for_decoded_channel(
-    hits: impl IntoIterator<Item = f64>,
-    tuned_hz: f64,
-    passband_hz: f64,
-) -> Option<f64> {
-    hits.into_iter()
-        .filter(|hz| (hz - tuned_hz).abs() <= passband_hz)
-        .min_by(|a, b| (a - tuned_hz).abs().total_cmp(&(b - tuned_hz).abs()))
-}
-
-fn snap_to_nearest_fpv_channel(freq_hz: f64) -> f64 {
-    let freq_mhz = freq_hz / 1e6;
-    let mut best_mhz = freq_mhz;
-    let mut min_diff = CHANNEL_SNAP_TOLERANCE_MHZ;
-
-    for &ch in FPV_CHANNELS_MHZ {
-        let diff = (freq_mhz - ch).abs();
-        if diff < min_diff {
-            min_diff = diff;
-            best_mhz = ch;
-        }
-    }
-
-    best_mhz * 1e6
-}
-
-fn get_candidate_fpv_channels(freq_hz: f64) -> Vec<f64> {
-    let freq_mhz = freq_hz / 1e6;
-    let mut candidates: Vec<f64> = FPV_CHANNELS_MHZ
-        .iter()
-        .filter(|&&ch| (freq_mhz - ch).abs() <= CHANNEL_SNAP_TOLERANCE_MHZ)
-        .map(|&ch| ch * 1e6)
-        .collect();
-
-    // Sort by proximity to the coarse hit so the most likely
-    // candidates are checked/printed first by the fine-tune loop.
-    candidates.sort_by(|a, b| {
-        (freq_hz - *a)
-            .abs()
-            .partial_cmp(&(freq_hz - *b).abs())
-            .unwrap()
-    });
-
-    candidates
-}
 
 fn get_char_bitmap(c: char) -> [u8; 8] {
     match c {
@@ -3970,84 +3127,6 @@ mod tests {
         }
     }
 
-    /// The decode path may only shed bandwidth it has already filtered
-    /// away. Energy at `work_rate - cutoff` folds onto the passband
-    /// edge, so that frequency has to clear the filter's stopband edge.
-    ///
-    /// The rule has to be driven by the channel's own cutoff, not a
-    /// fixed target rate: file playback defaults to a 17 MHz deviation,
-    /// and "always decode at 15.36 MSPS" would fold a 19 MHz-wide
-    /// channel onto itself.
-    #[test]
-    fn decode_decimation_never_folds_a_channel_onto_itself() {
-        // A live channel (5 MHz deviation) and a file one (17 MHz).
-        for cutoff in [5e6f32 + LUMA_HEADROOM_HZ, 17e6 + LUMA_HEADROOM_HZ] {
-            for rate in [
-                7_680_000u32,
-                15_360_000,
-                20_000_000,
-                25_000_000,
-                30_720_000,
-                40_000_000,
-                50_000_000,
-                61_440_000,
-                100_000_000,
-            ] {
-                let decim = decode_decimation(rate, cutoff);
-                assert!(decim >= 1, "{rate} at {cutoff}: factor must be positive");
-                if decim == 1 {
-                    // Declining to decimate is always safe. Whether the
-                    // capture was wide enough for the channel in the
-                    // first place is not this function's business — at
-                    // 7.68 MSPS a 7 MHz cutoff is already undersampled,
-                    // and no stride fixes that.
-                    continue;
-                }
-                let work_rate = (rate / decim as u32) as f32;
-                // Nothing above the new Nyquist that could fold into
-                // the passband is still inside the filter's transition.
-                let stopband_edge =
-                    cutoff + FIR_TRANSITION_K * rate as f32 / DECODE_FIR_TAPS as f32;
-                assert!(
-                    work_rate - cutoff >= stopband_edge,
-                    "{:.2} MSPS at a {:.1} MHz cutoff decimated by {decim} to {:.2} MSPS: \
-                     energy at {:.2} MHz folds onto the passband edge but the filter is \
-                     still {:.2} MHz from its stopband",
-                    rate as f64 / 1e6,
-                    cutoff as f64 / 1e6,
-                    work_rate as f64 / 1e6,
-                    (work_rate - cutoff) as f64 / 1e6,
-                    stopband_edge as f64 / 1e6
-                );
-            }
-        }
-
-        // The live defaults, spelled out: both wide Aaronia spans land
-        // on the same working rate, and every rate a decoder already
-        // kept up with is left alone.
-        let live = 5e6f32 + LUMA_HEADROOM_HZ;
-        assert_eq!(decode_decimation(61_440_000, live), 4);
-        assert_eq!(decode_decimation(30_720_000, live), 2);
-        for unchanged in [25_000_000u32, 20_000_000, 15_360_000, 7_680_000] {
-            assert_eq!(
-                decode_decimation(unchanged, live),
-                1,
-                "{unchanged} has nothing to shed at a 7 MHz cutoff"
-            );
-        }
-
-        // A 19 MHz-wide file channel needs ~38 MSPS of working rate, so
-        // it must not decimate below that.
-        let file = 17e6f32 + LUMA_HEADROOM_HZ;
-        assert_eq!(decode_decimation(61_440_000, file), 1);
-        assert!(100_000_000 / decode_decimation(100_000_000, file) as u32 >= 38_000_000);
-
-        // Degenerate input must not divide by zero or panic.
-        assert_eq!(decode_decimation(0, live), 1);
-        assert_eq!(decode_decimation(61_440_000, 0.0), 1);
-        assert_eq!(decode_decimation(61_440_000, f32::NAN), 1);
-    }
-
     #[test]
     fn tune_planner_covers_every_channel_at_every_plausible_rate() {
         for bands in [ScanBands::Band58, ScanBands::All] {
@@ -4094,29 +3173,6 @@ mod tests {
         );
     }
 
-    /// A span too narrow to group anything must degrade to one tune per
-    /// channel rather than silently dropping channels — and must not
-    /// spin forever doing it.
-    #[test]
-    fn tune_planner_degrades_to_one_tune_per_channel_when_span_is_zero() {
-        let channels = vec![5_658e6, 5_695e6, 5_732e6];
-        let hops = plan_tune_centers(&channels, 0.0);
-        assert_eq!(hops, channels);
-    }
-
-    #[test]
-    fn tune_planner_handles_degenerate_input() {
-        assert!(plan_tune_centers(&[], 50e6).is_empty());
-        // Duplicates collapse rather than each claiming a tune.
-        assert_eq!(
-            plan_tune_centers(&[5_800e6, 5_800e6, 5_800e6], 0.0).len(),
-            1
-        );
-        // A non-finite entry must not poison the sort into an infinite loop.
-        let hops = plan_tune_centers(&[5_800e6, f64::NAN, 5_810e6], 50e6);
-        assert_eq!(hops.len(), 1);
-    }
-
     /// Scanning everything must be a strict superset of scanning 5.8,
     /// and must cost more tunes — that trade is the point of the flag.
     #[test]
@@ -4131,249 +3187,6 @@ mod tests {
         );
     }
 
-    /// A healthy decode must never be released.
-    #[test]
-    fn a_decoding_carrier_holds_lock_indefinitely() {
-        let mut lock = LockState::default();
-        for i in 0..1000 {
-            assert!(
-                !lock.observe(true, true),
-                "released a decoding carrier at check {i}"
-            );
-        }
-    }
-
-    /// The review's case: a horizontal-sync train with no vertical sync
-    /// scores 0.8 on the sweep detector forever and reconstructs no
-    /// frame. "There is a hit" held the viewer on a picture it could
-    /// never draw.
-    #[test]
-    fn a_detected_but_undecodable_carrier_is_eventually_released() {
-        let mut lock = LockState::default();
-        let mut checks = 0;
-        while !lock.observe(true, false) {
-            checks += 1;
-            assert!(checks < 100, "never released an undecodable carrier");
-        }
-        assert_eq!(checks + 1, LOCK_PROVISIONAL_CHECKS);
-    }
-
-    /// A hit that is not ours must not keep this channel alive — the
-    /// lock check ran on the whole capture, so a transmitter elsewhere
-    /// in a 49 MHz span did exactly that.
-    #[test]
-    fn a_hit_elsewhere_does_not_hold_our_channel() {
-        let mut lock = LockState::default();
-        // Someone else's strong, decodable signal.
-        for _ in 0..LOCK_EMPTY_CHECKS - 1 {
-            assert!(!lock.observe(false, true));
-        }
-        assert!(
-            lock.observe(false, true),
-            "another channel's detection kept ours locked"
-        );
-    }
-
-    /// The review's sequence: a miss, then the carrier returns without
-    /// a field, then another miss. Those two misses are not consecutive
-    /// and must not release the channel.
-    #[test]
-    fn non_consecutive_misses_do_not_release_the_channel() {
-        // miss -> carrier back but no field yet -> miss. Two misses,
-        // not consecutive. `LOCK_EMPTY_CHECKS` counts consecutive ones,
-        // so this must survive; before the fix the second miss released.
-        let mut lock = LockState::default();
-        assert!(!lock.observe(false, true), "a single miss released");
-        assert!(!lock.observe(true, false), "a provisional check released");
-        assert!(
-            !lock.observe(false, true),
-            "two non-consecutive misses released the channel"
-        );
-
-        // A decoded field clears both counters, so an isolated miss
-        // between good checks can repeat indefinitely without drifting
-        // toward release. (Good check first: the sequence above already
-        // ended on a miss, and two in a row *should* release.)
-        for _ in 0..50 {
-            assert!(!lock.observe(true, true));
-            assert!(!lock.observe(false, true), "an isolated miss released");
-        }
-    }
-
-    /// Strictly consecutive misses still release, on the documented
-    /// count — the fix must not make the channel un-releasable.
-    #[test]
-    fn consecutive_misses_still_release() {
-        let mut lock = LockState::default();
-        for _ in 0..LOCK_EMPTY_CHECKS - 1 {
-            assert!(!lock.observe(false, false));
-        }
-        assert!(lock.observe(false, false));
-    }
-
-    /// And an undecodable carrier still runs out its own budget even
-    /// though it keeps clearing the miss counter.
-    #[test]
-    fn a_provisional_carrier_still_times_out() {
-        let mut lock = LockState::default();
-        for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
-            assert!(!lock.observe(true, false));
-        }
-        assert!(lock.observe(true, false));
-    }
-
-    /// Acquisition stutter must not accumulate toward release: a check
-    /// that sees both clears the provisional count.
-    #[test]
-    fn a_field_arriving_clears_the_provisional_count() {
-        let mut lock = LockState::default();
-        for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
-            assert!(!lock.observe(true, false));
-        }
-        assert!(!lock.observe(true, true), "a good check should recover");
-        // Full budget available again.
-        for _ in 0..LOCK_PROVISIONAL_CHECKS - 1 {
-            assert!(!lock.observe(true, false));
-        }
-    }
-
-    /// The auto rule has to be about the deviation, not the rate. At
-    /// FPV's 5 MHz the PLL measured 9-25 dB *worse* than the
-    /// discriminator, because its loop cannot track that excursion —
-    /// and it also costs 6.49 dB at 4.2 MHz luma.
-    #[test]
-    fn auto_does_not_pick_the_pll_at_an_fpv_deviation() {
-        for rate in [25_000_000u32, 30_720_000, 61_440_000] {
-            assert!(
-                !DemodKind::Auto.use_pll(rate, 5_000_000.0),
-                "auto chose the PLL at {rate} Hz for a 5 MHz deviation"
-            );
-        }
-    }
-
-    /// Through the *pipeline's* ordering — decimate, then choose —
-    /// `Auto` resolves to the discriminator everywhere.
-    ///
-    /// This replaces a test that asked `use_pll(25_000_000, 500_000.0)`
-    /// directly and concluded the PLL was reachable. The pipeline never
-    /// poses that question: a 500 kHz deviation at 25 MSPS decimates by
-    /// 4 first, so what `Auto` is actually asked about is 6.25 MSPS,
-    /// where the loop is worth +1.8 dB rather than +9.9 and the rate
-    /// gate correctly declines.
-    #[test]
-    fn auto_resolves_to_the_discriminator_through_the_real_ordering() {
-        for capture in [15_360_000u32, 25_000_000, 30_720_000, 61_440_000] {
-            for dev in [200_000.0f32, 500_000.0, 1_000_000.0, 5_000_000.0] {
-                let (work, pll) = select_decode(capture, dev, DemodKind::Auto);
-                assert!(
-                    !pll,
-                    "auto chose the PLL at capture {capture} dev {dev} \
-                     (work rate {work})"
-                );
-            }
-        }
-    }
-
-    /// `--demod pll` still gets the PLL, and gets it at a rate the loop
-    /// can use rather than a decimated one.
-    #[test]
-    fn forcing_the_pll_holds_the_decode_rate_up() {
-        let (work, pll) = select_decode(25_000_000, 500_000.0, DemodKind::Pll);
-        assert!(pll, "--demod pll must force it");
-        assert!(
-            work >= PLL_AUTO_MIN_SAMPLE_RATE_HZ,
-            "forced PLL decoded at {work}, below the rate its loop needs"
-        );
-    }
-
-    /// Below the rate threshold the deviation is irrelevant.
-    #[test]
-    fn auto_keeps_the_discriminator_below_the_rate_threshold() {
-        assert!(!DemodKind::Auto.use_pll(15_360_000, 500_000.0));
-    }
-
-    /// The clamp is real: at a low rate the loop cannot reach its
-    /// nominal bandwidth, so a deviation it could otherwise track is
-    /// still out of reach.
-    #[test]
-    fn the_loop_bandwidth_clamp_is_respected() {
-        // fs / 4pi at 25 MSPS is ~1.99 MHz, so PLL_LOOP_BW_HZ binds.
-        assert!(!DemodKind::Auto.use_pll(25_000_000, 1_500_000.0));
-    }
-
-    /// Explicit flags keep meaning what they say.
-    #[test]
-    fn explicit_demod_choices_ignore_the_heuristic() {
-        assert!(DemodKind::Pll.use_pll(15_360_000, 5_000_000.0));
-        assert!(!DemodKind::Discriminator.use_pll(61_440_000, 100_000.0));
-    }
-
-    /// A degenerate deviation must not select the PLL by accident.
-    #[test]
-    fn a_degenerate_deviation_keeps_the_discriminator() {
-        assert!(!DemodKind::Auto.use_pll(25_000_000, 0.0));
-        assert!(!DemodKind::Auto.use_pll(25_000_000, -1.0));
-        assert!(!DemodKind::Auto.use_pll(25_000_000, f32::NAN));
-    }
-
-    /// A packet is a fixed 65,536 samples, so its worth depends on the
-    /// rate: 4.27 ms of signal at 15.36 MSPS against 1.07 at 61.44, for
-    /// 2.49 ms of detector against 6.41. Narrow captures get the
-    /// integration budget because there it is both more useful and
-    /// affordable.
-    #[test]
-    fn a_narrow_capture_gets_the_integration_budget() {
-        assert_eq!(detect_packets_per_hop(15_360_000.0), DETECT_PACKETS_NARROW);
-        assert_eq!(detect_packets_per_hop(30_720_000.0), DETECT_PACKETS_NARROW);
-    }
-
-    /// The review's reproduction: two transmitters, 5800 and 5820 MHz,
-    /// captured at 5800. Both score 0.95. Ranking by confidence picked
-    /// 5820 and labelled the picture after a transmitter the DDC never
-    /// passes.
-    #[test]
-    fn refinement_labels_the_carrier_being_decoded_not_the_loudest() {
-        let tuned = 5_800e6;
-        let passband = 7e6; // 5 MHz deviation + luma headroom
-        assert_eq!(
-            carrier_for_decoded_channel(vec![5_800e6, 5_820e6], tuned, passband),
-            Some(5_800e6)
-        );
-    }
-
-    /// Order must not decide it either.
-    #[test]
-    fn refinement_is_independent_of_detection_order() {
-        let tuned = 5_800e6;
-        assert_eq!(
-            carrier_for_decoded_channel(vec![5_820e6, 5_800e6], tuned, 7e6),
-            carrier_for_decoded_channel(vec![5_800e6, 5_820e6], tuned, 7e6)
-        );
-    }
-
-    /// A real offset inside the passband is still adopted — the whole
-    /// point, since the sweep may have tuned a megahertz off.
-    #[test]
-    fn refinement_adopts_a_carrier_offset_inside_the_passband() {
-        // Tuned to F7 (5860) with the carrier really near A1 (5865).
-        let got = carrier_for_decoded_channel(vec![5_863.98e6], 5_860e6, 7e6);
-        assert_eq!(got, Some(5_863.98e6));
-        assert_eq!(snap_to_nearest_fpv_channel(got.unwrap()) / 1e6, 5865.0);
-    }
-
-    /// Nothing the decoder can see means no refinement, not a guess.
-    #[test]
-    fn refinement_declines_when_every_candidate_is_out_of_band() {
-        assert_eq!(
-            carrier_for_decoded_channel(vec![5_820e6, 5_780e6], 5_800e6, 7e6),
-            None
-        );
-        assert_eq!(
-            carrier_for_decoded_channel(Vec::<f64>::new(), 5_800e6, 7e6),
-            None
-        );
-    }
-
     /// The review's case: a noisy fixture at 61.44 MSPS first detects
     /// on packet 3, which a two-packet fast pass can never reach. Some
     /// sweep has to spend more, and no per-hop prediction can decide
@@ -4383,7 +3196,7 @@ mod tests {
     fn a_sensitive_sweep_comes_round_and_reaches_packet_three() {
         let wide = 61_440_000.0;
         let budgets: Vec<usize> = (0..AARONIA_SENSITIVE_EVERY * 2)
-            .map(|n| SweepBudget::for_sweep(n, wide).packets_per_hop)
+            .map(|n| aaronia_sweep_budget(n, wide).packets_per_hop)
             .collect();
         assert!(
             budgets.iter().any(|&p| p >= 3),
@@ -4404,7 +3217,7 @@ mod tests {
     #[cfg(feature = "aaronia")]
     #[test]
     fn the_sensitive_dwell_pays_for_its_packets() {
-        let b = SweepBudget::for_sweep(AARONIA_SENSITIVE_EVERY - 1, 61_440_000.0);
+        let b = aaronia_sweep_budget(AARONIA_SENSITIVE_EVERY - 1, 61_440_000.0);
         // 6.41 ms per pass, measured at 61.44 MSPS.
         let cpu_ms = 6.41 * b.packets_per_hop as f64;
         assert!(
@@ -4421,7 +3234,7 @@ mod tests {
     fn most_sweeps_keep_the_fast_budget() {
         let wide = 61_440_000.0;
         let fast = (0..AARONIA_SENSITIVE_EVERY)
-            .filter(|&n| SweepBudget::for_sweep(n, wide).packets_per_hop == DETECT_PACKETS_PER_HOP)
+            .filter(|&n| aaronia_sweep_budget(n, wide).packets_per_hop == DETECT_PACKETS_PER_HOP)
             .count();
         assert_eq!(fast as u32, AARONIA_SENSITIVE_EVERY - 1);
     }
@@ -4432,33 +3245,15 @@ mod tests {
     #[test]
     fn a_narrow_capture_is_unaffected_by_the_cadence() {
         for n in 0..AARONIA_SENSITIVE_EVERY * 2 {
-            let b = SweepBudget::for_sweep(n, 15_360_000.0);
+            let b = aaronia_sweep_budget(n, 15_360_000.0);
             assert_eq!(b.packets_per_hop, DETECT_PACKETS_NARROW);
             assert_eq!(b.dwell, AARONIA_SCAN_DWELL);
         }
     }
 
-    /// Six passes at 61.44 MSPS is 38.5 ms of detector against a 25 ms
-    /// dwell — the hop would end before the budget was spent.
-    #[test]
-    fn a_wide_capture_keeps_the_fast_pass() {
-        assert_eq!(detect_packets_per_hop(61_440_000.0), DETECT_PACKETS_PER_HOP);
-        assert!(
-            detect_packets_per_hop(61_440_000.0) < detect_packets_per_hop(15_360_000.0),
-            "a wide capture must spend fewer passes than a narrow one"
-        );
-    }
-
-    /// A nonsense rate must not silently pick the expensive branch.
-    #[test]
-    fn a_degenerate_rate_keeps_the_fast_pass() {
-        assert_eq!(detect_packets_per_hop(0.0), DETECT_PACKETS_PER_HOP);
-        assert_eq!(detect_packets_per_hop(-1.0), DETECT_PACKETS_PER_HOP);
-        assert_eq!(detect_packets_per_hop(f64::NAN), DETECT_PACKETS_PER_HOP);
-    }
-
     /// The budget must fit the dwell, or the hop ends mid-budget and
     /// the extra packets are never read.
+    #[cfg(feature = "aaronia")]
     #[test]
     fn the_narrow_budget_fits_the_dwell() {
         // 2.49 ms per pass, measured at 15.36 MSPS.
@@ -4546,32 +3341,5 @@ mod tests {
         let wide = 17_000_000.0f32;
         let r = locked_capture_rate_hz(61_440_000.0, wide, DemodKind::Auto);
         assert_eq!(r, 61_440_000.0, "nothing below the scan rate can hold it");
-    }
-
-    /// Holdover frames must not count as observed timing evidence for channel lock.
-    /// If carrier is detected but only coasted/holdover frames are produced (no observed timing evidence),
-    /// the scanner must still release the channel after the provisional timeout.
-    #[test]
-    fn holdover_fields_do_not_prevent_undecodable_carrier_timeout() {
-        let mut lock = LockState::default();
-        let mut checks = 0;
-        let observed_timing_fields = 0u64;
-        let mut frames_at_last_check = 0u64;
-
-        // Simulate a carrier present where decoder produces holdover fields (worker_frames increments,
-        // but observed_timing_fields stays unchanged).
-        while checks < 100 {
-            let decoding = observed_timing_fields > frames_at_last_check;
-            frames_at_last_check = observed_timing_fields;
-            if lock.observe(true, decoding) {
-                break;
-            }
-            checks += 1;
-        }
-        assert_eq!(
-            checks + 1,
-            LOCK_PROVISIONAL_CHECKS,
-            "holdover fields kept the channel locked"
-        );
     }
 }

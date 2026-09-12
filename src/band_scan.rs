@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use minifb::{Key, Window, WindowOptions};
-use orecchiette_fpv_drone_analog_rs::bands::FpvBand;
 use orecchiette_fpv_drone_analog_rs::detector::ProbeEnergy;
 use orecchiette_fpv_drone_analog_rs::types::{DetectionResult, SignalType};
 
@@ -82,25 +81,6 @@ pub struct Channel {
     pub name: String,
     pub band: char,
     pub hz: f64,
-}
-
-/// The letter a band goes by on a VTX menu and in `--channel`.
-pub fn band_letter(band: FpvBand) -> char {
-    match band {
-        FpvBand::BandA => 'A',
-        FpvBand::BandB => 'B',
-        FpvBand::BandE => 'E',
-        FpvBand::Fatshark => 'F',
-        FpvBand::Raceband => 'R',
-        FpvBand::Lowband => 'L',
-        FpvBand::BandD => 'D',
-        FpvBand::Band1200 => '1',
-        FpvBand::Band3300 => '3',
-        FpvBand::Band1200Wide => 'W',
-        // `FpvBand` is non-exhaustive; a band this build does not know
-        // still gets a row.
-        _ => '-',
-    }
 }
 
 /// Height of the strip overlay in pixels.
@@ -894,8 +874,8 @@ mod tests {
             .into_iter()
             .filter(|c| (5_645e6..=5_945e6).contains(&(c.frequency_hz as f64)))
             .map(|c| Channel {
-                name: format!("{}{}", band_letter(c.band), c.channel),
-                band: band_letter(c.band),
+                name: c.name(),
+                band: c.band.code(),
                 hz: c.frequency_hz as f64,
             })
             .collect()
