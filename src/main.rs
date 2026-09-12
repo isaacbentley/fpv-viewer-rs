@@ -1,17 +1,16 @@
 mod band_scan;
+mod decode_worker;
 
 use band_scan::{BandScan, PanelMode, ScanWindow};
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use decode_worker::{DecodeWorker, DecodeWorkerConfig, FrameSlot, IqChunk, lock_slot};
 use minifb::{Key, Window, WindowOptions};
 use num_complex::Complex;
 use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
-use orecchiette_fpv_drone_analog_rs::demod::{
-    DEFAULT_DEEMPHASIS_TAU_S, Deemphasis, PllFmDemod, fm_demod, fm_demod_into,
-};
+use orecchiette_fpv_drone_analog_rs::demod::{DEFAULT_DEEMPHASIS_TAU_S, fm_demod};
 use orecchiette_fpv_drone_analog_rs::detector::{
     AnalogFpvDetector, FpvDetector, ProbeEnergy, SpectralIntegrator,
 };
-use orecchiette_fpv_drone_analog_rs::levels::estimate_cnr_db;
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
 use orecchiette_fpv_drone_analog_rs::types::SignalType;
 use orecchiette_fpv_drone_analog_rs::video::{FrameReconstructor, detect_video_standard};
@@ -1029,47 +1028,6 @@ const AARONIA_SCAN_DWELL: Duration = Duration::from_millis(25);
 #[cfg(feature = "aaronia")]
 const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
 
-/// The one frame the display will show next.
-///
-/// A bounded channel cannot express "latest wins": the producer can
-/// only add to the back, so when it is full the choice is to block (the
-/// display paces the decoder, and dropped IQ follows) or to discard the
-/// frame just produced — which keeps the *stale* ones queued. Sixty
-/// frames produced during a stall left frame 1 as the newest available.
-///
-/// A slot the producer overwrites has neither problem. It also hands
-/// back whatever it displaced, so the buffer is reused rather than
-/// allocated, and the queue depth cannot add latency because there is
-/// no queue.
-type FrameSlot = Arc<std::sync::Mutex<Option<Vec<u32>>>>;
-
-/// Lock a [`FrameSlot`], ignoring poisoning.
-///
-/// A panicking producer or consumer says nothing about whether the
-/// pixels in the slot are usable, and refusing to show video because a
-/// previous frame's thread died is worse than showing it.
-fn lock_slot(slot: &FrameSlot) -> std::sync::MutexGuard<'_, Option<Vec<u32>>> {
-    slot.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// One capture chunk on its way to the decoder, and whether the signal
-/// reaching it runs on from the last one.
-///
-/// The decoder carries state across chunk boundaries — a FIR delay
-/// line, a carried IQ sample, a field history — all of which assume the
-/// samples either side are adjacent. Two things break that, and neither
-/// used to reach the decoder: a source overrun (the flag was read once
-/// during standard classification and then dropped), and the reader
-/// discarding a chunk because the worker was behind.
-///
-/// Carrying it with the chunk rather than beside it means the decoder
-/// cannot act on the wrong one when it falls behind.
-struct IqChunk {
-    samples: Arc<orecchiette_sdr_source_rs::PooledIqBuffer>,
-    /// The stream broke immediately before this chunk.
-    discontinuous: bool,
-}
-
 // ── No-op dwell advice (single-channel, no hopping) ────────────────
 
 struct NoOpDwell;
@@ -1314,6 +1272,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
     let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let frames_decoded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_timing_fields = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let _ = run_viewer_pipeline(
         resolved_channels,
@@ -1334,6 +1293,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         exit_reason,
         tune_freq,
         frames_decoded.clone(),
+        observed_timing_fields.clone(),
         move |channel_txs, _exit_flag| {
             let _ = file.seek(SeekFrom::Start(0));
             let mut active_txs = channel_txs;
@@ -2832,6 +2792,7 @@ fn run_live(
     let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let frames_decoded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_timing_fields = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let result = run_viewer_pipeline(
         resolved_channels,
@@ -2849,6 +2810,7 @@ fn run_live(
         exit_reason.clone(),
         tune_freq,
         frames_decoded.clone(),
+        observed_timing_fields.clone(),
         move |channel_txs, exit_flag| {
             // Each consumer carries its own "the stream broke before
             // your next chunk" flag: a chunk dropped because one
@@ -2990,7 +2952,7 @@ fn run_live(
                                     <= LOCK_CARRIER_TOLERANCE_HZ
                             });
                             let produced =
-                                frames_decoded.load(std::sync::atomic::Ordering::Relaxed);
+                                observed_timing_fields.load(std::sync::atomic::Ordering::Relaxed);
                             let decoding = produced > frames_at_last_check;
                             frames_at_last_check = produced;
 
@@ -3084,6 +3046,7 @@ fn run_viewer_pipeline<F>(
     // Fields the decoder has actually reconstructed. The reader thread
     // watches this to tell a detection apart from decodable video.
     frames_decoded: Arc<std::sync::atomic::AtomicU64>,
+    observed_timing_fields: Arc<std::sync::atomic::AtomicU64>,
     reader_fn: F,
 ) -> anyhow::Result<RunLiveResult>
 where
@@ -3117,6 +3080,7 @@ where
         let frame_slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
         let producer_slot = Arc::clone(&frame_slot);
         let worker_frames = Arc::clone(&frames_decoded);
+        let worker_observed = Arc::clone(&observed_timing_fields);
         // Frame-buffer recycle pool: the UI hands spent frame buffers
         // back here so the decode worker can refill them in place
         // (`reconstruct_frame_into`) instead of allocating + zeroing a
@@ -3174,28 +3138,7 @@ where
             work_rate as f64 / 1e6
         );
 
-        #[allow(unused_mut)]
-        let mut reconstructor = FrameReconstructor::new(work_rate, is_pal, fm_deviation, debug)
-            .with_temporal_window(temporal_window);
-        // Load the denoiser once per channel (opening an ONNX session is
-        // expensive, and the `D` hotkey must toggle instantly). It is
-        // parked in `stashed_restorer` while disabled and moved back into
-        // the reconstructor when enabled, so no reload happens on toggle.
-        #[cfg(feature = "neural-vsr")]
-        let mut stashed_restorer = {
-            reconstructor = reconstructor.with_neural_restorer(&denoise_model, true);
-            if reconstructor.neural_restorer.is_none() {
-                eprintln!(
-                    "Denoiser unavailable: could not load {denoise_model} — continuing without it."
-                );
-            }
-            // Start parked unless the operator asked for it up front.
-            if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
-                None
-            } else {
-                reconstructor.neural_restorer.take()
-            }
-        };
+        let reconstructor = FrameReconstructor::new(work_rate, is_pal, fm_deviation, debug);
         let width = reconstructor.width;
         let height = reconstructor.height;
 
@@ -3297,316 +3240,36 @@ where
             }
         });
 
-        thread::spawn(move || {
-            // The down-converter is the one stage that stays at the
-            // capture rate: it reads every input sample and emits one
-            // per stride. A decimating cut needs the longer filter (see
-            // `DECODE_FIR_TAPS`); at stride 1 nothing folds, so keep the
-            // default and leave that path byte-identical.
-            let mut ddc = if decim > 1 {
-                StreamingDDC::with_taps(freq_offset, sample_rate, ddc_cutoff, DECODE_FIR_TAPS)
-            } else {
-                StreamingDDC::new(freq_offset, sample_rate, ddc_cutoff)
-            };
-            let mut shifted_iq: Vec<Complex<f32>> = Vec::new();
-            // Last DDC output sample of the previous chunk. `fm_demod`
-            // is stateless and returns n−1 samples for n inputs, so
-            // without this carry the phase transition across every
-            // chunk boundary is silently dropped (~15 ppm timebase
-            // slip). Seeding each chunk with the previous chunk's final
-            // sample makes the demod stream gapless.
-            let mut iq_carry: Option<Complex<f32>> = None;
-            // Reused per-chunk demod scratch (fm_demod_into) — a fresh
-            // ~256 KB Vec per chunk was pure allocator churn.
-            let mut demod_scratch: Vec<f32> = Vec::new();
-            // Stream-side deemphasis, applied exactly once per sample,
-            // before anything enters the persistent demod buffer — the
-            // placement the library documents (a stateful filter inside
-            // the reconstructor would re-filter the re-read tail).
-            let mut deemph = (deemphasis_tau.is_finite() && deemphasis_tau > 0.0)
-                .then(|| Deemphasis::new(work_rate, deemphasis_tau));
-            // PLL demodulator (--demod pll, or auto's >= 25 MSPS
-            // crossover): threshold extension — see DemodKind's doc
-            // for the measured numbers and the low-rate caveat. 1 MHz
-            // loop bandwidth per the weak_signal_sweep tuning.
-            // 1 MHz loop bandwidth is an absolute figure and does not
-            // scale with the rate; `use_pll` was resolved against the
-            // working rate in the setup loop.
-            let mut pll =
-                use_pll.then(|| PllFmDemod::new(work_rate, PLL_LOOP_BW_HZ, fm_deviation * 1.2));
-            let mut demod_buffer: Vec<f32> = Vec::new();
-            // A field plus its blanking, the same bound the
-            // reconstructor's own fallback path uses before it will
-            // commit to a field. ~13 ms at 15.36 MSPS, well under a
-            // field period, so gating on it costs no latency.
-            let min_samples_per_field = {
-                let line_rate = if is_pal { 15_625.0f32 } else { 15_734.0 };
-                let lines = if is_pal { 288 } else { 240 } + 22;
-                ((work_rate as f32 / line_rate) * lines as f32) as usize
-            };
-            // ~33 ms consumed before compacting, ~83 ms of live region
-            // before the valve fires, ~16 ms kept when it does.
-            let compact_after = work_rate as usize / 30;
-            let live_region_cap = work_rate as usize / 12;
-            let keep_on_skip = work_rate as usize / 60;
-            // Cursor into `demod_buffer`: live (unconsumed) samples are
-            // `demod_buffer[demod_start..]`. Advancing a cursor instead
-            // of `drain(0..consumed)` per field avoids an O(n) prefix
-            // memmove every frame; we compact in one shot once the
-            // consumed prefix grows large.
-            let mut demod_start = 0usize;
-            // Reused frame buffer; refilled in place by
-            // `reconstruct_frame_into` and swapped for a recycled/fresh
-            // one each time a completed field is shipped to the UI.
-            let mut frame_buf: Vec<u32> = vec![0u32; width * height];
-            let mut frame_count = 0u64;
-            // One-shot guard for the PAL demod-range probe. Gating on
-            // `frame_count == 0` instead floods the console: that stays
-            // true for every chunk when the field never locks.
-            let mut pal_debug_done = false;
+        let config = DecodeWorkerConfig {
+            sample_rate,
+            freq_offset,
+            ddc_cutoff,
+            decim,
+            work_rate,
+            use_pll,
+            pll_loop_bw_hz: PLL_LOOP_BW_HZ,
+            fm_deviation,
+            deemphasis_tau,
+            is_pal,
+            temporal_window,
+            debug,
+            display_mhz,
+            decode_fir_taps: DECODE_FIR_TAPS,
+            denoise_model: Some(denoise_model),
+        };
 
-            while let Ok(iq_chunk) = iq_rx.recv() {
-                if iq_chunk.discontinuous {
-                    // The stream broke before this chunk, so every
-                    // piece of state that spans a chunk boundary is now
-                    // describing a moment that no longer connects to
-                    // this one.
-                    //
-                    // The carry sample is the sharpest of them: the
-                    // discriminator takes the phase difference between
-                    // it and the first new sample, and across a gap
-                    // that difference is not a frequency — it is
-                    // whatever the signal did while nobody was looking,
-                    // rendered as one enormous spike. That reads
-                    // downstream as a sync edge, which is why a dropped
-                    // chunk could cost lock rather than a glitch.
-                    iq_carry = None;
-                    ddc.reset();
-                    if let Some(p) = pll.as_mut() {
-                        p.reset();
-                    }
-                    if let Some(d) = deemph.as_mut() {
-                        d.reset();
-                    }
-                    // Drop the partially decoded field: it now has the
-                    // far side of a gap spliced onto it.
-                    demod_buffer.clear();
-                    demod_start = 0;
-                    // Temporal denoise, dropout repair and the time-base
-                    // reference all assume consecutive views of one
-                    // scene. Holding the last good picture while sync
-                    // reacquires is better than blending across the
-                    // hole.
-                    reconstructor.forget_history();
-                    #[cfg(feature = "neural-vsr")]
-                    {
-                        reconstructor.hidden_state = None;
-                    }
-                }
-                shifted_iq.clear();
-                // The carry sample only serves the stateless
-                // discriminator; the PLL's loop state already spans
-                // chunk boundaries, and a duplicated sample would be a
-                // phase glitch to it.
-                if pll.is_none()
-                    && let Some(prev) = iq_carry
-                {
-                    shifted_iq.push(prev);
-                }
-                ddc.process_into_decimated(&iq_chunk.samples, &mut shifted_iq, decim);
-                iq_carry = shifted_iq.last().copied();
-                match pll.as_mut() {
-                    Some(p) => p.process_into(&shifted_iq, &mut demod_scratch),
-                    None => fm_demod_into(&shifted_iq, &mut demod_scratch),
-                }
-                if let Some(d) = deemph.as_mut() {
-                    d.process_in_place(&mut demod_scratch);
-                }
-
-                // Live denoiser toggle + link-quality conditioning. The
-                // CNR is measured on the DDC-filtered channel, not the
-                // raw wideband chunk, so it reflects THIS signal's link
-                // rather than the whole capture's noise floor.
-                #[cfg(feature = "neural-vsr")]
-                {
-                    let want = denoise_on.load(std::sync::atomic::Ordering::Relaxed);
-                    let have = reconstructor.neural_restorer.is_some();
-                    if want && !have {
-                        reconstructor.neural_restorer = stashed_restorer.take();
-                        // Drop temporal context accumulated before the
-                        // gap — blending across a disabled period would
-                        // mix in stale fields.
-                        reconstructor.hidden_state = None;
-                    } else if !want && have {
-                        stashed_restorer = reconstructor.neural_restorer.take();
-                    }
-                    if reconstructor.neural_restorer.is_some()
-                        && let Some(cnr) = estimate_cnr_db(&shifted_iq)
-                    {
-                        reconstructor.set_neural_noise_level(cnr);
-                    }
-                }
-
-                if debug && is_pal && !pal_debug_done && !demod_scratch.is_empty() {
-                    let min = demod_scratch.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = demod_scratch
-                        .iter()
-                        .cloned()
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let mean = demod_scratch.iter().sum::<f32>() / demod_scratch.len() as f32;
-                    eprintln!(
-                        "[PAL DEBUG] first demod chunk: min={:.4} max={:.4} mean={:.4}",
-                        min, max, mean
-                    );
-                    pal_debug_done = true;
-                }
-
-                demod_buffer.extend_from_slice(&demod_scratch);
-
-                // None ends the loop (no full field buffered yet);
-                // `frame_buf` is left untouched on the None paths (they
-                // return before writing it), so it's safe to keep for the
-                // next chunk.
-                //
-                // Only ask once a field could actually be in there.
-                // `reconstruct_frame_into` runs three full-slice passes
-                // and two full-length allocations *before* the length
-                // check that would reject a short buffer, so calling it
-                // on every chunk means most calls do all that work and
-                // return None. It costs more the more chunks a second
-                // brings: measured, reconstruction ran at 0.34 CPU-s/s
-                // fed 65,536-sample chunks and 0.75 fed the
-                // 16,384-sample chunks a 4x stride produces.
-                while demod_buffer.len() - demod_start >= min_samples_per_field {
-                    let Some(consumed) = reconstructor
-                        .reconstruct_frame_into(&demod_buffer[demod_start..], &mut frame_buf)
-                    else {
-                        break;
-                    };
-                    frame_count += 1;
-
-                    // Rate-limited debug telemetry: print per-frame
-                    // for the first 3 frames (which also get saved
-                    // as PNGs for visual inspection), then every
-                    // 30 frames thereafter (≈ once every 500 ms at
-                    // NTSC's 60-field rate). The 3-frame auto-exit
-                    // was dropped after the chroma-PLL wind-up bug
-                    // — that failure mode develops over seconds of
-                    // continuous capture and was invisible in a
-                    // 3-frame snapshot, so debug mode now keeps
-                    // running and lets you `Ctrl-C` (or `timeout`)
-                    // when you've seen enough.
-                    let metrics_due = debug && (frame_count <= 3 || frame_count.is_multiple_of(30));
-                    if metrics_due {
-                        // Envelope CNR (link-quality meter) + PLL lock
-                        // telemetry when applicable. Measured on the
-                        // DDC-filtered channel (`shifted_iq`), not the
-                        // raw capture — a wideband chunk's envelope
-                        // reflects the whole band's floor, not this
-                        // channel's link.
-                        let cnr = estimate_cnr_db(&shifted_iq)
-                            .map(|v| format!("{v:.1} dB"))
-                            .unwrap_or_else(|| "n/a".into());
-                        let lock = pll
-                            .as_ref()
-                            .map(|p| format!(" | PLLerr: {:.2} rad", p.phase_error_rms()))
-                            .unwrap_or_default();
-                        println!("[DEBUG LINK] CNRest: {cnr}{lock}");
-                        // New v0.4.37 telemetry fields:
-                        //  - SyncQ : per-field MAD-rejection-pass
-                        //    rate. 1.00 = perfect; <0.5 = dropout
-                        //    repair fires.
-                        //  - Y_avg : mean Y amplitude post-notch.
-                        //    Sudden drops mark transmitter going
-                        //    out of range / antenna blockage.
-                        //  - HistD : how full the temporal history
-                        //    is (1 → window). Denoise benefit
-                        //    scales with √HistD.
-                        println!(
-                            "[DEBUG METRICS] Frame {} | Std: {:?} | LinePer: {:.2}s | SyncQ: {:.2} | Y_avg: {:+.3} | HistD: {}",
-                            frame_count,
-                            reconstructor.video_standard(),
-                            reconstructor.line_period_samples(),
-                            reconstructor.latest_sync_quality(),
-                            reconstructor.latest_mean_amplitude(),
-                            reconstructor.history_depth(),
-                        );
-                    }
-
-                    // Snapshot the first 3 frames (startup transient,
-                    // before the line-period history + temporal denoise
-                    // settle) and frames 30-32 (steady state, ≈ 0.5 s
-                    // in) for visual inspection. The cheap RGB conversion
-                    // runs here; the PNG encode is handed to the snapshot
-                    // thread so it never stalls the decode loop.
-                    if debug && (frame_count <= 3 || (30..=32).contains(&frame_count)) {
-                        // Frequency in the filename: in Scan mode several
-                        // per-channel workers snapshot concurrently, and
-                        // an undiscriminated `fpv_frame_{n}.png` had them
-                        // racing to overwrite each other's files.
-                        let path = format!("fpv_frame_{:.0}MHz_{}.png", display_mhz, frame_count);
-                        let mut rgb_buf = vec![0u8; width * height * 3];
-                        for (i, &pixel) in frame_buf.iter().enumerate() {
-                            rgb_buf[i * 3] = ((pixel >> 16) & 0xFF) as u8;
-                            rgb_buf[i * 3 + 1] = ((pixel >> 8) & 0xFF) as u8;
-                            rgb_buf[i * 3 + 2] = (pixel & 0xFF) as u8;
-                        }
-                        let _ = snap_tx.send((path, rgb_buf, width as u32, height as u32));
-                    }
-
-                    demod_start += consumed;
-                    // Ship the just-filled frame to the UI, but never
-                    // wait for it.
-                    //
-                    // A blocking send here made the display the
-                    // decoder's pacer: two frames of queue, and a UI
-                    // that stalls stalls the decoder, which stops
-                    // draining the IQ queue, which is ten packets —
-                    // 10.7 ms of signal at 61.44 MSPS — after which the
-                    // reader discards live IQ. A dropped *frame* costs
-                    // one repeated picture; dropped *IQ* costs sync.
-                    //
-                    // So the frame goes into a slot the producer
-                    // overwrites: the UI always sees the newest one,
-                    // and whatever it had not taken yet comes back here
-                    // to be reused, which keeps the steady state
-                    // allocation-free even when the recycle pool has
-                    // run dry.
-                    // A field came out. This is the only evidence that
-                    // the signal is decodable rather than merely
-                    // present, and the lock check upstream needs it.
-                    worker_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let displaced =
-                        lock_slot(&producer_slot).replace(std::mem::take(&mut frame_buf));
-                    frame_buf = displaced
-                        .or_else(|| recycle_rx.try_recv().ok())
-                        .unwrap_or_else(|| vec![0u32; width * height]);
-                    // Wake the UI. `Full` just means it has not looked
-                    // since the last frame, which is exactly the case
-                    // the slot already handled.
-                    match frame_tx.try_send(()) {
-                        Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
-                        Err(mpsc::TrySendError::Disconnected(())) => return,
-                    }
-                }
-
-                // Amortised compaction: drop the consumed prefix in a
-                // single memmove once it's grown past the threshold,
-                // rather than once per field. Sized in time rather than
-                // samples, so decimating doesn't quietly buy four times
-                // the buffering.
-                if demod_start > compact_after {
-                    demod_buffer.drain(0..demod_start);
-                    demod_start = 0;
-                }
-                // Safety valve: if reconstruction can't keep up and the
-                // live region balloons, skip ahead (corrupts one field's
-                // sync, but bounds memory) instead of growing unbounded.
-                if demod_buffer.len() - demod_start > live_region_cap {
-                    demod_start = demod_buffer.len().saturating_sub(keep_on_skip);
-                }
-            }
-        });
+        DecodeWorker::spawn(
+            config,
+            iq_rx,
+            producer_slot,
+            frame_tx,
+            recycle_rx,
+            worker_frames,
+            worker_observed,
+            snap_tx,
+            #[cfg(feature = "neural-vsr")]
+            denoise_on,
+        );
     }
 
     if channel_txs.is_empty() {
@@ -4883,5 +4546,32 @@ mod tests {
         let wide = 17_000_000.0f32;
         let r = locked_capture_rate_hz(61_440_000.0, wide, DemodKind::Auto);
         assert_eq!(r, 61_440_000.0, "nothing below the scan rate can hold it");
+    }
+
+    /// Holdover frames must not count as observed timing evidence for channel lock.
+    /// If carrier is detected but only coasted/holdover frames are produced (no observed timing evidence),
+    /// the scanner must still release the channel after the provisional timeout.
+    #[test]
+    fn holdover_fields_do_not_prevent_undecodable_carrier_timeout() {
+        let mut lock = LockState::default();
+        let mut checks = 0;
+        let observed_timing_fields = 0u64;
+        let mut frames_at_last_check = 0u64;
+
+        // Simulate a carrier present where decoder produces holdover fields (worker_frames increments,
+        // but observed_timing_fields stays unchanged).
+        while checks < 100 {
+            let decoding = observed_timing_fields > frames_at_last_check;
+            frames_at_last_check = observed_timing_fields;
+            if lock.observe(true, decoding) {
+                break;
+            }
+            checks += 1;
+        }
+        assert_eq!(
+            checks + 1,
+            LOCK_PROVISIONAL_CHECKS,
+            "holdover fields kept the channel locked"
+        );
     }
 }
