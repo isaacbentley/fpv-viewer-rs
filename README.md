@@ -36,11 +36,12 @@ frame recycling, windows and snapshots. The profiler calls the same
   table at its true frequency, and each hit labelled with its channel,
   standard, and localized carrier. Once locked, the same data sits as a
   strip under the picture; `B` cycles strip, full panel, and off.
-- **Decoding costs the same whether the capture is wide or narrow.**
+- **Decimation reduces downstream decoding cost.**
   The video inside a capture is about 14 MHz wide, so the
   down-converter decimates as far as the channel allows before anything
   else touches the samples. A 61.44 MSPS capture decodes at 15.36 MSPS;
-  a capture already that narrow is left alone. Run
+  a capture already that narrow is left alone. Mixing, input handling,
+  and transport still scale with the capture rate. Run
   `cargo run --release --example profile_decode` to measure the actual
   decoder stages for PAL and NTSC on your machine. The reported s/s is
   elapsed processing time per second of signal; above 1.0, sustained
@@ -105,6 +106,62 @@ cargo build --release --features neural-vsr   # neural denoiser
 `neural-vsr` is disabled by default because it introduces a dependency
 on ONNX Runtime.
 
+## CPU budget and Raspberry Pi 5
+
+See the [filter optimization measurements](analysis/cpu-optimization.md)
+for the local before/after results and how to build against the optimized
+sibling decoder checkout.
+
+Linux ARM64 is a build target; this does not establish real-time performance
+on a Pi 5. A channel's decode worker runs filtering, demodulation and
+reconstruction in sequence; reconstruction uses Rayon for parallel row
+processing. Capture and display also run separately. Extra cores help those
+parallel stages, but filtering and demodulation remain serial, and a decode
+loop taking more than one second per second of signal cannot keep up.
+
+Measure on the actual Pi, using a release build and the intended capture
+rate. For example, compare HackRF's 20 MSPS with and without temporal repair:
+
+```bash
+cargo run --locked --release --example profile_decode -- \
+  --sample-rate 20000000 --seconds 30 --temporal-window 5
+cargo run --locked --release --example profile_decode -- \
+  --sample-rate 20000000 --seconds 30 --temporal-window 1
+```
+
+The profiler accepts comma-separated rates and `--chunk-size` (default
+65,536 samples). It uses synthetic PAL and NTSC bars with 5 MHz FM deviation,
+the default deemphasis, and no neural denoiser. Fixture generation is outside
+the measured interval; replay boundaries reset decoder continuity. `wall s/s`
+measures the entire decode loop, while `stage s/s` sums instrumented stages.
+These are elapsed times, not whole-system CPU percentages. A result above
+1.0 cannot sustain real time on that worker; aim below roughly 0.7 to leave
+headroom, then verify live capture, frame delivery and overruns. Synthetic
+bars do not cover every weak-signal acquisition or moving-scene workload.
+
+For lower CPU usage:
+
+- Use the lowest capture rate that still holds the full channel, including
+  the hardware's usable bandwidth and filter transition. Decimation saves
+  downstream work, but does not remove the cost of reading and mixing input.
+- Keep `--demod auto` or `--demod disc`; avoid forcing PLL for a CPU budget.
+- Try `--temporal-window 1` on a clean signal. This disables temporal noise
+  reduction and previous-field dropout repair, trading weak-signal quality
+  for less reconstruction work. Leave neural denoising and `--debug` off.
+- Start with one directly tuned channel; measure scanning separately.
+
+The [Pi 5's specifications](https://www.raspberrypi.com/products/raspberry-pi-5/)
+include four Cortex-A76 cores, USB 3 and Gigabit Ethernet. Aaronia HTTP needs
+61.44, 122.88 or 245.76 MB/s of IQ payload at 15.36, 30.72 or 61.44 MSPS
+in `f16`, respectively. Built-in Gigabit Ethernet cannot carry 61.44 MSPS;
+30.72 MSPS leaves insufficient room for normal network overhead. At the
+default 5 MHz deviation, the viewer's 80% usable-span rule requires at least
+17.5 MSPS and therefore selects 30.72 MSPS on Aaronia's rate grid after lock.
+15.36 MSPS fits the network, but is below that conservative RF requirement.
+Use faster networking or a suitable USB SDR instead of assuming a CPU
+optimization will solve a transport bottleneck. Use active cooling for
+sustained Pi benchmarks and repeat with the live source before relying on it.
+
 ## Usage
 
 Sweep the band with a USRP and tune to the strongest detected signal:
@@ -165,7 +222,7 @@ subcommand:
 | Option | Description |
 | :--- | :--- |
 | `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` includes L/D/U, both 1.2 GHz grids, 2.4 GHz and 3.3 GHz, at proportionally more tunes per sweep. |
-| `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. The RTSA server discards data once its outbound buffer passes 8 MB, so the link sets the ceiling: measured over Wi-Fi, 15.36 MSPS (61 MB/s) fell a few percent short and dropped most packets, while a wired link measured 61.44 MSPS sustained in both formats at 98–100% of nominal (484 MB/s in `f32`). This is a network limit only — decoding decimates to a fixed working rate, so a wide capture costs no more CPU than a narrow one. |
+| `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default scan rate of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. Without an explicit override, Aaronia lowers the rate after lock to fit the channel and the hardware's usable span (30.72 MSPS for the default 5 MHz deviation). The RTSA server discards data once its outbound buffer passes 8 MB. Decimation reduces downstream DSP work, but wider capture still increases transport, conversion, and mixing costs. |
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant, in seconds. Default 0.15 µs (`0.00000015`); `0` disables. It is a single pole, so its attenuation grows without limit: 0.15 µs costs 2.7 dB at 1 MHz and 11.1 dB at 4.2 MHz, where 0.75 µs costs 13.6 and 24.8 dB. NTSC luma runs to about 4.2 MHz, so a long time constant softens the picture badly — measured against a live transmitter, detail fell from 38.6 with it off to 1.6 at 0.75 µs. Lengthen it if your transmitter's pre-emphasis is strong and the picture looks noisy. |
