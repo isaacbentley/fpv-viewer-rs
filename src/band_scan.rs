@@ -302,34 +302,34 @@ impl BandScan {
         190 + self.rows.len() * 9
     }
 
-    /// The sweep ran the detector on one packet at `center_hz`.
+    /// Record a planned hop with probes relative to the measured `rf_center_hz`.
     /// `first_of_hop` is true for the first packet since a retune; that is
     /// when this tune's previous bars and hits are replaced.
     pub fn record_hop(
         &mut self,
-        center_hz: f64,
+        hop_center_hz: f64,
+        rf_center_hz: f64,
         first_of_hop: bool,
         probes: &[ProbeEnergy],
         results: &[DetectionResult],
     ) {
-        if let Some((k, _)) = self
-            .tunes
-            .iter()
-            .enumerate()
-            .min_by(|a, b| (a.1 - center_hz).abs().total_cmp(&(b.1 - center_hz).abs()))
-        {
+        if let Some((k, _)) = self.tunes.iter().enumerate().min_by(|a, b| {
+            (a.1 - hop_center_hz)
+                .abs()
+                .total_cmp(&(b.1 - hop_center_hz).abs())
+        }) {
             self.visited[k] = Some(Instant::now());
             self.active_tune = Some(k);
         }
         if first_of_hop {
             let half = self.span_hz / 2.0 + PROBE_STEP_HZ;
             self.energies
-                .retain(|k, _| ((*k as f64) * 1e5 - center_hz).abs() > half);
+                .retain(|k, _| ((*k as f64) * 1e5 - hop_center_hz).abs() > half);
             self.detections
-                .retain(|(hop, _)| (*hop - center_hz).abs() > 1.0);
+                .retain(|(hop, _)| (*hop - hop_center_hz).abs() > 1.0);
         }
         for p in probes {
-            let key = ((center_hz + p.offset_hz) / 1e5).round() as i64;
+            let key = ((rf_center_hz + p.offset_hz) / 1e5).round() as i64;
             self.energies.insert(key, p.energy);
         }
         for r in results {
@@ -341,10 +341,10 @@ impl BandScan {
             {
                 Some(slot) => {
                     if r.rssi_dbm > slot.1.rssi_dbm || r.confidence > slot.1.confidence {
-                        *slot = (center_hz, r.clone());
+                        *slot = (hop_center_hz, r.clone());
                     }
                 }
-                None => self.detections.push((center_hz, r.clone())),
+                None => self.detections.push((hop_center_hz, r.clone())),
             }
         }
     }
@@ -920,19 +920,57 @@ mod tests {
     fn revisiting_a_tune_replaces_only_its_own_bars_and_hits() {
         let mut b = BandScan::new(band58());
         b.set_plan(vec![5.7e9, 5.8e9], 49e6);
-        b.record_hop(5.7e9, true, &probes(9), &[hit(5.695e9, -60.0, 0.95)]);
-        b.record_hop(5.8e9, true, &probes(9), &[hit(5.806e9, -70.0, 0.8)]);
+        b.record_hop(5.7e9, 5.7e9, true, &probes(9), &[hit(5.695e9, -60.0, 0.95)]);
+        b.record_hop(5.8e9, 5.8e9, true, &probes(9), &[hit(5.806e9, -70.0, 0.8)]);
         assert_eq!(b.energies.len(), 18);
         assert_eq!(b.detections.len(), 2);
         // Second pass over the first tune: it is quiet now.
-        b.record_hop(5.7e9, true, &probes(9), &[]);
+        b.record_hop(5.7e9, 5.7e9, true, &probes(9), &[]);
         assert_eq!(b.energies.len(), 18);
         let left: Vec<u64> = b.detections.iter().map(|(_, d)| d.frequency_hz).collect();
         assert_eq!(left, vec![5_806_000_000]);
         // A second packet of the same hop merges rather than replaces.
-        b.record_hop(5.8e9, false, &probes(9), &[hit(5.806e9, -65.0, 0.95)]);
+        b.record_hop(
+            5.8e9,
+            5.8e9,
+            false,
+            &probes(9),
+            &[hit(5.806e9, -65.0, 0.95)],
+        );
         assert_eq!(b.detections.len(), 1);
         assert_eq!(b.detections[0].1.rssi_dbm, -65.0);
+    }
+
+    #[test]
+    fn measured_frequency_positions_probes_while_planned_hop_owns_hits() {
+        let mut b = BandScan::new(band58());
+        let planned = 5.8e9;
+        let measured = planned - 250_000.0;
+        b.set_plan(vec![planned], 49e6);
+        let probes = [ProbeEnergy {
+            offset_hz: 100_000.0,
+            energy: 1e-8,
+            confidence: 0.0,
+        }];
+        b.record_hop(
+            planned,
+            measured,
+            true,
+            &probes,
+            &[hit(measured, -60.0, 0.95)],
+        );
+        assert_eq!(b.active_tune, Some(0));
+        assert!(b.visited[0].is_some());
+        let actual_bin = ((measured + probes[0].offset_hz) / 1e5).round() as i64;
+        let snapped_bin = ((planned + probes[0].offset_hz) / 1e5).round() as i64;
+        assert_eq!(b.energies.get(&actual_bin), Some(&probes[0].energy));
+        assert!(!b.energies.contains_key(&snapped_bin));
+        assert_eq!(b.detections[0].1.frequency_hz, measured as u64);
+
+        // A later visit with a different PLL offset still replaces this hop's hits.
+        b.record_hop(planned, measured + 100_000.0, true, &[], &[]);
+        assert!(b.detections.is_empty());
+        assert!(b.energies.is_empty());
     }
 
     #[test]
@@ -959,7 +997,13 @@ mod tests {
     fn drawing_stays_inside_every_buffer_it_is_given() {
         let mut b = BandScan::new(band58());
         b.set_plan(vec![5.67e9, 5.72e9, 5.77e9, 5.82e9, 5.87e9, 5.92e9], 49e6);
-        b.record_hop(5.87e9, true, &probes(9), &[hit(5.865e9, -55.0, 0.95)]);
+        b.record_hop(
+            5.87e9,
+            5.87e9,
+            true,
+            &probes(9),
+            &[hit(5.865e9, -55.0, 0.95)],
+        );
         b.set_lock(Some(5.865e9));
         let mut skipped = HashSet::new();
         skipped.insert(5_806_000_000u64);

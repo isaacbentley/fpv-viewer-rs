@@ -438,6 +438,18 @@ fn build_scan_hops(sample_rate: f64, bands: ScanBands) -> Vec<f64> {
     plan_tune_centers(&channels, sample_rate * USABLE_SPAN_FRACTION)
 }
 
+/// Snap an observed packet centre frequency to the nearest expected hop frequency
+/// within tolerance (1 MHz). Hardware synthesisers (such as Aaronia over HTTP metadata)
+/// can report exact PLL frequencies with small fractional offsets from the commanded centre.
+/// Use this only for hop bookkeeping; DSP must use the packet's measured RF centre.
+fn snap_to_nearest_hop(freq_hz: f64, hops: &[f64]) -> u64 {
+    hops.iter()
+        .min_by(|a, b| (freq_hz - **a).abs().total_cmp(&(freq_hz - **b).abs()))
+        .filter(|&&nearest| (freq_hz - nearest).abs() <= 1_000_000.0)
+        .map(|&nearest| nearest as u64)
+        .unwrap_or(freq_hz as u64)
+}
+
 /// Resolve --channel to a centre frequency in Hz.
 fn resolve_channel(ch: &str) -> anyhow::Result<f64> {
     // Try channel name first
@@ -1084,7 +1096,9 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         }
                     };
                     {
-                        let center = packet.center_frequency_hz as u64;
+                        let rf_center = packet.center_frequency_hz as u64;
+                        let hop_center =
+                            snap_to_nearest_hop(packet.center_frequency_hz, &hop_freqs);
 
                         // Pump the scan window on every packet, drained
                         // ones included, so it stays responsive.
@@ -1109,13 +1123,13 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         // With a single tune the source never retunes, so
                         // there is no boundary to observe and no hop to
                         // drain for; every packet is processed.
-                        let Some(hop) = progress.observe(center) else {
+                        let Some(hop) = progress.observe(hop_center) else {
                             continue;
                         };
 
                         let results = detector.detect_from_iq_integrated_with_probes(
                             &packet.samples,
-                            center,
+                            rf_center,
                             current_sample_rate as u32,
                             &mut sweep.integrator,
                             &mut probes,
@@ -1123,7 +1137,8 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                         // With one tune there is no retune to mark a new
                         // look, so every packet replaces the last.
                         sweep.band.record_hop(
-                            center as f64,
+                            hop_center as f64,
+                            rf_center as f64,
                             hop.first_packet || !multi_hop,
                             &probes,
                             &results,
@@ -1216,9 +1231,13 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                         }
                                     };
                                     {
-                                        let center = packet.center_frequency_hz as u64;
+                                        let rf_center = packet.center_frequency_hz as u64;
+                                        let hop_center = snap_to_nearest_hop(
+                                            packet.center_frequency_hz,
+                                            &candidates,
+                                        );
 
-                                        let Some(ft_hop) = ft_progress.observe(center) else {
+                                        let Some(ft_hop) = ft_progress.observe(hop_center) else {
                                             continue;
                                         };
 
@@ -1231,7 +1250,7 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
                                         if let Some(res) = detector
                                             .detect_from_iq(
                                                 &packet.samples,
-                                                center,
+                                                rf_center,
                                                 current_sample_rate as u32,
                                             )
                                             .first()
@@ -1241,14 +1260,14 @@ fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
 
                                         println!(
                                             "  → Testing {:.3} MHz ({}): conf {:.0}%, rssi {:.1} dBm",
-                                            center as f64 / 1e6,
-                                            get_fpv_channel_name(center as f64 / 1e6)
+                                            hop_center as f64 / 1e6,
+                                            get_fpv_channel_name(hop_center as f64 / 1e6)
                                                 .unwrap_or("Unknown"),
                                             conf * 100.0,
                                             rssi
                                         );
 
-                                        ft_selector.consider(center as f64, conf, rssi);
+                                        ft_selector.consider(hop_center as f64, conf, rssi);
 
                                         if ft_hop.sweep_complete {
                                             (ft_handle.stop)();
@@ -1699,7 +1718,8 @@ fn scan_band_for_channel(
     loop {
         match handle.receiver.recv_timeout(Duration::from_millis(2000)) {
             Ok(packet) => {
-                let center = packet.center_frequency_hz as u64;
+                let rf_center = packet.center_frequency_hz as u64;
+                let hop_center = snap_to_nearest_hop(packet.center_frequency_hz, &hop_freqs);
                 // Pump the scan window on every packet, drained ones
                 // included, so it stays responsive through a long dwell.
                 if let Some(ui) = sweep.ui.as_mut()
@@ -1714,20 +1734,30 @@ fn scan_band_for_channel(
                 // sweep is complete rather than clearing `seen` and going
                 // round again, so a one-tune plan finishes on its first
                 // packet and can never sit draining.
-                let Some(hop) = progress.observe(center) else {
+                let Some(hop) = progress.observe(hop_center) else {
                     continue;
                 };
 
                 let results = detector.detect_from_iq_integrated_with_probes(
                     &packet.samples,
-                    center,
+                    rf_center,
                     sample_rate as u32,
                     &mut sweep.integrator,
                     &mut probes,
                 );
-                sweep
-                    .band
-                    .record_hop(center as f64, hop.first_packet, &probes, &results);
+                sweep.band.record_hop(
+                    hop_center as f64,
+                    rf_center as f64,
+                    hop.first_packet,
+                    &probes,
+                    &results,
+                );
+                if let Some(ui) = sweep.ui.as_mut()
+                    && !ui.update(&sweep.band)
+                {
+                    (handle.stop)();
+                    return Ok(ScanOutcome::Quit);
+                }
 
                 for res in results {
                     if selector.consider(&res) {
@@ -3341,5 +3371,17 @@ mod tests {
         let wide = 17_000_000.0f32;
         let r = locked_capture_rate_hz(61_440_000.0, wide, DemodKind::Auto);
         assert_eq!(r, 61_440_000.0, "nothing below the scan rate can hold it");
+    }
+
+    /// Snapping to the nearest planned hop absorbs hardware PLL fractional offsets.
+    #[test]
+    fn snap_to_nearest_hop_absorbs_fractional_offset() {
+        let hops = vec![1_200_000_000.0, 3_312_500_000.0, 5_800_000_000.0];
+        // Typical Aaronia Spectran V6 ECO PLL frequency with -2.6 kHz offset
+        let observed = 3_312_497_366.4;
+        assert_eq!(snap_to_nearest_hop(observed, &hops), 3_312_500_000);
+        // Distant unexpected frequency is kept as-is
+        let foreign = 2_400_000_000.0;
+        assert_eq!(snap_to_nearest_hop(foreign, &hops), 2_400_000_000);
     }
 }
