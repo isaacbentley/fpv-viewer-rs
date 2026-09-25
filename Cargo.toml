@@ -7,7 +7,7 @@ description = "A real-time cross-SDR viewer for analog FPV drone video signals"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-orecchiette-fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git", tag = "v0.9.0" }
+orecchiette-fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git", rev = "a80d55f1e5cedeafc3f42f450e055c5d2a4ba3c8" }
 orecchiette-sdr-source-rs = "0.1.3"
 orecchiette-sdr-usrp-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-usrp-rs.git", branch = "main" }
 orecchiette-sdr-hackrf-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-hackrf-rs.git", branch = "main" }

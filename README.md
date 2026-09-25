@@ -282,7 +282,8 @@ Channel names come from the shared catalog: A/B/E/F/R/L/D/U plus `N` (narrow
 channel-entry prompt, a prefix such as `S6` waits for a second digit; press
 Enter for S6 or continue typing S60–S64. Backspace edits the entry.
 
-The release manifest pins the analog crate to `v0.9.0`. For local co-development,
+The release manifest pins the analog crate to commit `a80d55f`, the first commit
+after `v0.9.0`, which carries the SIMD DDC optimization. For local co-development,
 pass a Cargo command-line patch instead of committing a machine-specific path:
 
 ```bash
