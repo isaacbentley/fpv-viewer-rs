@@ -5,3 +5,4 @@
 fpv_frame_*.png
 .DS_Store
 analysis/measurements/
+analysis/cpu-optimization.md

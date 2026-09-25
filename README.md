@@ -108,9 +108,17 @@ on ONNX Runtime.
 
 ## CPU budget and Raspberry Pi 5
 
-See the [filter optimization measurements](analysis/cpu-optimization.md)
-for the local before/after results and how to build against the optimized
-sibling decoder checkout.
+Measured locally on an Apple M4 with the profiler described below, the
+decoder crate's down-converter and reconstruction optimization (commit
+`a80d55f`, the first after `v0.9.0`) cut the decode loop from 0.64–0.83 to
+0.43–0.56 s/s at 15.36, 30.72 and 61.44 MSPS: the down-converter stage
+roughly halved at decimation 1 and 4, and reconstruction fell by about a
+quarter. The profiler decodes a centred channel; a channel locked from a
+sweep is mixed at the offset the detector measured and gains less in the
+down-converter. The co-development note near the end of this README gives
+the Cargo command-line patch for building against a sibling decoder
+checkout; it applies to `cargo build` and `cargo run` as it does to
+`cargo check`.
 
 Linux ARM64 is a build target; this does not establish real-time performance
 on a Pi 5. A channel's decode worker runs filtering, demodulation and
