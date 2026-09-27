@@ -16,10 +16,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # No Windows job: the USRP backend links libuhd via pkg-config and
-      # the Windows runners have no unattended UHD install, so the build
-      # can never link there. Windows users build from source with UHD
-      # installed (see README).
+      # No Windows job: the SoapySDR backend links libSoapySDR via
+      # pkg-config and the Windows runners have no unattended SoapySDR
+      # install. Windows users build from source with SoapySDR installed,
+      # or with `--no-default-features --features aaronia` (see README).
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
@@ -29,19 +29,19 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+          sudo apt-get install -y libsoapysdr-dev cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
 
       - name: Install macOS Dependencies
         if: runner.os == 'macOS'
-        run: brew install uhd
+        run: brew install soapysdr
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      # Default features, which include `aaronia`. The AARTSAAPI SDK is
-      # resolved at runtime, not link time, so the backend builds and
-      # tests here without one installed.
+      # Default features: `soapy` and `aaronia`. The AARTSAAPI SDK is
+      # resolved at runtime, not link time, so the Aaronia backend builds
+      # and tests here without one installed.
       - name: cargo test
         run: cargo test --locked
 
@@ -54,7 +54,7 @@ jobs:
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libuhd-dev uhd-host cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
+          sudo apt-get install -y libsoapysdr-dev cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,3 +68,11 @@ jobs:
       # Default features — see the note on the test job.
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Each backend alone, and neither: the cfg gates must hold up
+      # without the other feature switched on.
+      - name: cargo clippy (per backend)
+        run: |
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features --features soapy -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features --features aaronia -- -D warnings

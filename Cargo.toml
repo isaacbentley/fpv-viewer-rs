@@ -1,6 +1,6 @@
 [package]
 name = "fpv-viewer"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
@@ -8,17 +8,23 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 orecchiette-fpv-drone-analog-rs = { git = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git", rev = "a80d55f1e5cedeafc3f42f450e055c5d2a4ba3c8" }
-orecchiette-sdr-source-rs = "0.1.3"
-orecchiette-sdr-usrp-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-usrp-rs.git", branch = "main" }
-orecchiette-sdr-hackrf-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-hackrf-rs.git", branch = "main" }
-# Optional: links against the native AARTSAAPI SDK, which most build
-# hosts (and CI) don't have — enable with `--features aaronia`. For
-# local co-development against a sibling checkout, add:
+# SoapySDR: links the system libSoapySDR (found via pkg-config); the
+# device itself is reached through whichever SoapySDR module drives it
+# (SoapyHackRF, SoapyUHD, ...), installed separately.
+soapysdr = { version = "0.5.1", optional = true }
+# Default features off: the crate's `sdr-source` facade pulls in a
+# source trait this viewer does not use — it drives the unified source
+# itself (`src/sdr/aaronia.rs`). `http` + `file` are what the unified
+# source needs; `native-sdk` adds `aaronia sdk`. For local
+# co-development against a sibling checkout, add:
 #   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
 #   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
-sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.11.1", features = [
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.11.1", default-features = false, features = [
+    "http",
+    "file",
     "native-sdk",
 ], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -30,13 +36,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0"
 
 [features]
-default = ["aaronia"]
+default = ["soapy", "aaronia"]
+# SoapySDR backend (`soapy` subcommand): HackRF, USRP, LimeSDR and any
+# other device with a SoapySDR module. Needs libSoapySDR to build.
+soapy = ["dep:soapysdr"]
 # Aaronia Spectran V6 backend (`aaronia` subcommand). On by default: the
 # AARTSAAPI SDK is resolved at *runtime*, not link time (the binary
 # carries no dynamic reference to it), so building needs no SDK — and
 # the HTTP backend never needs it at all, only `aaronia sdk` does.
-# `--no-default-features` restores the old lean build.
-aaronia = ["dep:sdr-aaronia-rs"]
+# `--no-default-features` builds with neither backend: file replay only.
+aaronia = ["dep:sdr-aaronia-rs", "dep:tokio"]
 # Neural temporal denoiser (`--denoise`, toggled live with `D`). Off by
 # default: it pulls in ONNX Runtime, and the denoiser is a win under
 # impairment but a small cost on a clean signal — see the analog crate's

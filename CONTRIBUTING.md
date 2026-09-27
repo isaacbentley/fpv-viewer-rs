@@ -16,25 +16,36 @@ cargo fmt --all --check
 
 CI runs `cargo test`, `cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --all --check` (all `--locked`) on the `stable` toolchain,
-for `ubuntu-latest` and `macos-latest`. There is no Windows job: the
-USRP backend links `libuhd` via pkg-config and the runners have no
-unattended UHD install.
+for `ubuntu-latest` and `macos-latest`, with SoapySDR installed from
+the system package manager. There is no Windows job: the SoapySDR
+backend links `libSoapySDR`, and the runners have no unattended
+SoapySDR install.
 
 The crate declares `rust-version = "1.89"`, set by `wide` and
 `safe_arch` in the dependency tree.
 
-### The `aaronia` feature
+### The backend features
 
-The Aaronia Spectran V6 backend is **on by default**
-(`default = ["aaronia"]`), so CI builds and tests it. The AARTSAAPI SDK
-is resolved at runtime, not link time, so building requires no SDK. Only
-`aaronia sdk` needs one, at run time, on the machine running it; the
-`aaronia http` backend needs no SDK at all.
+Both SDR backends are features, and both are **on by default**
+(`default = ["soapy", "aaronia"]`), so CI builds and tests them. They
+share one capture interface in `src/sdr/`: a backend starts a capture
+thread and hands the viewer `IqPacket`s over a channel.
 
-`--no-default-features` builds without the backend.
+- `soapy` links `libSoapySDR` (via `pkg-config`), so building needs it
+  installed — `libsoapysdr-dev` or `brew install soapysdr`. Talking to a
+  radio also needs that radio's SoapySDR module, at run time only.
+- `aaronia` drives `sdr-aaronia-rs`'s unified source directly, with the
+  crate's own default features (and its `sdr-source` facade) off. The
+  AARTSAAPI SDK is resolved at runtime, not link time, so building
+  requires no SDK. Only `aaronia sdk` needs one, at run time, on the
+  machine running it; the `aaronia http` backend needs no SDK at all.
 
-To co-develop against a local checkout of `sdr-aaronia-rs`, uncomment
-the `[patch]` block in `Cargo.toml`.
+`--no-default-features` builds with neither (file replay only); add one
+back with `--features soapy` or `--features aaronia`. Clippy should pass
+for each of those combinations, not only the default.
+
+To co-develop against a local checkout of `sdr-aaronia-rs`, add the
+`[patch]` block shown in the comment above its entry in `Cargo.toml`.
 
 ## Adding features or fixing bugs
 

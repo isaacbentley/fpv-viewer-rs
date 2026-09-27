@@ -4,8 +4,8 @@
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/fpv-viewer-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
 A real-time desktop viewer for analog FPV drone video, supporting live
-capture from USRP, HackRF, and Aaronia hardware as well as offline
-playback of recorded files.
+capture from any SoapySDR device (HackRF, USRP, LimeSDR, ...) and from
+Aaronia Spectran hardware, as well as offline playback of recorded files.
 
 Signal processing is provided by
 [orecchiette-fpv-drone-analog-rs](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs);
@@ -17,8 +17,10 @@ frame recycling, windows and snapshots. The profiler calls the same
 
 ## Features
 
-- **Multiple SDR backends.** Ettus USRP, HackRF One, and the Aaronia
-  Spectran V6 — over the RTSA HTTP interface or the native SDK.
+- **Two SDR backends.** [SoapySDR](https://github.com/pothosware/SoapySDR),
+  which reaches HackRF One, Ettus USRP (through SoapyUHD), LimeSDR and any
+  other radio with a SoapySDR module; and the Aaronia Spectran V6 — over
+  the RTSA HTTP interface or the native SDK.
 - **Offline playback.** SigMF datasets (`.sigmf-meta` and `.sigmf-data`)
   and raw interleaved cf32 I/Q files.
 - **Automatic band sweep on every backend.** Scans the 5.8 GHz FPV band
@@ -72,18 +74,29 @@ frame recycling, windows and snapshots. The profiler calls the same
 
 ## Platform support
 
-- **Linux** — all SDRs and offline playback. Prebuilt release binaries
-  target aarch64 (Raspberry Pi 5 class).
-- **macOS** — HackRF, USRP, offline playback, and Aaronia over the RTSA
+- **Linux** — both backends and offline playback. Prebuilt release
+  binaries target aarch64 (Raspberry Pi 5 class).
+- **macOS** — SoapySDR, offline playback, and Aaronia over the RTSA
   HTTP interface. Prebuilt release DMGs target Apple Silicon. Only the
   Aaronia native-SDK path (`aaronia sdk`) is unavailable on macOS.
-- **Windows** — builds from source with UHD installed. No prebuilt
-  binaries, as CI has no unattended UHD installation for Windows.
+- **Windows** — builds from source with SoapySDR installed (for example
+  from PothosSDR or radioconda), or without it using
+  `--no-default-features --features aaronia`. No prebuilt binaries.
 
 ## Installation
 
-Install the relevant SDR drivers first, such as UHD for USRP or `hackrf`
-for HackRF One.
+Building needs the SoapySDR library (found through `pkg-config`), and
+running a radio through it needs that radio's SoapySDR module:
+
+```bash
+brew install soapysdr soapyhackrf                         # macOS
+sudo apt install libsoapysdr-dev soapysdr-module-hackrf   # Debian/Ubuntu
+```
+
+A USRP goes through SoapyUHD: `soapysdr-module-uhd` on Debian/Ubuntu;
+Homebrew does not package it, so on macOS build it from
+[source](https://github.com/pothosware/SoapyUHD) against Homebrew's
+`uhd`. `SoapySDRUtil --find` lists the radios SoapySDR can see.
 
 ```bash
 git clone https://github.com/isaacbentley/fpv-viewer-rs.git
@@ -91,11 +104,13 @@ cd fpv-viewer-rs
 cargo build --release
 ```
 
-The Aaronia backend is included by default. The AARTSAAPI SDK is
-resolved at runtime rather than link time, so building requires nothing
-extra — and the RTSA HTTP backend needs no SDK at all; only
-`aaronia sdk` does, on the machine running it. `--no-default-features`
-restores the lean build without the backend.
+Both backends are features, and both are on by default: `soapy` and
+`aaronia`. The AARTSAAPI SDK is resolved at runtime rather than link
+time, so the Aaronia backend needs nothing extra to build — and the RTSA
+HTTP backend needs no SDK at all; only `aaronia sdk` does, on the
+machine running it. Leave either out with `--no-default-features` and
+`--features` (`--no-default-features --features aaronia` builds without
+SoapySDR); with neither, the viewer only replays files.
 
 One optional feature:
 
@@ -128,7 +143,7 @@ parallel stages, but filtering and demodulation remain serial, and a decode
 loop taking more than one second per second of signal cannot keep up.
 
 Measure on the actual Pi, using a release build and the intended capture
-rate. For example, compare HackRF's 20 MSPS with and without temporal repair:
+rate. For example, compare a HackRF's 20 MSPS with and without temporal repair:
 
 ```bash
 cargo run --locked --release --example profile_decode -- \
@@ -172,16 +187,23 @@ sustained Pi benchmarks and repeat with the live source before relying on it.
 
 ## Usage
 
-Sweep the band with a USRP and tune to the strongest detected signal:
+Sweep the band with the first SoapySDR radio found and tune to the
+strongest detected signal:
 
 ```bash
-cargo run --release -- usrp
+cargo run --release -- soapy
 ```
 
-Tune a HackRF directly to channel R8 (5,917 MHz):
+Tune a HackRF directly to channel R8 (5,917 MHz), setting its gain stages:
 
 ```bash
-cargo run --release -- hackrf --channel R8
+cargo run --release -- soapy --device driver=hackrf --gain-element LNA=16 --gain-element VGA=20 --channel R8
+```
+
+Sweep with a USRP B2xx through SoapyUHD:
+
+```bash
+cargo run --release -- soapy --device driver=uhd,type=b200 --antenna RX2 --gain 40
 ```
 
 Replay a capture, reading the `.sigmf-meta` sidecar automatically when
@@ -216,13 +238,12 @@ Usage: fpv-viewer <COMMAND>
 
 Commands:
   file     Replay a SigMF or raw IQ file
-  usrp     Live capture from an Ettus USRP B2xx
-  hackrf   Live capture from a HackRF One
+  soapy    Live capture from any SoapySDR device (HackRF, USRP, LimeSDR, ...)
   aaronia  Live capture from an Aaronia Spectran V6
 ```
 
-The `aaronia` subcommand is present in default builds; it is absent
-only from `--no-default-features` builds.
+`soapy` and `aaronia` are present in default builds; each is absent from
+a build without its feature.
 
 Frequently used options, with the full set available from `--help` on any
 subcommand:
@@ -230,7 +251,10 @@ subcommand:
 | Option | Description |
 | :--- | :--- |
 | `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` includes L/D/U, both 1.2 GHz grids, 2.4 GHz and 3.3 GHz, at proportionally more tunes per sweep. |
-| `--sample-rate <hz>` | Override the capture rate. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default scan rate of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. Without an explicit override, Aaronia lowers the rate after lock to fit the channel and the hardware's usable span (30.72 MSPS for the default 5 MHz deviation). The RTSA server discards data once its outbound buffer passes 8 MB. Decimation reduces downstream DSP work, but wider capture still increases transport, conversion, and mixing costs. |
+| `--sample-rate <hz>` | Override the capture rate. SoapySDR defaults to 25 MSPS, or the device's maximum where that is lower (20 MSPS on a HackRF), and uses the rate the device actually settles on. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default scan rate of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. Without an explicit override, Aaronia lowers the rate after lock to fit the channel and the hardware's usable span (30.72 MSPS for the default 5 MHz deviation). The RTSA server discards data once its outbound buffer passes 8 MB. Decimation reduces downstream DSP work, but wider capture still increases transport, conversion, and mixing costs. |
+| `--device <args>` | SoapySDR only: device arguments, e.g. `driver=hackrf` or `driver=uhd,type=b200`. Empty (default) opens the first device found. |
+| `--gain <db>`, `--gain-element <NAME=DB>`, `--agc` | SoapySDR only: overall gain, individual gain stages (repeatable; HackRF has `LNA`, `VGA` and `AMP`), or automatic gain control. With none, the driver's own gains stay. |
+| `--antenna <name>`, `--bandwidth <hz>`, `--setting <KEY=VALUE>` | SoapySDR only: antenna port, analog filter bandwidth, and driver settings (repeatable; a HackRF's bias-tee is `--setting bias_tx=true`). |
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant, in seconds. Default 0.15 µs (`0.00000015`); `0` disables. It is a single pole, so its attenuation grows without limit: 0.15 µs costs 2.7 dB at 1 MHz and 11.1 dB at 4.2 MHz, where 0.75 µs costs 13.6 and 24.8 dB. NTSC luma runs to about 4.2 MHz, so a long time constant softens the picture badly — measured against a live transmitter, detail fell from 38.6 with it off to 1.6 at 0.75 µs. Lengthen it if your transmitter's pre-emphasis is strong and the picture looks noisy. |

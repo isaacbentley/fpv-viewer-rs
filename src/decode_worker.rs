@@ -13,7 +13,7 @@ pub fn lock_slot(slot: &FrameSlot) -> std::sync::MutexGuard<'_, Option<Vec<u32>>
 
 /// Transport ownership stays outside the hardware-independent decoder crate.
 pub struct IqChunk {
-    pub samples: Arc<orecchiette_sdr_source_rs::PooledIqBuffer>,
+    pub samples: Arc<crate::sdr::IqBuffer>,
     pub discontinuous: bool,
 }
 
@@ -291,9 +291,7 @@ mod tests {
 
     fn chunk(samples: &[Complex<f32>], discontinuous: bool) -> IqChunk {
         IqChunk {
-            samples: Arc::new(orecchiette_sdr_source_rs::PooledIqBuffer::new_unpooled(
-                samples.to_vec(),
-            )),
+            samples: Arc::new(crate::sdr::IqBuffer::new_unpooled(samples.to_vec())),
             discontinuous,
         }
     }

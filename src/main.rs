@@ -1,5 +1,13 @@
+// A build with neither live backend is file replay only, and the live
+// pipeline it cannot reach would otherwise be one long dead-code warning.
+#![cfg_attr(
+    not(any(feature = "soapy", feature = "aaronia")),
+    allow(dead_code, unused_imports)
+)]
+
 mod band_scan;
 mod decode_worker;
+mod sdr;
 
 use band_scan::{BandScan, PanelMode, ScanWindow};
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -14,17 +22,18 @@ use orecchiette_fpv_drone_analog_rs::decode::{
     DecodePlan, DecoderConfig, DemodulationMode, LUMA_HEADROOM_HZ, decode_decimation,
 };
 use orecchiette_fpv_drone_analog_rs::demod::DEFAULT_DEEMPHASIS_TAU_S;
-use orecchiette_fpv_drone_analog_rs::detector::{FpvDetector, ProbeEnergy, SpectralIntegrator};
+use orecchiette_fpv_drone_analog_rs::detector::{ProbeEnergy, SpectralIntegrator};
 use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
+#[cfg(feature = "soapy")]
+use orecchiette_fpv_drone_analog_rs::scanner::detect_packets_per_hop;
 use orecchiette_fpv_drone_analog_rs::scanner::{
-    CandidatePolicy, DETECT_PACKETS_PER_HOP, FineTuneSelector, ScanProgress, ScanSelector,
-    SweepBudget, plan_tune_centers,
+    CandidatePolicy, ScanProgress, ScanSelector, SweepBudget, plan_tune_centers,
 };
-#[cfg(any(test, feature = "aaronia"))]
-use orecchiette_fpv_drone_analog_rs::scanner::{DETECT_PACKETS_NARROW, detect_packets_per_hop};
+#[cfg(feature = "aaronia")]
+use orecchiette_fpv_drone_analog_rs::scanner::{DETECT_PACKETS_NARROW, DETECT_PACKETS_PER_HOP};
 use orecchiette_fpv_drone_analog_rs::types::SignalType;
 use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
-use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
+use sdr::{SdrSource, SourceConfig};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -46,10 +55,9 @@ struct Cli {
 enum SourceCmd {
     /// Replay a SigMF or raw IQ file.
     File(FileArgs),
-    /// Live capture from an Ettus USRP B2xx.
-    Usrp(UsrpArgs),
-    /// Live capture from a HackRF One.
-    Hackrf(HackrfArgs),
+    /// Live capture from any SoapySDR device (HackRF, USRP, LimeSDR, ...).
+    #[cfg(feature = "soapy")]
+    Soapy(SoapyArgs),
     /// Live capture from an Aaronia Spectran V6.
     #[cfg(feature = "aaronia")]
     #[command(subcommand)]
@@ -121,8 +129,9 @@ struct LiveArgs {
     /// Force video standard instead of auto-detecting.
     #[arg(long, value_parser = parse_standard)]
     standard: Option<SignalType>,
-    /// Override sample rate (Hz). Defaults per backend: USRP 25 MSPS,
-    /// HackRF 20 MSPS (its USB 2.0 ceiling), Aaronia 61.44 MSPS (it runs 61.44 MHz over powers of two, down to 120 kSPS).
+    /// Override sample rate (Hz). Defaults per backend: SoapySDR 25 MSPS
+    /// or the device's maximum if lower (HackRF: 20 MSPS), Aaronia
+    /// 61.44 MSPS (it runs 61.44 MHz over powers of two, down to 120 kSPS).
     #[arg(long)]
     sample_rate: Option<f64>,
     /// Which bands the auto-scan sweeps. '5.8' (default) covers
@@ -468,42 +477,66 @@ fn resolve_channel(ch: &str) -> anyhow::Result<f64> {
     );
 }
 
-// ── USRP subcommand ────────────────────────────────────────────────
+// ── SoapySDR subcommand ────────────────────────────────────────────
 
+#[cfg(feature = "soapy")]
 #[derive(ClapArgs, Debug)]
-struct UsrpArgs {
+struct SoapyArgs {
     #[command(flatten)]
     live: LiveArgs,
-    /// UHD device args (e.g. "type=b200").
+    /// SoapySDR device arguments, e.g. "driver=hackrf" or
+    /// "driver=uhd,type=b200". Empty opens the first device found;
+    /// `SoapySDRUtil --find` lists what is attached.
     #[arg(long, default_value = "")]
-    args: String,
-    /// RX gain in dB.
-    #[arg(long, default_value_t = 40.0)]
-    gain: f64,
-    /// RX antenna port.
-    #[arg(long, default_value = "RX2")]
-    antenna: String,
+    device: String,
+    /// RX channel on the device.
+    #[arg(long, default_value_t = 0)]
+    rx_channel: usize,
+    /// Overall RX gain in dB, distributed across the gain stages by the
+    /// driver. Omit to leave the driver's own gains in place.
+    #[arg(long)]
+    gain: Option<f64>,
+    /// One gain stage, NAME=DB; repeatable and applied after `--gain`.
+    /// HackRF: `--gain-element LNA=16 --gain-element VGA=20` (AMP=14
+    /// switches on its front-end amplifier, which overloads easily on
+    /// strong ambient traffic).
+    #[arg(long = "gain-element", value_name = "NAME=DB", value_parser = parse_gain_element)]
+    gain_elements: Vec<(String, f64)>,
+    /// Let the device run automatic gain control.
+    #[arg(long, conflicts_with_all = ["gain", "gain_elements"])]
+    agc: bool,
+    /// RX antenna port, e.g. "RX2" on a USRP B2xx.
+    #[arg(long)]
+    antenna: Option<String>,
+    /// Analog baseband filter bandwidth in Hz. Omit to let the driver
+    /// choose one for the sample rate.
+    #[arg(long)]
+    bandwidth: Option<f64>,
+    /// A driver setting, KEY=VALUE; repeatable. HackRF's bias-tee for an
+    /// active antenna, for example, is `--setting bias_tx=true`.
+    #[arg(long = "setting", value_name = "KEY=VALUE", value_parser = parse_setting)]
+    settings: Vec<(String, String)>,
+    /// Samples discarded after each retune while the synthesiser locks,
+    /// in milliseconds.
+    #[arg(long, default_value_t = 2)]
+    retune_settle_ms: u64,
 }
 
-// ── HackRF subcommand ──────────────────────────────────────────────
+#[cfg(feature = "soapy")]
+fn parse_setting(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.trim().is_empty() => Ok((k.trim().to_string(), v.trim().to_string())),
+        _ => Err(format!("expected KEY=VALUE, got '{s}'")),
+    }
+}
 
-#[derive(ClapArgs, Debug)]
-struct HackrfArgs {
-    #[command(flatten)]
-    live: LiveArgs,
-    /// LNA (IF) gain in dB, 0–40 in 8 dB steps.
-    #[arg(long, default_value_t = 16)]
-    lna_gain: u16,
-    /// VGA (baseband) gain in dB, 0–62 in 2 dB steps.
-    #[arg(long, default_value_t = 20)]
-    vga_gain: u16,
-    /// Enable the front-end +14 dB RF amplifier (off by default; it
-    /// overloads easily on strong ambient traffic).
-    #[arg(long, default_value_t = false)]
-    amp: bool,
-    /// Enable the bias-tee (antenna-port DC power) for active antennas.
-    #[arg(long, default_value_t = false)]
-    bias_tee: bool,
+#[cfg(feature = "soapy")]
+fn parse_gain_element(s: &str) -> Result<(String, f64), String> {
+    let (name, db) = parse_setting(s)?;
+    let db = db
+        .parse::<f64>()
+        .map_err(|_| format!("gain '{db}' for {name} is not a number of dB"))?;
+    Ok((name, db))
 }
 
 // ── Aaronia subcommands ────────────────────────────────────────────
@@ -577,24 +610,17 @@ struct AaroniaSdkArgs {
 
 // ── Constants ──────────────────────────────────────────────────────
 
-/// Default centre of the 5.8 GHz FPV band for wideband scanning.
-/// (Only the Aaronia backend scans a single fixed span; USRP/HackRF
-/// hop through `build_scan_hops` instead.)
-#[cfg(feature = "aaronia")]
-const SCAN_CENTER_HZ: f64 = 5_800_000_000.0;
-
-/// Dwell per hop for the Aaronia sweep, on top of the driver's own
-/// 20 ms post-retune drain (`RETUNE_SETTLE` in `sdr-aaronia-rs`, taken
+/// Dwell per hop for the Aaronia sweep, on top of the capture's own
+/// 20 ms post-retune drain (`RETUNE_SETTLE` in `sdr::aaronia`, taken
 /// before the dwell clock starts — a hop costs settle + dwell).
 ///
 /// A retune must be complete before any packet is attributed to the new
 /// centre, or the sweep reports a real signal at a frequency it was
-/// never received on. Since `sdr-aaronia-rs` v0.11.0 the driver stamps
-/// each `IqPacket` with the frequency the RTSA packet header reports,
-/// and drops any buffer whose capture frequency does not match the
-/// commanded channel — a stale packet is rejected rather than
-/// mislabelled. The drain is what keeps that rejection cheap; it is no
-/// longer what makes it correct.
+/// never received on. The capture stamps each `IqPacket` with the
+/// frequency the RTSA packet header reports, and drops any buffer whose
+/// capture frequency does not match the commanded channel — a stale
+/// packet is rejected rather than mislabelled. The drain is what keeps
+/// that rejection cheap; it is not what makes it correct.
 ///
 /// Measured against a Spectran V6 ECO over RTSA HTTP at 61.44 MSPS, by
 /// alternating between 869 MHz and 3500 MHz (a 23 dB power step) and
@@ -629,15 +655,6 @@ const AARONIA_SCAN_DWELL: Duration = Duration::from_millis(25);
 #[cfg(feature = "aaronia")]
 const AARONIA_DEFAULT_RATE_HZ: f64 = 61_440_000.0;
 
-// ── No-op dwell advice (single-channel, no hopping) ────────────────
-
-struct NoOpDwell;
-impl DwellAdvice for NoOpDwell {
-    fn latest_signal_at(&self, _: u64) -> Option<Instant> {
-        None
-    }
-}
-
 // ── Main ───────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
@@ -651,8 +668,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.source {
         SourceCmd::File(f) => run_file(f),
-        SourceCmd::Usrp(u) => run_live_usrp(u),
-        SourceCmd::Hackrf(h) => run_live_hackrf(h),
+        #[cfg(feature = "soapy")]
+        SourceCmd::Soapy(s) => run_live_soapy(s),
         #[cfg(feature = "aaronia")]
         SourceCmd::Aaronia(a) => run_live_aaronia(a),
     }
@@ -880,9 +897,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                                 Complex::new(re, im)
                             })
                             .collect();
-                        let pooled =
-                            orecchiette_sdr_source_rs::PooledIqBuffer::new_unpooled(iq_vec);
-                        let arc_chunk = Arc::new(pooled);
+                        let arc_chunk = Arc::new(sdr::IqBuffer::new_unpooled(iq_vec));
                         let breaks = std::mem::take(&mut wrapped);
                         active_txs.retain(|tx| {
                             tx.send(IqChunk {
@@ -901,7 +916,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  LIVE USRP MODE
+//  LIVE-VIEW CONTROL
 // ═══════════════════════════════════════════════════════════════════
 
 pub enum RunLiveResult {
@@ -970,507 +985,148 @@ enum ChannelInputState {
     Typing(String),
 }
 
-fn run_live_usrp(args: UsrpArgs) -> anyhow::Result<()> {
-    use orecchiette_sdr_usrp_rs::UsrpSource;
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE SOAPYSDR MODE
+// ═══════════════════════════════════════════════════════════════════
 
-    let initial_sample_rate = if let Some(sr) = args.live.sample_rate {
-        println!("Using user-specified sample rate: {:.2} MSPS", sr / 1e6);
-        sr
+/// SoapySDR's default scan rate: wide enough for ~20 MHz of usable
+/// spectrum per tune, and within reach of a USB 3 radio (a USRP B2xx
+/// runs it without overruns). Devices that top out lower (HackRF's
+/// 20 MSPS USB 2.0 ceiling) use their maximum instead.
+#[cfg(feature = "soapy")]
+const SOAPY_DEFAULT_RATE_HZ: f64 = 25_000_000.0;
+
+/// Below this an overrun no longer steps the rate down: analog FPV
+/// needs ~17 MSPS to hold its ~5 MHz deviation plus luma.
+#[cfg(feature = "soapy")]
+const SOAPY_MIN_STEP_DOWN_RATE_HZ: f64 = 16_000_000.0;
+
+/// Open and configure the SoapySDR device once for the whole session;
+/// every scan and live capture after that opens its own stream on it.
+#[cfg(feature = "soapy")]
+fn open_soapy(args: &SoapyArgs) -> anyhow::Result<soapysdr::Device> {
+    use anyhow::Context;
+    use soapysdr::Direction::Rx;
+
+    let device = soapysdr::Device::new(args.device.as_str()).with_context(|| {
+        format!(
+            "opening SoapySDR device '{}' (is its SoapySDR module installed? `SoapySDRUtil --find` lists devices)",
+            args.device
+        )
+    })?;
+    let ch = args.rx_channel;
+    println!(
+        "SoapySDR device: {} ({})",
+        device.hardware_key().unwrap_or_else(|_| "unknown".into()),
+        device.driver_key().unwrap_or_else(|_| "unknown".into())
+    );
+    for (key, value) in &args.settings {
+        device
+            .write_setting(key.as_str(), value.as_str())
+            .with_context(|| format!("writing setting {key}={value}"))?;
+    }
+    if let Some(antenna) = &args.antenna {
+        device
+            .set_antenna(Rx, ch, antenna.as_str())
+            .with_context(|| format!("selecting antenna {antenna}"))?;
+    }
+    if args.agc {
+        device
+            .set_gain_mode(Rx, ch, true)
+            .context("enabling automatic gain control")?;
     } else {
-        println!("No sample rate specified. Defaulting to 25.00 MSPS.");
-        25_000_000.0
-    };
-
-    let mut current_sample_rate = initial_sample_rate;
-    let auto_scan = args.live.channel.is_none();
-    let mut current_mode = if auto_scan {
-        ViewerMode::Scan
-    } else {
-        ViewerMode::SingleChannel
-    };
-
-    // Frequencies temporarily blacklisted by the user pressing 'S'.
-    // Cleared only when the user exits entirely.
-    let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-    let mut sweep = SweepState::new(args.live.scan_bands);
-
-    let mut explicit_freq = if let Some(ref ch) = args.live.channel {
-        Some(resolve_channel(ch)?)
-    } else {
-        None
-    };
-
-    let fm_deviation = args.live.fm_deviation;
-
-    loop {
-        let center_freq = match current_mode {
-            ViewerMode::SingleChannel => {
-                // Invariant: SingleChannel mode is only entered with a
-                // resolved frequency. Surface a clean error instead of
-                // panicking if a future state-machine edit ever breaks
-                // that.
-                let freq = explicit_freq.ok_or_else(|| {
-                    anyhow::anyhow!("SingleChannel mode entered with no frequency set")
-                })?;
-                let ch_name = get_fpv_channel_name(freq / 1e6)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{:.2} MHz", freq / 1e6));
-                println!("Single-channel mode: {} ({:.3} MHz)", ch_name, freq / 1e6);
-                freq
-            }
-            ViewerMode::Scan => {
-                let hop_freqs = build_scan_hops(current_sample_rate, args.live.scan_bands);
-                sweep.band.set_plan(
-                    hop_freqs.clone(),
-                    current_sample_rate * USABLE_SPAN_FRACTION,
-                );
-                sweep.band.set_skipped(&skipped_freqs);
-                if sweep.ui.is_none() {
-                    sweep.ui = Some(ScanWindow::open(sweep.band.full_height())?);
-                }
-                println!(
-                    "Wideband scan requested [{}]. {} channels covered by {} tunes ({:.1} MHz usable per tune)...",
-                    args.live.scan_bands.label(),
-                    args.live.scan_bands.channel_freqs_hz().len(),
-                    hop_freqs.len(),
-                    current_sample_rate * USABLE_SPAN_FRACTION / 1e6
-                );
-
-                let config = SourceConfig {
-                    sample_rate_hz: current_sample_rate,
-                    channels_hz: hop_freqs.clone(),
-                    // Long enough to actually deliver
-                    // `DETECT_PACKETS_PER_HOP` captures plus retune
-                    // settling. Two 65,536-sample packets is 5.2 ms of
-                    // signal at 25 MSPS and 6.6 ms at 20 MSPS, so 20 ms
-                    // leaves comfortable margin at every rate the scan
-                    // runs at. Two detection passes are ~18 ms of CPU,
-                    // so the hop is bound by that rather than by the
-                    // dwell.
-                    //
-                    // `dwell_max == dwell_min` leaves the source crate's
-                    // adaptive dwell off: a longer look neither promotes
-                    // confidence on a strong signal (it plateaus at 0.80
-                    // from the second packet) nor recovers a weak one
-                    // (the sigma cliff sits between 1.0 and 1.5 and does
-                    // not move with 12x the dwell).
-                    dwell_min: Duration::from_millis(20),
-                    dwell_max: Duration::from_millis(20),
-                    dwell_extension: Duration::ZERO,
-                };
-                let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
-                let source = Box::new(UsrpSource {
-                    args: args.args.clone(),
-                    gain_db: args.gain,
-                    antenna: args.antenna.clone(),
-                });
-
-                let handle = source.start(config, advice.clone())?;
-                let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
-                let mut selector =
-                    ScanSelector::new(&skipped_freqs, CandidatePolicy::AnyUnskippedChannel);
-                let mut progress = ScanProgress::new(&hop_freqs, DETECT_PACKETS_PER_HOP);
-                let mut sweeps_completed = 0;
-                let mut last_progress_msg = Instant::now();
-                let multi_hop = hop_freqs.len() > 1;
-                let mut probes: Vec<ProbeEnergy> = Vec::new();
-
-                // `None` when the operator closed the scan window.
-                let found_freq: Option<f64> = 'scan_loop: loop {
-                    let packet = match handle.receiver.recv_timeout(Duration::from_millis(1000)) {
-                        Ok(packet) => packet,
-                        // `recv_timeout` returns Err immediately when the
-                        // sender is dropped (capture thread died — e.g. a
-                        // USB reset), not only after the timeout. Retrying
-                        // a disconnected channel busy-spins at 100% CPU
-                        // flooding stdout, with no exit path.
-                        Err(e) if e.is_disconnected() => {
-                            anyhow::bail!(
-                                "SDR capture thread died during scan (channel disconnected)"
-                            );
-                        }
-                        Err(_) => {
-                            println!("SDR timed out during scan. Retrying...");
-                            continue;
-                        }
-                    };
-                    {
-                        let rf_center = packet.center_frequency_hz as u64;
-                        let hop_center =
-                            snap_to_nearest_hop(packet.center_frequency_hz, &hop_freqs);
-
-                        // Pump the scan window on every packet, drained
-                        // ones included, so it stays responsive.
-                        if let Some(ui) = sweep.ui.as_mut()
-                            && !ui.update(&sweep.band)
-                        {
-                            (handle.stop)();
-                            break 'scan_loop None;
-                        }
-
-                        // Feed the sweep `DETECT_PACKETS_PER_HOP` packets
-                        // per hop, then drain the rest of the dwell so the
-                        // SDR's buffer doesn't overflow.
-                        //
-                        // A change of centre frequency is the only signal
-                        // `IqPacket` carries that a new hop began, so the
-                        // budget resets on that. `plan_tune_centers`
-                        // dedups and emits strictly ascending centres
-                        // (pinned by `tune_planner_emits_ascending_hops`),
-                        // so two consecutive hops never share one.
-                        //
-                        // With a single tune the source never retunes, so
-                        // there is no boundary to observe and no hop to
-                        // drain for; every packet is processed.
-                        let Some(hop) = progress.observe(hop_center) else {
-                            continue;
-                        };
-
-                        let results = detector.detect_from_iq_integrated_with_probes(
-                            &packet.samples,
-                            rf_center,
-                            current_sample_rate as u32,
-                            &mut sweep.integrator,
-                            &mut probes,
-                        );
-                        // With one tune there is no retune to mark a new
-                        // look, so every packet replaces the last.
-                        sweep.band.record_hop(
-                            hop_center as f64,
-                            rf_center as f64,
-                            hop.first_packet || !multi_hop,
-                            &probes,
-                            &results,
-                        );
-                        for res in results {
-                            let ch_name = get_fpv_channel_name(res.frequency_hz as f64 / 1e6)
-                                .unwrap_or("Unknown");
-                            println!(
-                                "  → Found {:?} at {:.3} MHz (channel {}, conf {:.0}%, rssi {:.1} dBm)",
-                                res.signal_type,
-                                res.frequency_hz as f64 / 1e6,
-                                ch_name,
-                                res.confidence * 100.0,
-                                res.rssi_dbm
-                            );
-                            selector.consider(&res);
-                        }
-                        // Sweep is complete once every hop has been visited
-                        // *and* the current one has had its full packet
-                        // budget. Without the budget half of that test this
-                        // fires on the first packet of the last hop, which
-                        // both cuts that hop short of the two passes it
-                        // needs to detect anything and clears `seen_freqs`
-                        // mid-hop, sliding the sweep boundary one hop
-                        // earlier on every subsequent pass.
-                        if hop.sweep_complete {
-                            sweep.band.end_sweep();
-                            if let Some((freq, _rssi, _sig_type)) = selector.best() {
-                                // Found something, break out of the infinite scan loop
-                                (handle.stop)();
-                                std::thread::sleep(Duration::from_millis(200));
-
-                                let candidates = selector.refinement_candidates(freq);
-                                if candidates.is_empty() {
-                                    let snapped_freq = selector
-                                        .fallback_frequency(freq)
-                                        .expect("selected hit has an unskipped fallback");
-                                    let ch_name = get_fpv_channel_name(snapped_freq / 1e6)
-                                        .unwrap_or("Unknown");
-                                    println!(
-                                        "Sweep complete. Auto-tuning to exact channel: {} ({:.3} MHz) [raw hit at {:.3} MHz]",
-                                        ch_name,
-                                        snapped_freq / 1e6,
-                                        freq / 1e6
-                                    );
-                                    break 'scan_loop Some(snapped_freq);
-                                }
-
-                                println!(
-                                    "Coarse hit at {:.3} MHz. Fine-tuning across {} candidate channels...",
-                                    freq / 1e6,
-                                    candidates.len()
-                                );
-
-                                let ft_config = SourceConfig {
-                                    sample_rate_hz: current_sample_rate,
-                                    channels_hz: candidates.clone(),
-                                    // Fine-tune needs slightly more settle time
-                                    // but still only one chunk per candidate.
-                                    dwell_min: Duration::from_millis(15),
-                                    dwell_max: Duration::from_millis(15),
-                                    dwell_extension: Duration::ZERO,
-                                };
-                                let ft_source = Box::new(UsrpSource {
-                                    args: args.args.clone(),
-                                    gain_db: args.gain,
-                                    antenna: args.antenna.clone(),
-                                });
-                                let ft_handle = ft_source.start(ft_config, advice.clone())?;
-
-                                let mut ft_selector = FineTuneSelector::default();
-                                let mut ft_progress = ScanProgress::new(&candidates, 1);
-
-                                loop {
-                                    let packet = match ft_handle
-                                        .receiver
-                                        .recv_timeout(Duration::from_millis(1000))
-                                    {
-                                        Ok(packet) => packet,
-                                        // Same immediate-Err-on-disconnect
-                                        // semantics as the coarse loop above.
-                                        Err(e) if e.is_disconnected() => {
-                                            anyhow::bail!(
-                                                "SDR capture thread died during fine-tune (channel disconnected)"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            println!("SDR timed out during fine-tune. Retrying...");
-                                            continue;
-                                        }
-                                    };
-                                    {
-                                        let rf_center = packet.center_frequency_hz as u64;
-                                        let hop_center = snap_to_nearest_hop(
-                                            packet.center_frequency_hz,
-                                            &candidates,
-                                        );
-
-                                        let Some(ft_hop) = ft_progress.observe(hop_center) else {
-                                            continue;
-                                        };
-
-                                        let (_sig_type, conf) = detector.detect_sync_pulses(
-                                            &packet.samples,
-                                            current_sample_rate as u32,
-                                        );
-
-                                        let mut rssi = -100.0;
-                                        if let Some(res) = detector
-                                            .detect_from_iq(
-                                                &packet.samples,
-                                                rf_center,
-                                                current_sample_rate as u32,
-                                            )
-                                            .first()
-                                        {
-                                            rssi = res.rssi_dbm;
-                                        }
-
-                                        println!(
-                                            "  → Testing {:.3} MHz ({}): conf {:.0}%, rssi {:.1} dBm",
-                                            hop_center as f64 / 1e6,
-                                            get_fpv_channel_name(hop_center as f64 / 1e6)
-                                                .unwrap_or("Unknown"),
-                                            conf * 100.0,
-                                            rssi
-                                        );
-
-                                        ft_selector.consider(hop_center as f64, conf, rssi);
-
-                                        if ft_hop.sweep_complete {
-                                            (ft_handle.stop)();
-                                            std::thread::sleep(Duration::from_millis(200));
-
-                                            if let Some((best_freq, _best_conf, _)) =
-                                                ft_selector.best()
-                                            {
-                                                println!(
-                                                    "Fine-tuning complete. Selected exact channel: {} ({:.3} MHz)",
-                                                    get_fpv_channel_name(best_freq / 1e6)
-                                                        .unwrap_or("Unknown"),
-                                                    best_freq / 1e6
-                                                );
-                                                break 'scan_loop Some(best_freq);
-                                            }
-
-                                            println!(
-                                                "Fine-tuning didn't find clear sync pulses. Falling back to simple snap."
-                                            );
-                                            let snapped_freq = selector
-                                                .fallback_frequency(freq)
-                                                .expect("selected hit has an unskipped fallback");
-                                            let ch_name = get_fpv_channel_name(snapped_freq / 1e6)
-                                                .unwrap_or("Unknown");
-                                            println!(
-                                                "Auto-tuning to exact channel: {} ({:.3} MHz)",
-                                                ch_name,
-                                                snapped_freq / 1e6
-                                            );
-                                            break 'scan_loop Some(snapped_freq);
-                                        }
-                                    }
-                                }
-                            } else {
-                                sweeps_completed += 1;
-                                // Time-gated, not every Nth sweep. A sweep
-                                // is `tunes × dwell`, which ranges from
-                                // ~120 ms for six tunes to ~2 s for the
-                                // whole table — so a fixed sweep count
-                                // prints either far too often or barely at
-                                // all depending on --scan-bands and the
-                                // sample rate. It also bounds the
-                                // degenerate single-tune case, where a
-                                // "sweep" is one hop and completes on
-                                // every packet.
-                                if last_progress_msg.elapsed() >= Duration::from_secs(5) {
-                                    println!(
-                                        "Still sweeping ({sweeps_completed} passes)... no signals found yet."
-                                    );
-                                    last_progress_msg = Instant::now();
-                                }
-                                // Reset for the next sweep.
-                                progress.reset_sweep();
-                            }
-                        }
-                    }
-                };
-                let Some(found_freq) = found_freq else {
-                    // The operator closed the scan window: done.
-                    break;
-                };
-                explicit_freq = Some(found_freq);
-                found_freq
-            }
-        };
-
-        let source = Box::new(UsrpSource {
-            args: args.args.clone(),
-            gain_db: args.gain,
-            antenna: args.antenna.clone(),
-        });
-
-        // The picture window takes over from the scan window.
-        sweep.ui = None;
-        match run_live(
-            source,
-            current_sample_rate,
-            fm_deviation,
-            args.live.deemphasis_tau,
-            args.live.demod,
-            args.live.denoise,
-            args.live.denoise_model.clone(),
-            center_freq,
-            args.live.standard,
-            None,
-            args.live.debug,
-            args.live.temporal_window,
-            Some(&sweep.band),
-            OverrunPolicy::StepDown,
-            Duration::ZERO,
-        )? {
-            RunLiveResult::UserExit => {
-                break;
-            }
-            RunLiveResult::SignalLost => {
-                println!("Signal lost. Resuming scan...");
-                if auto_scan {
-                    current_mode = ViewerMode::Scan;
-                    explicit_freq = None;
-                } else {
-                    println!("Cannot resume scan in explicit channel mode. Exiting.");
-                    break;
-                }
-            }
-            RunLiveResult::SkipFrequency => {
-                let freq_key = center_freq.round() as u64;
-                skipped_freqs.insert(freq_key);
-                println!(
-                    "Skipped {:.3} MHz ({}). {} frequencies blacklisted. Resuming scan...",
-                    center_freq / 1e6,
-                    get_fpv_channel_name(center_freq / 1e6).unwrap_or("Unknown"),
-                    skipped_freqs.len()
-                );
-                if auto_scan {
-                    current_mode = ViewerMode::Scan;
-                    explicit_freq = None;
-                } else {
-                    println!("Cannot resume scan in explicit channel mode. Exiting.");
-                    break;
-                }
-            }
-            RunLiveResult::NextChannel => {
-                println!("Finding next channel...");
-                if auto_scan {
-                    current_mode = ViewerMode::Scan;
-                    explicit_freq = None;
-                } else {
-                    println!("Cannot scan for next channel in explicit channel mode. Exiting.");
-                    break;
-                }
-            }
-            RunLiveResult::TuneToChannel(freq) => {
-                let ch_name = get_fpv_channel_name(freq / 1e6)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{:.2} MHz", freq / 1e6));
-                println!("Tuning to channel {} ({:.3} MHz)...", ch_name, freq / 1e6);
-                explicit_freq = Some(freq);
-                current_mode = ViewerMode::SingleChannel;
-            }
-            RunLiveResult::TooManyOverruns => {
-                println!("Hardware buffer overrun limit reached.");
-                if current_sample_rate > 16_000_000.0 {
-                    current_sample_rate -= 5_000_000.0;
-                    println!(
-                        "Stepping down SDR sample rate to {:.2} MSPS...",
-                        current_sample_rate / 1e6
-                    );
-                    if auto_scan {
-                        current_mode = ViewerMode::Scan;
-                        explicit_freq = None;
-                    }
-                } else {
-                    println!("Sample rate is already near minimum. Cannot step down further.");
-                    if auto_scan {
-                        current_mode = ViewerMode::Scan;
-                        explicit_freq = None;
-                    } else {
-                        break;
-                    }
-                }
-            }
+        if device.has_gain_mode(Rx, ch).unwrap_or(false) {
+            let _ = device.set_gain_mode(Rx, ch, false);
+        }
+        if let Some(gain) = args.gain {
+            device
+                .set_gain(Rx, ch, gain)
+                .with_context(|| format!("setting gain {gain} dB"))?;
+        }
+        for (name, db) in &args.gain_elements {
+            device
+                .set_gain_element(Rx, ch, name.as_str(), *db)
+                .with_context(|| format!("setting gain element {name}={db} dB"))?;
         }
     }
-    // Use process::exit to skip UHD's broken C++ static destructors.
-    // libuhd keeps a global `std::map<unsigned long, usrp_ptr>` that
-    // double-frees during __cxa_finalize if the Rust side already dropped
-    // the Usrp handle.  The capture thread is already stopped cleanly by
-    // handle_stop() in run_live, so this is safe.
-    std::process::exit(0);
+    if let Some(bw) = args.bandwidth {
+        device
+            .set_bandwidth(Rx, ch, bw)
+            .with_context(|| format!("setting bandwidth {:.3} MHz", bw / 1e6))?;
+    }
+    let stages = device
+        .list_gains(Rx, ch)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| {
+            let db = device
+                .gain_element(Rx, ch, name.as_str())
+                .unwrap_or(f64::NAN);
+            format!("{name}={db:.0}")
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "  gain {:.1} dB [{}], antenna {}",
+        device.gain(Rx, ch).unwrap_or(f64::NAN),
+        stages.join(" "),
+        device.antenna(Rx, ch).unwrap_or_else(|_| "?".into())
+    );
+    Ok(device)
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  LIVE HACKRF MODE
-// ═══════════════════════════════════════════════════════════════════
+#[cfg(feature = "soapy")]
+fn run_live_soapy(args: SoapyArgs) -> anyhow::Result<()> {
+    use sdr::soapy::{SoapySource, apply_sample_rate, max_sample_rate};
 
-fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
-    use orecchiette_sdr_hackrf_rs::{HACKRF_MAX_SAMPLE_RATE_HZ, HackRfSource};
+    let device = open_soapy(&args)?;
+    let ch = args.rx_channel;
+    let make_source = || -> Box<dyn SdrSource> {
+        Box::new(SoapySource {
+            device: device.clone(),
+            channel: ch,
+            block_size: 65_536,
+            settle: Duration::from_millis(args.retune_settle_ms),
+        })
+    };
 
-    // HackRF One is USB 2.0: default to its ~20 MSPS ceiling (just enough
-    // for analog FPV's ~20 MHz FM) and clamp any larger request to it.
-    let requested = args.live.sample_rate.unwrap_or(HACKRF_MAX_SAMPLE_RATE_HZ);
-    let sample_rate = requested.min(HACKRF_MAX_SAMPLE_RATE_HZ);
-    if requested > HACKRF_MAX_SAMPLE_RATE_HZ {
+    let device_max = max_sample_rate(&device, ch);
+    let requested = args.live.sample_rate.unwrap_or_else(|| {
+        device_max.map_or(SOAPY_DEFAULT_RATE_HZ, |max| max.min(SOAPY_DEFAULT_RATE_HZ))
+    });
+    let requested = match device_max {
+        Some(max) if requested > max => {
+            println!(
+                "Requested {:.2} MSPS exceeds the device's {:.2} MSPS maximum; using {:.2} MSPS.",
+                requested / 1e6,
+                max / 1e6,
+                max / 1e6
+            );
+            max
+        }
+        _ => requested,
+    };
+    // Plan with the rate the device actually runs, not the one asked
+    // for: a device with a rate grid lands elsewhere, and the hop plan
+    // and detector both depend on it.
+    let mut sample_rate = apply_sample_rate(&device, ch, requested)?;
+    println!("SoapySDR sample rate: {:.2} MSPS.", sample_rate / 1e6);
+    if sample_rate < SOAPY_MIN_STEP_DOWN_RATE_HZ {
         println!(
-            "Requested {:.2} MSPS exceeds the HackRF's {:.0} MSPS USB-2.0 ceiling; using {:.0} MSPS.",
-            requested / 1e6,
-            HACKRF_MAX_SAMPLE_RATE_HZ / 1e6,
+            "Warning: {:.2} MSPS is narrower than an analog FPV channel (~17 MSPS); the picture will be cut down.",
             sample_rate / 1e6
         );
-    } else {
-        println!("HackRF sample rate: {:.2} MSPS.", sample_rate / 1e6);
     }
 
     let fm_deviation = args.live.fm_deviation;
     let auto_scan = args.live.channel.is_none();
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    // Cross-sweep spectral integration (see the USRP path's note).
     let mut sweep = SweepState::new(args.live.scan_bands);
-    let mut explicit_freq = match args.live.channel {
-        Some(ref ch) => Some(resolve_channel(ch)?),
-        None => None,
-    };
+    let mut explicit_freq = args
+        .live
+        .channel
+        .as_ref()
+        .map(|ch| resolve_channel(ch))
+        .transpose()?;
 
     // What the sweep classified the chosen signal as. Carried into the
     // live decode so a concrete PAL/NTSC verdict from the scan is not
@@ -1483,21 +1139,19 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
         let center_freq = match explicit_freq {
             Some(f) => f,
             None => match scan_band_for_channel(
-                Box::new(HackRfSource {
-                    lna_gain: args.lna_gain,
-                    vga_gain: args.vga_gain,
-                    amp_enable: args.amp,
-                    bias_tee: args.bias_tee,
-                }),
-                "HackRF",
+                make_source(),
+                "SoapySDR",
                 sample_rate,
                 args.live.scan_bands,
-                // See the USRP scan's dwell for why 20 ms and why
-                // adaptive dwell stays off. HackRF retunes its
-                // synthesiser in well under a millisecond, and its
-                // 20 MSPS ceiling makes packets the longest of any
-                // backend at 3.3 ms — 20 ms lands the per-hop budget
-                // with margin.
+                // Long enough to deliver the per-hop packet budget:
+                // 65,536-sample packets are 2.6 ms at 25 MSPS and 3.3 ms
+                // at 20, and the stream restart each hop costs is taken
+                // before the dwell clock starts. Adaptive dwell stays
+                // off: a longer look neither promotes confidence on a
+                // strong signal (it plateaus at 0.80 from the second
+                // packet) nor recovers a weak one (the sigma cliff sits
+                // between 1.0 and 1.5 and does not move with 12x the
+                // dwell).
                 SweepBudget::flat(
                     Duration::from_millis(20),
                     detect_packets_per_hop(sample_rate),
@@ -1526,19 +1180,12 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
         let ch_name = get_fpv_channel_name(center_freq / 1e6)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{:.2} MHz", center_freq / 1e6));
-        println!("HackRF tuned: {} ({:.3} MHz)", ch_name, center_freq / 1e6);
-
-        let source = Box::new(HackRfSource {
-            lna_gain: args.lna_gain,
-            vga_gain: args.vga_gain,
-            amp_enable: args.amp,
-            bias_tee: args.bias_tee,
-        });
+        println!("SoapySDR tuned: {} ({:.3} MHz)", ch_name, center_freq / 1e6);
 
         // The picture window takes over from the scan window.
         sweep.ui = None;
         match run_live(
-            source,
+            make_source(),
             sample_rate,
             fm_deviation,
             args.live.deemphasis_tau,
@@ -1555,8 +1202,16 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             Duration::ZERO,
         )? {
             RunLiveResult::UserExit => break,
-            RunLiveResult::SignalLost | RunLiveResult::NextChannel => {
+            r @ (RunLiveResult::SignalLost | RunLiveResult::NextChannel) => {
                 if auto_scan {
+                    println!(
+                        "{}. Resuming scan...",
+                        if matches!(r, RunLiveResult::SignalLost) {
+                            "Signal lost"
+                        } else {
+                            "Next channel requested"
+                        }
+                    );
                     explicit_freq = None;
                 } else {
                     println!("Signal lost (explicit-channel mode). Exiting.");
@@ -1565,6 +1220,12 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
             }
             RunLiveResult::SkipFrequency => {
                 skipped_freqs.insert(center_freq.round() as u64);
+                println!(
+                    "Skipped {:.3} MHz ({}). {} frequencies blacklisted.",
+                    center_freq / 1e6,
+                    get_fpv_channel_name(center_freq / 1e6).unwrap_or("Unknown"),
+                    skipped_freqs.len()
+                );
                 if auto_scan {
                     explicit_freq = None;
                 } else {
@@ -1575,14 +1236,35 @@ fn run_live_hackrf(args: HackrfArgs) -> anyhow::Result<()> {
                 explicit_freq = Some(freq);
                 scan_standard = None;
             }
-            // HackRF doesn't surface hardware-overrun metadata, so this
-            // variant isn't expected from its backend; handle it like a
-            // signal loss to stay exhaustive and safe.
+            // The host cannot keep up with the device: give up 5 MSPS
+            // and carry on, down to the narrowest rate that still holds
+            // a channel.
             RunLiveResult::TooManyOverruns => {
+                println!("Hardware buffer overrun limit reached.");
+                // A device with a rate grid can snap the request back up
+                // to the rate it already runs; that is no step at all.
+                let stepped = if sample_rate - 5_000_000.0 >= SOAPY_MIN_STEP_DOWN_RATE_HZ {
+                    let r = apply_sample_rate(&device, ch, sample_rate - 5_000_000.0)?;
+                    (r < sample_rate).then_some(r)
+                } else {
+                    None
+                };
+                if let Some(r) = stepped {
+                    sample_rate = r;
+                    println!(
+                        "Stepping down SDR sample rate to {:.2} MSPS...",
+                        sample_rate / 1e6
+                    );
+                } else {
+                    // Put back the rate the failed step may have left set.
+                    sample_rate = apply_sample_rate(&device, ch, sample_rate)?;
+                    println!("Sample rate is already near minimum. Cannot step down further.");
+                    if !auto_scan {
+                        break;
+                    }
+                }
                 if auto_scan {
                     explicit_freq = None;
-                } else {
-                    break;
                 }
             }
         }
@@ -1615,7 +1297,7 @@ impl SweepState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverrunPolicy {
     /// The host cannot keep up with the hardware: give the channel up so
-    /// the caller can step the sample rate down (USRP over USB).
+    /// the caller can step the sample rate down (a SoapySDR radio on USB).
     StepDown,
     /// A gap in a network stream drops a few samples and glitches the
     /// picture; it says nothing about the channel. Count it, keep going.
@@ -1627,7 +1309,7 @@ enum OverrunPolicy {
 
 /// How long the RTSA HTTP server keeps delivering samples from the
 /// previous centre after acknowledging a retune, over and above the
-/// driver's own 20 ms drain. Packets inside this window belong to the
+/// capture's own 20 ms drain. Packets inside this window belong to the
 /// old channel, whatever their label says.
 ///
 /// The 150–300 ms this once cited was never measured. On the hop path a
@@ -1653,20 +1335,17 @@ enum ScanOutcome {
     Quit,
 }
 
-/// Single-stage coarse scan shared by the hopping backends: sweep the
-/// planned tune centres, run the wideband detector on
-/// `DETECT_PACKETS_PER_HOP` chunks per hop, and snap the strongest
-/// (non-blacklisted) hit to the nearest FPV channel. Returns `None` if
-/// the band is empty.
+/// Single-stage coarse scan shared by both backends: sweep the planned
+/// tune centres, run the wideband detector on the budget's packets per
+/// hop, and snap the strongest (non-blacklisted) hit to the nearest FPV
+/// channel.
 ///
-/// This is intentionally simpler than the USRP path's two-stage
-/// coarse-then-fine-tune sweep — the single coarse snap is enough to
-/// land on a channel. The `source` decides what actually retunes:
-/// HackRF hops its synthesiser, while the Aaronia HTTP backend issues a
-/// capture-config update to the RTSA server per hop, whose latency is
-/// network-dependent — the per-hop packet budget doesn't care how long
-/// a retune took, only that fresh packets eventually arrive at the new
-/// centre.
+/// The `source` decides what actually retunes: a SoapySDR radio
+/// restarts its stream on the new centre, while the Aaronia HTTP
+/// backend issues a capture-config update to the RTSA server per hop,
+/// whose latency is network-dependent — the per-hop packet budget
+/// doesn't care how long a retune took, only that fresh packets
+/// eventually arrive at the new centre.
 fn scan_band_for_channel(
     source: Box<dyn SdrSource>,
     backend_label: &str,
@@ -1695,16 +1374,11 @@ fn scan_band_for_channel(
     let config = SourceConfig {
         sample_rate_hz: sample_rate,
         channels_hz: hop_freqs.clone(),
-        // Caller-chosen: the dwell must cover the backend's real retune
-        // latency, or packets from one centre arrive tagged with the
-        // next hop's frequency and every detection is reported at the
-        // wrong absolute frequency. See the call sites.
-        dwell_min: dwell,
-        dwell_max: dwell,
-        dwell_extension: Duration::ZERO,
+        // Caller-chosen: long enough to deliver the per-hop packet
+        // budget. See the call sites.
+        dwell,
     };
-    let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
-    let handle = source.start(config, advice)?;
+    let handle = source.start(config)?;
     let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
 
     let mut selector = ScanSelector::new(skipped_freqs, CandidatePolicy::NearestChannel);
@@ -1725,15 +1399,14 @@ fn scan_band_for_channel(
                 if let Some(ui) = sweep.ui.as_mut()
                     && !ui.update(&sweep.band)
                 {
-                    (handle.stop)();
+                    handle.stop();
                     return Ok(ScanOutcome::Quit);
                 }
-                // `DETECT_PACKETS_PER_HOP` detection passes per hop, then
-                // drain the rest of the dwell. Unlike the USRP loop this
-                // one needs no single-tune escape: it *returns* once the
-                // sweep is complete rather than clearing `seen` and going
-                // round again, so a one-tune plan finishes on its first
-                // packet and can never sit draining.
+                // The budget's detection passes per hop, then drain the
+                // rest of the dwell. No single-tune escape is needed: the
+                // loop *returns* once the sweep is complete rather than
+                // going round again, so a one-tune plan finishes on its
+                // first packet and can never sit draining.
                 let Some(hop) = progress.observe(hop_center) else {
                     continue;
                 };
@@ -1755,7 +1428,7 @@ fn scan_band_for_channel(
                 if let Some(ui) = sweep.ui.as_mut()
                     && !ui.update(&sweep.band)
                 {
-                    (handle.stop)();
+                    handle.stop();
                     return Ok(ScanOutcome::Quit);
                 }
 
@@ -1772,22 +1445,22 @@ fn scan_band_for_channel(
                     }
                 }
 
-                // As in the USRP loop: the last hop must get its full
-                // packet budget before the sweep counts as done. Returning
-                // on its first packet left the highest frequency in every
-                // HackRF scan with a single detection pass — below the
-                // length at which the sweep finds anything — so that
-                // channel could never be reported.
+                // The last hop must get its full packet budget before the
+                // sweep counts as done. Returning on its first packet left
+                // the highest frequency in every scan with a single
+                // detection pass — below the length at which the sweep
+                // finds anything — so that channel could never be
+                // reported. `stop` waits for the capture to release the
+                // radio, so the next capture can open it straight away.
                 if hop.sweep_complete {
                     sweep.band.end_sweep();
-                    (handle.stop)();
-                    std::thread::sleep(Duration::from_millis(150));
+                    handle.stop();
                     return Ok(outcome(selector.best()));
                 }
             }
             Err(_) => {
                 // SDR went quiet — return whatever we found this sweep.
-                (handle.stop)();
+                handle.stop();
                 return Ok(outcome(selector.best()));
             }
         }
@@ -1800,68 +1473,38 @@ fn scan_band_for_channel(
 
 #[cfg(feature = "aaronia")]
 fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
-    use sdr_aaronia_rs::{SpectranBackend, SpectranSdrSource};
+    use sdr::aaronia::{AaroniaSource, Transport};
 
     // Backend params split from LiveArgs so a fresh source can be built
     // for every (re)tune: `run_live` consumes its source, and every
     // non-quit RunLiveResult needs a new one to honour the S/N/C keys
     // and signal loss.
-    enum Backend {
-        Http {
-            url: String,
-            ref_level: f64,
-            stream_format: sdr_aaronia_rs::http_streaming::StreamFormat,
-        },
-        Sdk {
-            serial: Option<String>,
-            ref_level: f64,
-        },
-    }
-    let (backend, live, label) = match cmd {
+    let (transport, ref_level, live, label) = match cmd {
         AaroniaCmd::Http(h) => {
             let label = format!("Aaronia HTTP ({})", h.url);
             (
-                Backend::Http {
+                Transport::Http {
                     url: h.url,
-                    ref_level: h.ref_level,
-                    stream_format: h.stream_format.to_driver(),
+                    format: h.stream_format.to_driver(),
                 },
+                h.ref_level,
                 h.live,
                 label,
             )
         }
         AaroniaCmd::Sdk(s) => (
-            Backend::Sdk {
-                serial: s.serial,
-                ref_level: s.ref_level,
-            },
+            Transport::Sdk { serial: s.serial },
+            s.ref_level,
             s.live,
             "Aaronia SDK".to_string(),
         ),
     };
-    let make_source = |center_freq: f64| -> Box<dyn SdrSource> {
-        match &backend {
-            Backend::Http {
-                url,
-                ref_level,
-                stream_format,
-            } => Box::new(SpectranSdrSource {
-                backend: SpectranBackend::Http(url.clone()),
-                center_frequency_hz: center_freq,
-                reference_level_dbm: *ref_level,
-                block_size: 65_536,
-                stream_format: Some(*stream_format),
-            }),
-            Backend::Sdk { serial, ref_level } => Box::new(SpectranSdrSource {
-                backend: SpectranBackend::Sdk {
-                    serial: serial.clone(),
-                },
-                center_frequency_hz: center_freq,
-                reference_level_dbm: *ref_level,
-                block_size: 65_536,
-                stream_format: None,
-            }),
-        }
+    let make_source = || -> Box<dyn SdrSource> {
+        Box::new(AaroniaSource {
+            transport: transport.clone(),
+            reference_level_dbm: ref_level,
+            block_size: 65_536,
+        })
     };
 
     // `--sample-rate` is a rate, so it maps to the nearest rate the
@@ -1888,7 +1531,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
 
     let mut skipped_freqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut sweep = SweepState::new(live.scan_bands);
-    // See the HackRF caller for why the sweep's PAL/NTSC verdict rides
+    // See the SoapySDR caller for why the sweep's PAL/NTSC verdict rides
     // along instead of being re-derived at the tuned centre.
     let mut scan_standard: Option<SignalType> = None;
     // Which sweep this is, for the sensitive-sweep cadence.
@@ -1897,11 +1540,8 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
     loop {
         let center_freq = match explicit_freq {
             Some(f) => f,
-            // The sweeping source is built at the band centre, but that
-            // choice is cosmetic — the hop list in the scan's
-            // SourceConfig retunes it before the first packet arrives.
             None => match scan_band_for_channel(
-                make_source(SCAN_CENTER_HZ),
+                make_source(),
                 &label,
                 sample_rate,
                 live.scan_bands,
@@ -1965,7 +1605,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         // The picture window takes over from the scan window.
         sweep.ui = None;
         match run_live(
-            make_source(center_freq),
+            make_source(),
             live_rate,
             fm_deviation,
             live.deemphasis_tau,
@@ -2019,14 +1659,6 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
 //  SHARED LIVE PIPELINE
 // ═══════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Copy)]
-enum ViewerMode {
-    /// Tune to a single channel; one window.
-    SingleChannel,
-    /// Wideband scan; detect and open windows for all active signals.
-    Scan,
-}
-
 // Mirrors run_viewer_pipeline's wide signature — every knob the CLI
 // surfaces lands here before being forwarded. Splitting would mean
 // boxing a config struct, which is more ceremony than the call sites
@@ -2049,16 +1681,7 @@ fn run_live(
     overrun_policy: OverrunPolicy,
     settle_after_tune: Duration,
 ) -> anyhow::Result<RunLiveResult> {
-    let advice = Arc::new(NoOpDwell) as Arc<dyn DwellAdvice>;
-    let config = SourceConfig {
-        sample_rate_hz: sample_rate,
-        channels_hz: vec![center_freq],
-        dwell_min: Duration::from_secs(3600), // stay forever
-        dwell_max: Duration::from_secs(3600),
-        dwell_extension: Duration::ZERO,
-    };
-
-    let handle = source.start(config, advice)?;
+    let handle = source.start(SourceConfig::hold(sample_rate, center_freq))?;
     let sample_rate_u32 = sample_rate as u32;
 
     // Receive the first chunk for auto-detection
@@ -2101,8 +1724,8 @@ fn run_live(
     );
 
     // Resolve the single channel at DC. (Wideband multi-signal scan
-    // lives in the pre-tune sweeps — scan_band_for_channel and the USRP
-    // scan loop — so by the time run_live starts, the centre is chosen.)
+    // lives in the pre-tune sweep, scan_band_for_channel, so by the time
+    // run_live starts, the centre is chosen.)
     // The carrier, re-measured once we are tuned to it.
     //
     // The sweep's estimate named this channel, and at a low probe SNR it
@@ -2130,7 +1753,7 @@ fn run_live(
                         if p.sample_rate_hz as u32 != sample_rate_u32
                             || (p.center_frequency_hz - actual_center).abs() > 1.0
                         {
-                            (handle.stop)();
+                            handle.stop();
                             anyhow::bail!("SDR rate or centre changed during channel acquisition");
                         }
                         record.push(&p.samples, p.overrun);
@@ -2182,8 +1805,7 @@ fn run_live(
 
     // Feed the first chunk into the pipeline, then continue from the receiver
     let first_samples = first_packet.samples;
-    let receiver = handle.receiver.clone();
-    let handle_stop = handle.stop; // Take ownership of the stop closure
+    let (receiver, stopper) = handle.split();
 
     let exit_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let tune_freq = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2401,11 +2023,9 @@ fn run_live(
         },
     );
 
-    // Shut down the USRP capture thread cleanly before dropping the handle.
-    // Without this, the capture thread races with UHD's global usrp_ptr map
-    // destructor during process exit, causing a double-free (SIGABRT).
-    (handle_stop)();
-    std::thread::sleep(Duration::from_millis(100));
+    // Stop the capture and wait for it to release the radio before the
+    // caller scans or tunes again.
+    stopper.stop();
 
     result
 }
