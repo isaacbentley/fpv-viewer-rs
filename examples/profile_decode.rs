@@ -2,13 +2,13 @@
 //! Run with: cargo run --release --example profile_decode
 //! Stage figures are elapsed wall seconds per second of input signal.
 use clap::Parser;
-use orecchiette_fpv_drone_analog_rs::decode::{
+use fpv_drone_analog::decode::{
     DecodePlan, DecoderConfig, DemodulationMode, LUMA_HEADROOM_HZ, StreamingFpvDecoder,
 };
-use orecchiette_fpv_drone_analog_rs::demod::DEFAULT_DEEMPHASIS_TAU_S;
-use orecchiette_fpv_drone_analog_rs::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
-use orecchiette_fpv_drone_analog_rs::timing::Standard;
-use orecchiette_fpv_drone_analog_rs::vbi::FieldParity;
+use fpv_drone_analog::demod::DEFAULT_DEEMPHASIS_TAU_S;
+use fpv_drone_analog::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+use fpv_drone_analog::timing::Standard;
+use fpv_drone_analog::vbi::FieldParity;
 use std::num::NonZeroUsize;
 use std::time::Instant;
 

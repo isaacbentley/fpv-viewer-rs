@@ -8,8 +8,9 @@ capture from any SoapySDR device (HackRF, USRP, LimeSDR, ...) and from
 Aaronia Spectran hardware, as well as offline playback of recorded files.
 
 Signal processing is provided by
-[orecchiette-fpv-drone-analog-rs](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs);
-this repository is the application around it. The crate owns decode planning,
+[fpv-drone-analog-rs](https://github.com/isaacbentley/fpv-drone-analog-rs)
+(imported here as `fpv_drone_analog`); this repository is the application
+around it. The crate owns decode planning,
 streaming IQ-to-field processing, acquisition/lock policy, scan planning and
 channel identity. This application owns hardware adapters, deadlines, queues,
 frame recycling, windows and snapshots. The profiler calls the same
@@ -67,10 +68,6 @@ frame recycling, windows and snapshots. The profiler calls the same
   viewer says so; that costs the CPU the decimation would have saved.
   The discriminator is the default everywhere the decode rate lands
   below the crossover, which on a wide capture is everywhere.
-- **Optional neural denoiser.** Built with `--features neural-vsr`,
-  `--denoise` starts with it enabled and **`D`** toggles it during
-  playback. It improves a degraded signal and costs a small amount of
-  detail on a clean one, so live toggling is useful.
 
 ## Platform support
 
@@ -112,15 +109,6 @@ machine running it. Leave either out with `--no-default-features` and
 `--features` (`--no-default-features --features aaronia` builds without
 SoapySDR); with neither, the viewer only replays files.
 
-One optional feature:
-
-```bash
-cargo build --release --features neural-vsr   # neural denoiser
-```
-
-`neural-vsr` is disabled by default because it introduces a dependency
-on ONNX Runtime.
-
 ## CPU budget and Raspberry Pi 5
 
 Measured locally on an Apple M4 with the profiler described below, the
@@ -154,7 +142,7 @@ cargo run --locked --release --example profile_decode -- \
 
 The profiler accepts comma-separated rates and `--chunk-size` (default
 65,536 samples). It uses synthetic PAL and NTSC bars with 5 MHz FM deviation,
-the default deemphasis, and no neural denoiser. Fixture generation is outside
+the default deemphasis. Fixture generation is outside
 the measured interval; replay boundaries reset decoder continuity. `wall s/s`
 measures the entire decode loop, while `stage s/s` sums instrumented stages.
 These are elapsed times, not whole-system CPU percentages. A result above
@@ -170,7 +158,7 @@ For lower CPU usage:
 - Keep `--demod auto` or `--demod disc`; avoid forcing PLL for a CPU budget.
 - Try `--temporal-window 1` on a clean signal. This disables temporal noise
   reduction and previous-field dropout repair, trading weak-signal quality
-  for less reconstruction work. Leave neural denoising and `--debug` off.
+  for less reconstruction work. Leave `--debug` off.
 - Start with one directly tuned channel; measure scanning separately.
 
 The [Pi 5's specifications](https://www.raspberrypi.com/products/raspberry-pi-5/)
@@ -225,12 +213,6 @@ Sweep the band from an RTSA HTTP server instead (no SDK needed):
 cargo run --release -- aaronia http http://atc.local:54664
 ```
 
-Replay a file with the neural denoiser enabled from the start:
-
-```bash
-cargo run --release --features neural-vsr -- file --denoise /path/to/capture.sigmf-data
-```
-
 ## Commands and options
 
 ```text
@@ -258,8 +240,6 @@ subcommand:
 | `--stream-format f16\|f32\|int16` | Aaronia HTTP only: IQ wire format. `f16` (default) halves network bandwidth against `f32` with no visible cost on analog video. |
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant, in seconds. Default 0.15 µs (`0.00000015`); `0` disables. It is a single pole, so its attenuation grows without limit: 0.15 µs costs 2.7 dB at 1 MHz and 11.1 dB at 4.2 MHz, where 0.75 µs costs 13.6 and 24.8 dB. NTSC luma runs to about 4.2 MHz, so a long time constant softens the picture badly — measured against a live transmitter, detail fell from 38.6 with it off to 1.6 at 0.75 µs. Lengthen it if your transmitter's pre-emphasis is strong and the picture looks noisy. |
-| `--denoise` | Start with the neural denoiser enabled (requires `--features neural-vsr`). |
-| `--denoise-model <path>` | ONNX model to load. Defaults to `models/temporal_denoiser.onnx`. |
 | `--temporal-window <n>` | Fields retained for temporal denoising and dropout repair. Default 5, giving roughly +7 dB on static scenes at about 83 ms latency; `1` disables temporal processing. |
 | `--debug` | Print per-frame decode metrics and save frames 1–3 and 30–32 as PNG files. |
 
@@ -269,7 +249,6 @@ subcommand:
 | :--- | :--- |
 | **`N`** | Next channel. Abandons the current lock and resumes sweeping. |
 | **`S`** | Skip and blacklist the current frequency. |
-| **`D`** | Toggle the neural denoiser. |
 | **`B`** | Cycle the band panel: strip, full, off. Closing the scan window, or `Q` in it, quits. |
 | **`C`** then band and channel | Direct tune. For R8, press `C`, then `R`, then `8`. |
 | **`Esc`** or **`Q`** | Quit. |
@@ -281,7 +260,7 @@ decoder, generate a reference file that is correct by construction and
 replay that instead:
 
 ```bash
-cd ../orecchiette-fpv-drone-analog-rs
+cd ../fpv-drone-analog-rs
 cargo run --release --example make_reference_capture -- --standard pal
 cargo run --release --example make_reference_capture -- --standard ntsc
 ```
@@ -306,12 +285,16 @@ Channel names come from the shared catalog: A/B/E/F/R/L/D/U plus `N` (narrow
 channel-entry prompt, a prefix such as `S6` waits for a second digit; press
 Enter for S6 or continue typing S60–S64. Backspace edits the entry.
 
-The release manifest pins the analog crate to commit `a80d55f`, the first commit
-after `v0.9.0`, which carries the SIMD DDC optimization. For local co-development,
-pass a Cargo command-line patch instead of committing a machine-specific path:
+The manifest pins the decoder crate to commit `459eb94` of `fpv-drone-analog-rs`,
+the head of that repository, which carries the SIMD DDC optimization (`a80d55f`, the
+first commit after `v0.9.0`). The repository is frozen: its development continues in
+Specola as the `fpv-drone-analog` package, while the package published here is still
+named `orecchiette-fpv-drone-analog-rs`, so `Cargo.toml` renames it on import. For local
+co-development, pass a Cargo command-line patch instead of committing a machine-specific
+path:
 
 ```bash
-cargo check --config 'patch."https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git".orecchiette-fpv-drone-analog-rs.path="../orecchiette-fpv-drone-analog-rs"'
+cargo check --config 'patch."https://github.com/isaacbentley/fpv-drone-analog-rs.git".orecchiette-fpv-drone-analog-rs.path="../fpv-drone-analog-rs"'
 ```
 
 Restore `Cargo.lock` after local patch experiments before building a release.

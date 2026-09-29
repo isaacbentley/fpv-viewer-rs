@@ -1,7 +1,5 @@
-use orecchiette_fpv_drone_analog_rs::decode::{
-    DecodeConfigError, DecoderConfig, StreamingFpvDecoder,
-};
-use orecchiette_fpv_drone_analog_rs::timing::Standard;
+use fpv_drone_analog::decode::{DecodeConfigError, DecoderConfig, StreamingFpvDecoder};
+use fpv_drone_analog::timing::Standard;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -20,8 +18,6 @@ pub struct IqChunk {
 pub struct DecodeWorkerConfig {
     pub decoder: DecoderConfig,
     pub display_mhz: f64,
-    #[allow(dead_code)]
-    pub denoise_model: Option<String>,
 }
 
 pub struct DecodeWorker {
@@ -36,8 +32,6 @@ pub struct DecodeWorker {
     snap_tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>,
     frame_count: u64,
     pal_debug_done: bool,
-    #[cfg(feature = "neural-vsr")]
-    denoise_on: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DecodeWorker {
@@ -50,17 +44,8 @@ impl DecodeWorker {
         worker_frames: Arc<std::sync::atomic::AtomicU64>,
         observed_timing_fields: Arc<std::sync::atomic::AtomicU64>,
         snap_tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>,
-        #[cfg(feature = "neural-vsr")] denoise_on: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, DecodeConfigError> {
-        #[allow(unused_mut)]
-        let mut decoder = StreamingFpvDecoder::new(config.decoder.clone())?;
-        #[cfg(feature = "neural-vsr")]
-        if let Some(model) = &config.denoise_model {
-            if let Err(error) = decoder.load_neural_restorer(model, true) {
-                eprintln!("Denoiser unavailable: {error} — continuing without it.");
-            }
-            decoder.set_restoration_enabled(denoise_on.load(std::sync::atomic::Ordering::Relaxed));
-        }
+        let decoder = StreamingFpvDecoder::new(config.decoder.clone())?;
         let frame_buf = vec![0; decoder.reconstructor().width * decoder.reconstructor().height];
         Ok(Self {
             config,
@@ -74,8 +59,6 @@ impl DecodeWorker {
             snap_tx,
             frame_count: 0,
             pal_debug_done: false,
-            #[cfg(feature = "neural-vsr")]
-            denoise_on,
         })
     }
 
@@ -89,7 +72,6 @@ impl DecodeWorker {
         worker_frames: Arc<std::sync::atomic::AtomicU64>,
         observed_timing_fields: Arc<std::sync::atomic::AtomicU64>,
         snap_tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>,
-        #[cfg(feature = "neural-vsr")] denoise_on: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<thread::JoinHandle<()>, DecodeConfigError> {
         let worker = Self::new(
             config,
@@ -99,8 +81,6 @@ impl DecodeWorker {
             worker_frames,
             observed_timing_fields,
             snap_tx,
-            #[cfg(feature = "neural-vsr")]
-            denoise_on,
         )?;
         Ok(thread::spawn(move || worker.run(iq_rx)))
     }
@@ -114,9 +94,6 @@ impl DecodeWorker {
     }
 
     fn process_chunk(&mut self, chunk: IqChunk) -> bool {
-        #[cfg(feature = "neural-vsr")]
-        self.decoder
-            .set_restoration_enabled(self.denoise_on.load(std::sync::atomic::Ordering::Relaxed));
         self.decoder.push_iq(&chunk.samples, chunk.discontinuous);
         if self.config.decoder.debug
             && self.config.decoder.standard == Standard::Pal
@@ -230,21 +207,19 @@ impl DecodeWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fpv_drone_analog::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+    use fpv_drone_analog::vbi::FieldParity;
     use num_complex::Complex;
-    use orecchiette_fpv_drone_analog_rs::synthetic::{
-        SyntheticVideoConfig, TestPattern, generate_iq,
-    };
-    use orecchiette_fpv_drone_analog_rs::vbi::FieldParity;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn worker(is_pal: bool, decim: usize) -> (DecodeWorker, mpsc::Receiver<()>) {
         let config = DecodeWorkerConfig {
             decoder: DecoderConfig {
-                plan: orecchiette_fpv_drone_analog_rs::decode::DecodePlan::new(
+                plan: fpv_drone_analog::decode::DecodePlan::new(
                     15_360_000 * decim as u32,
                     3_000_000.0,
                     10_000_000.0,
-                    orecchiette_fpv_drone_analog_rs::decode::DemodulationMode::Discriminator,
+                    fpv_drone_analog::decode::DemodulationMode::Discriminator,
                 )
                 .unwrap(),
                 frequency_offset_hz: 0.0,
@@ -254,7 +229,6 @@ mod tests {
                 debug: false,
             },
             display_mhz: 5865.0,
-            denoise_model: None,
         };
         let (frame_tx, frame_rx) = mpsc::sync_channel(1);
         let (_, recycle_rx) = mpsc::channel();
@@ -267,8 +241,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             snap_tx,
-            #[cfg(feature = "neural-vsr")]
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         (worker.unwrap(), frame_rx)
     }

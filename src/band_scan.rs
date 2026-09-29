@@ -23,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use fpv_drone_analog::detector::ProbeEnergy;
+use fpv_drone_analog::types::{DetectionResult, SignalType};
 use minifb::{Key, Window, WindowOptions};
-use orecchiette_fpv_drone_analog_rs::detector::ProbeEnergy;
-use orecchiette_fpv_drone_analog_rs::types::{DetectionResult, SignalType};
 
 /// How the panel is shown over a locked picture. Process-wide so the
 /// operator's choice survives a relock.
@@ -870,7 +870,7 @@ mod tests {
     use super::*;
 
     fn band58() -> Vec<Channel> {
-        orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
+        fpv_drone_analog::bands::get_all_channels()
             .into_iter()
             .filter(|c| (5_645e6..=5_945e6).contains(&(c.frequency_hz as f64)))
             .map(|c| Channel {
@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn axis_is_monotonic_and_splits_far_apart_bands() {
-        let all: Vec<f64> = orecchiette_fpv_drone_analog_rs::bands::get_all_channels()
+        let all: Vec<f64> = fpv_drone_analog::bands::get_all_channels()
             .iter()
             .map(|c| c.frequency_hz as f64)
             .collect();

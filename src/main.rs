@@ -12,27 +12,27 @@ mod sdr;
 use band_scan::{BandScan, PanelMode, ScanWindow};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use decode_worker::{DecodeWorker, DecodeWorkerConfig, FrameSlot, IqChunk, lock_slot};
-use minifb::{Key, Window, WindowOptions};
-use num_complex::Complex;
-use orecchiette_fpv_drone_analog_rs::acquisition::{
+use fpv_drone_analog::acquisition::{
     AcquisitionRecord, LockState, analyze_channel_standard, analyze_tuned_channel,
 };
-use orecchiette_fpv_drone_analog_rs::bands::{get_fpv_channel_name, snap_to_nearest_fpv_channel};
-use orecchiette_fpv_drone_analog_rs::decode::{
+use fpv_drone_analog::bands::{get_fpv_channel_name, snap_to_nearest_fpv_channel};
+use fpv_drone_analog::decode::{
     DecodePlan, DecoderConfig, DemodulationMode, LUMA_HEADROOM_HZ, decode_decimation,
 };
-use orecchiette_fpv_drone_analog_rs::demod::DEFAULT_DEEMPHASIS_TAU_S;
-use orecchiette_fpv_drone_analog_rs::detector::{ProbeEnergy, SpectralIntegrator};
-use orecchiette_fpv_drone_analog_rs::lookup_channel_by_name;
+use fpv_drone_analog::demod::DEFAULT_DEEMPHASIS_TAU_S;
+use fpv_drone_analog::detector::{ProbeEnergy, SpectralIntegrator};
+use fpv_drone_analog::lookup_channel_by_name;
 #[cfg(feature = "soapy")]
-use orecchiette_fpv_drone_analog_rs::scanner::detect_packets_per_hop;
-use orecchiette_fpv_drone_analog_rs::scanner::{
+use fpv_drone_analog::scanner::detect_packets_per_hop;
+use fpv_drone_analog::scanner::{
     CandidatePolicy, ScanProgress, ScanSelector, SweepBudget, plan_tune_centers,
 };
 #[cfg(feature = "aaronia")]
-use orecchiette_fpv_drone_analog_rs::scanner::{DETECT_PACKETS_NARROW, DETECT_PACKETS_PER_HOP};
-use orecchiette_fpv_drone_analog_rs::types::SignalType;
-use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
+use fpv_drone_analog::scanner::{DETECT_PACKETS_NARROW, DETECT_PACKETS_PER_HOP};
+use fpv_drone_analog::types::SignalType;
+use fpv_drone_analog::video::FrameReconstructor;
+use minifb::{Key, Window, WindowOptions};
+use num_complex::Complex;
 use sdr::{SdrSource, SourceConfig};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -97,13 +97,6 @@ struct FileArgs {
     /// per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
-    /// Start with the neural temporal denoiser enabled (requires a
-    /// build with `--features neural-vsr`). Toggle it live with `D`.
-    #[arg(long)]
-    denoise: bool,
-    /// Path to the denoiser ONNX model.
-    #[arg(long, default_value = "models/temporal_denoiser.onnx")]
-    denoise_model: String,
     #[arg(long)]
     debug: bool,
     /// Number of fields kept in the temporal denoise / dropout-repair
@@ -165,15 +158,6 @@ struct LiveArgs {
     /// per-value details.
     #[arg(long, value_enum, ignore_case = true, default_value_t = DemodKind::Auto)]
     demod: DemodKind,
-    /// Start with the neural temporal denoiser enabled (requires a
-    /// build with `--features neural-vsr`). Toggle it live with `D`.
-    /// It is a clear win on impaired links — dropouts especially — and
-    /// a small cost on a clean signal, so it starts off by default.
-    #[arg(long)]
-    denoise: bool,
-    /// Path to the denoiser ONNX model.
-    #[arg(long, default_value = "models/temporal_denoiser.onnx")]
-    denoise_model: String,
     /// Enable debug mode: saves startup frames 1-3 and steady-state
     /// frames 30-32 as PNGs, prints periodic metrics, and keeps
     /// running until quit (Q / Ctrl-C).
@@ -227,7 +211,7 @@ impl From<DemodKind> for DemodulationMode {
 
 // `--standard` stays a hand-written `value_parser` rather than
 // `clap::ValueEnum`: `SignalType` is a foreign, `#[non_exhaustive]`
-// type from `orecchiette_fpv_drone_analog_rs`, so the orphan rule
+// type from `fpv_drone_analog`, so the orphan rule
 // blocks implementing `ValueEnum` for it here — unlike `DemodKind`,
 // which is a local type and derives it directly above.
 fn parse_standard(s: &str) -> Result<SignalType, String> {
@@ -272,12 +256,11 @@ const AARONIA_SENSITIVE_DWELL: Duration = Duration::from_millis(60);
 /// Aaronia's measured tuning costs, supplied to the shared sweep policy.
 #[cfg(feature = "aaronia")]
 fn aaronia_sweep_budget(n: u32, sample_rate_hz: f64) -> SweepBudget {
-    orecchiette_fpv_drone_analog_rs::scanner::SweepPolicy {
+    fpv_drone_analog::scanner::SweepPolicy {
         fast: SweepBudget::flat(AARONIA_SCAN_DWELL, DETECT_PACKETS_PER_HOP),
         sensitive: SweepBudget::flat(AARONIA_SENSITIVE_DWELL, DETECT_PACKETS_NARROW),
         sensitive_every: AARONIA_SENSITIVE_EVERY,
-        narrow_capture_max_rate_hz:
-            orecchiette_fpv_drone_analog_rs::scanner::NARROW_CAPTURE_MAX_RATE_HZ,
+        narrow_capture_max_rate_hz: fpv_drone_analog::scanner::NARROW_CAPTURE_MAX_RATE_HZ,
     }
     .budget(n, sample_rate_hz)
 }
@@ -331,10 +314,9 @@ fn locked_capture_rate_hz(scan_rate_hz: f64, fm_deviation: f32, demod: DemodKind
     if matches!(demod, DemodKind::Pll) || !scan_rate_hz.is_finite() || scan_rate_hz <= 0.0 {
         return scan_rate_hz;
     }
-    let Some(needed_rate) = orecchiette_fpv_drone_analog_rs::decode::required_capture_rate(
-        fm_deviation,
-        USABLE_SPAN_FRACTION,
-    ) else {
+    let Some(needed_rate) =
+        fpv_drone_analog::decode::required_capture_rate(fm_deviation, USABLE_SPAN_FRACTION)
+    else {
         return scan_rate_hz;
     };
 
@@ -375,10 +357,10 @@ impl ScanBands {
         }
     }
 
-    fn selection(self) -> orecchiette_fpv_drone_analog_rs::bands::BandSelection {
+    fn selection(self) -> fpv_drone_analog::bands::BandSelection {
         match self {
-            Self::Band58 => orecchiette_fpv_drone_analog_rs::bands::BandSelection::Band58,
-            Self::All => orecchiette_fpv_drone_analog_rs::bands::BandSelection::All,
+            Self::Band58 => fpv_drone_analog::bands::BandSelection::Band58,
+            Self::All => fpv_drone_analog::bands::BandSelection::All,
         }
     }
     fn channel_freqs_hz(self) -> Vec<f64> {
@@ -852,8 +834,6 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         fm_deviation,
         args.deemphasis_tau,
         args.demod,
-        args.denoise,
-        args.denoise_model.clone(),
         rf_center_freq,
         args.debug,
         args.temporal_window,
@@ -1190,8 +1170,6 @@ fn run_live_soapy(args: SoapyArgs) -> anyhow::Result<()> {
             fm_deviation,
             args.live.deemphasis_tau,
             args.live.demod,
-            args.live.denoise,
-            args.live.denoise_model.clone(),
             center_freq,
             args.live.standard,
             scan_standard,
@@ -1379,7 +1357,7 @@ fn scan_band_for_channel(
         dwell,
     };
     let handle = source.start(config)?;
-    let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
+    let detector = fpv_drone_analog::scanner::receiver_detector();
 
     let mut selector = ScanSelector::new(skipped_freqs, CandidatePolicy::NearestChannel);
     let mut progress = ScanProgress::new(&hop_freqs, budget.packets_per_hop);
@@ -1610,8 +1588,6 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             fm_deviation,
             live.deemphasis_tau,
             live.demod,
-            live.denoise,
-            live.denoise_model.clone(),
             center_freq,
             live.standard,
             scan_standard,
@@ -1670,8 +1646,6 @@ fn run_live(
     fm_deviation: f32,
     deemphasis_tau: f32,
     demod_kind: DemodKind,
-    denoise: bool,
-    denoise_model: String,
     center_freq: f64,
     forced_standard: Option<SignalType>,
     scan_hint: Option<SignalType>,
@@ -1819,8 +1793,6 @@ fn run_live(
         fm_deviation,
         deemphasis_tau,
         demod_kind,
-        denoise,
-        denoise_model,
         rf_center_freq,
         debug,
         temporal_window,
@@ -1847,7 +1819,7 @@ fn run_live(
             // relocked in a loop — 44 times in four minutes on a live
             // Aaronia link before crashing.
             let mut lock_integ = SpectralIntegrator::new(4);
-            let detector = orecchiette_fpv_drone_analog_rs::scanner::receiver_detector();
+            let detector = fpv_drone_analog::scanner::receiver_detector();
             // Check cadence in wall time, not packets: a fixed 400-packet
             // interval was 0.43 s at 61.44 MSPS but 1.3 s at HackRF's
             // 20 MSPS, and the integrator's 4-batch memory plus the miss
@@ -2048,8 +2020,6 @@ fn run_viewer_pipeline<F>(
     fm_deviation: f32,
     deemphasis_tau: f32,
     demod_kind: DemodKind,
-    denoise: bool,
-    denoise_model: String,
     rf_center_freq: f64,
     debug: bool,
     temporal_window: usize,
@@ -2072,19 +2042,7 @@ where
     let mut windows = Vec::new();
     let mut display_buffers = Vec::new();
 
-    // Live denoiser toggle, shared UI thread → every decode worker. The
-    // reconstructors live in per-channel threads, so the `D` hotkey flips
-    // this flag and each worker picks it up on its next field rather than
-    // the UI reaching into another thread's state.
-    let denoise_on = Arc::new(std::sync::atomic::AtomicBool::new(denoise));
-
     for (sig_type, freq_offset, bandwidth_hz) in resolved_channels {
-        // Both are only read by the `neural-vsr` code paths; without that
-        // feature the worker has no denoiser to toggle.
-        #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
-        let denoise_on = Arc::clone(&denoise_on);
-        #[cfg_attr(not(feature = "neural-vsr"), allow(unused_variables))]
-        let denoise_model = denoise_model.clone();
         let (iq_tx, iq_rx) = mpsc::sync_channel::<IqChunk>(10);
         // The channel is now only a wakeup, and the thing that still
         // reports the UI going away: dropping the receiver is how the
@@ -2245,13 +2203,12 @@ where
             decoder: DecoderConfig {
                 plan,
                 frequency_offset_hz: freq_offset,
-                standard: orecchiette_fpv_drone_analog_rs::timing::Standard::from_is_pal(is_pal),
+                standard: fpv_drone_analog::timing::Standard::from_is_pal(is_pal),
                 deemphasis_tau_s: deemphasis_tau,
                 temporal_window,
                 debug,
             },
             display_mhz,
-            denoise_model: Some(denoise_model),
         };
 
         DecodeWorker::spawn(
@@ -2263,8 +2220,6 @@ where
             worker_frames,
             worker_observed,
             snap_tx,
-            #[cfg(feature = "neural-vsr")]
-            denoise_on,
         )?;
     }
 
@@ -2278,7 +2233,6 @@ where
     thread::spawn(move || reader_fn(channel_txs, thread_exit_flag));
     // Main UI Loop
     let mut ch_input = ChannelInputState::Idle;
-    let mut denoise_toggle_requested = false;
     // The band panel rides under the picture, marking the frequency this
     // window is locked to. `B` cycles its size; the choice is process-wide
     // so it survives a relock.
@@ -2335,17 +2289,11 @@ where
                 break;
             }
 
-            // D → toggle the neural denoiser. Only *record* the request
-            // here: this block runs once per open window, so acting on it
-            // inline would toggle N times for one keypress — with two
-            // windows that is a silent no-op. Applied once after the
-            // per-window loop.
-            if idle && pressed.contains(&Key::D) {
-                denoise_toggle_requested = true;
-            }
-
-            // B → cycle the band panel (strip, full, off). Recorded like
-            // D and applied once after the per-window loop.
+            // B → cycle the band panel (strip, full, off). Only *record*
+            // the request here: this block runs once per open window, so
+            // acting on it inline would cycle N times for one keypress —
+            // with two windows that is a silent no-op. Applied once after
+            // the per-window loop.
             if idle && band.is_some() && pressed.contains(&Key::B) {
                 panel_toggle_requested = true;
             }
@@ -2412,12 +2360,13 @@ where
                             name.push(c);
                         }
                         let exact = lookup_channel_by_name(&name);
-                        let has_longer = orecchiette_fpv_drone_analog_rs::bands::channel_catalog()
-                            .iter()
-                            .any(|channel| {
-                                let full = channel.name();
-                                full.len() > name.len() && full.starts_with(&name)
-                            });
+                        let has_longer =
+                            fpv_drone_analog::bands::channel_catalog()
+                                .iter()
+                                .any(|channel| {
+                                    let full = channel.name();
+                                    full.len() > name.len() && full.starts_with(&name)
+                                });
                         if !submit && has_longer {
                             ch_input = ChannelInputState::Typing(name);
                             break;
@@ -2455,17 +2404,10 @@ where
 
                     let format_str = if *is_pal { "PAL" } else { "NTSC" };
                     let channel_name = get_fpv_channel_name(*display_mhz);
-                    // Show the denoiser state so the operator can see what
-                    // `D` did without hunting the console.
-                    let dn = if denoise_on.load(std::sync::atomic::Ordering::Relaxed) {
-                        " DN"
-                    } else {
-                        ""
-                    };
                     let display_text = if let Some(ch) = channel_name {
-                        format!("{} · Channel {} [BW]{}", format_str, ch, dn)
+                        format!("{} · Channel {} [BW]", format_str, ch)
                     } else {
-                        format!("{} · {:.2} MHz [BW]{}", format_str, display_mhz, dn)
+                        format!("{} · {:.2} MHz [BW]", format_str, display_mhz)
                     };
 
                     draw_text_with_bg(
@@ -2506,9 +2448,9 @@ where
                     // offered when there is a panel to cycle.
                     let hint_y = (*height).saturating_sub(20);
                     let hint = if band.is_some() {
-                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise  B:Band"
+                        "Q:Quit  S:Skip  N:Next  C:Channel  B:Band"
                     } else {
-                        "Q:Quit  S:Skip  N:Next  C:Channel  D:Denoise"
+                        "Q:Quit  S:Skip  N:Next  C:Channel"
                     };
                     draw_text_with_bg(
                         &mut display_buffers[i],
@@ -2587,22 +2529,6 @@ where
             }
 
             i += 1;
-        }
-
-        // One keypress → one toggle, regardless of how many windows are
-        // open. Workers pick the new state up on their next field; the
-        // model stays loaded either way, so the switch is instant.
-        if denoise_toggle_requested {
-            denoise_toggle_requested = false;
-            let now = !denoise_on.load(std::sync::atomic::Ordering::Relaxed);
-            denoise_on.store(now, std::sync::atomic::Ordering::Relaxed);
-            if cfg!(feature = "neural-vsr") {
-                println!("Denoiser {}", if now { "ON" } else { "OFF" });
-            } else {
-                println!(
-                    "Denoiser unavailable: rebuild with `--features neural-vsr` to enable it."
-                );
-            }
         }
 
         if panel_toggle_requested {
