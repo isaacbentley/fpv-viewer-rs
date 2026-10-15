@@ -264,7 +264,8 @@ impl Pump {
                 if last_delivered.elapsed() >= SILENCE_BAILOUT {
                     match last_rejected_hz {
                         Some(hz) => anyhow::bail!(
-                            "no usable samples for {SILENCE_BAILOUT:?}: packets report {:.3} MHz, not the commanded {:.3} MHz",
+                            "no usable samples for {SILENCE_BAILOUT:?}: packets report {:.3} MHz, not the commanded {:.3} MHz \
+                             (check RTSA-Suite block config and /remoteconfig software license: https://aaronia.com/en/software-licence-remote-config)",
                             hz / 1e6,
                             channel / 1e6
                         ),
@@ -312,7 +313,7 @@ impl Pump {
                     // Read per packet: over HTTP the rate the device
                     // streams is only known once packets flow, and snaps
                     // to its decimation ladder.
-                    sample_rate_hz: source.sample_rate_hz() as f32,
+                    sample_rate_hz: (source.capture_sample_rate_hz() as f32).max(1.0),
                     overrun: source.take_overrun(),
                 };
                 if !self.deliver(pkt).await {

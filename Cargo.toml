@@ -1,6 +1,6 @@
 [package]
 name = "fpv-viewer"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 rust-version = "1.89"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
@@ -17,14 +17,12 @@ fpv-drone-analog = { package = "orecchiette-fpv-drone-analog-rs", git = "https:/
 # device itself is reached through whichever SoapySDR module drives it
 # (SoapyHackRF, SoapyUHD, ...), installed separately.
 soapysdr = { version = "0.5.1", optional = true }
-# Default features off: the crate's `sdr-source` facade pulls in a
-# source trait this viewer does not use — it drives the unified source
-# itself (`src/sdr/aaronia.rs`). `http` + `file` are what the unified
-# source needs; `native-sdk` adds `aaronia sdk`. For local
-# co-development against a sibling checkout, add:
+# Default features off: only enable `http`, `file`, and `native-sdk` for the
+# unified source (`src/sdr/aaronia.rs`). For local co-development against a
+# sibling checkout, add:
 #   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
 #   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
-sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.11.2", default-features = false, features = [
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.13.2", default-features = false, features = [
     "http",
     "file",
     "native-sdk",

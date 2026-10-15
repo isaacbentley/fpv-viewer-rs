@@ -340,8 +340,22 @@ impl BandScan {
                 .find(|(_, d)| (d.frequency_hz as f64 - f).abs() < CHANNEL_REACH_HZ)
             {
                 Some(slot) => {
-                    if r.rssi_dbm > slot.1.rssi_dbm || r.confidence > slot.1.confidence {
-                        *slot = (hop_center_hz, r.clone());
+                    let was_confirmed = slot.1.confidence >= CONFIRM_AT;
+                    let is_confirmed = r.confidence >= CONFIRM_AT;
+                    let should_replace = if was_confirmed && !is_confirmed {
+                        false
+                    } else {
+                        (is_confirmed && !was_confirmed)
+                            || r.rssi_dbm > slot.1.rssi_dbm
+                            || r.confidence > slot.1.confidence
+                    };
+                    if should_replace {
+                        let max_conf = slot.1.confidence.max(r.confidence);
+                        let mut updated = r.clone();
+                        updated.confidence = max_conf;
+                        *slot = (hop_center_hz, updated);
+                    } else if r.rssi_dbm > slot.1.rssi_dbm {
+                        slot.1.rssi_dbm = r.rssi_dbm;
                     }
                 }
                 None => self.detections.push((hop_center_hz, r.clone())),
@@ -584,6 +598,7 @@ impl BandScan {
         }
         // channel grid: one row per band, each cell at its true frequency
         let grid_top = bars_bot + axis_h + 2;
+        let closest_locked_hz = self.lock_hz.and_then(|l| self.channel_at(l)).map(|c| c.hz);
         for (r, band) in self.rows.iter().enumerate() {
             let yy = grid_top + r * 9;
             super::draw_string(
@@ -603,9 +618,7 @@ impl BandScan {
                     .unwrap_or(0.0);
                 let x = axis.x(c.hz).saturating_sub(cell_w / 2);
                 let is_skip = self.skipped.contains(&(c.hz.round() as u64));
-                let is_lock = self
-                    .lock_hz
-                    .is_some_and(|l| (l - c.hz).abs() < CHANNEL_REACH_HZ);
+                let is_lock = closest_locked_hz == Some(c.hz);
                 let det = self
                     .detections
                     .iter()

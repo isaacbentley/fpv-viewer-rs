@@ -32,7 +32,7 @@ jobs:
             ext: ""
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install Cross-Compilation Dependencies (Linux)
         if: runner.os == 'Linux'
@@ -87,7 +87,7 @@ jobs:
       # For Windows and Linux, just upload the binary
       - name: Upload Binary (Windows/Linux)
         if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: target/${{ matrix.target }}/release/fpv-viewer${{ matrix.ext }}
@@ -102,7 +102,38 @@ jobs:
 
       - name: Upload DMG (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}.dmg
+          name: ${{ matrix.artifact_name }}-dmg
           path: ${{ matrix.artifact_name }}.dmg
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p dist
+          if [ -f release-assets/fpv-viewer-linux-rpi5/fpv-viewer ]; then
+            cp release-assets/fpv-viewer-linux-rpi5/fpv-viewer dist/fpv-viewer-linux-rpi5
+            chmod +x dist/fpv-viewer-linux-rpi5
+          fi
+          find release-assets -name "*.dmg" -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+

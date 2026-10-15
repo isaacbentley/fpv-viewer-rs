@@ -94,7 +94,25 @@ impl DecodeWorker {
     }
 
     fn process_chunk(&mut self, chunk: IqChunk) -> bool {
-        self.decoder.push_iq(&chunk.samples, chunk.discontinuous);
+        let clean_chunk: Option<Vec<num_complex::Complex<f32>>> = chunk
+            .samples
+            .iter()
+            .any(|s| !s.re.is_finite() || !s.im.is_finite())
+            .then(|| {
+                chunk
+                    .samples
+                    .iter()
+                    .map(|s| {
+                        num_complex::Complex::new(
+                            if s.re.is_finite() { s.re } else { 0.0 },
+                            if s.im.is_finite() { s.im } else { 0.0 },
+                        )
+                    })
+                    .collect()
+            });
+        let iq_slice: &[num_complex::Complex<f32>] =
+            clean_chunk.as_deref().unwrap_or(&chunk.samples);
+        self.decoder.push_iq(iq_slice, chunk.discontinuous);
         if self.config.decoder.debug
             && self.config.decoder.standard == Standard::Pal
             && !self.pal_debug_done

@@ -213,6 +213,8 @@ Sweep the band from an RTSA HTTP server instead (no SDK needed):
 cargo run --release -- aaronia http http://atc.local:54664
 ```
 
+> **Note:** Retuning an Aaronia RTSA-Suite HTTP server via `/remoteconfig` requires the [Aaronia Remote Config software license](https://aaronia.com/en/software-licence-remote-config) when the HTTP Server block sits downstream of a Spectran V6 hardware block; without it, `sdr-aaronia-rs` automatically falls back to `/control` where supported.
+
 ## Commands and options
 
 ```text

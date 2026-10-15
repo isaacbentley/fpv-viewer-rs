@@ -166,7 +166,7 @@ impl Capture {
                     .pool_rx
                     .try_recv()
                     .unwrap_or_else(|_| Vec::with_capacity(self.block_size));
-                match self.fill(&mut block, &mut errors, &mut timeouts)? {
+                match self.fill(&mut block, &mut overrun, &mut errors, &mut timeouts)? {
                     Fill::Stopped => break,
                     Fill::Overflowed => {
                         overrun = true;
@@ -238,16 +238,19 @@ impl Capture {
         Ok(tuned)
     }
 
-    /// Read until `block` holds `block_size` contiguous samples.
+    /// Read until `block` holds `block_size` contiguous samples (or fewer if
+    /// an overflow interrupted a non-empty partial fill).
     fn fill(
         &mut self,
         block: &mut Vec<Complex32>,
+        overrun: &mut bool,
         errors: &mut u32,
         timeouts: &mut u32,
     ) -> anyhow::Result<Fill> {
         block.clear();
         block.resize(self.block_size, Complex32::default());
         let mut filled = 0;
+        let mut empty_overflows = 0u32;
         while filled < self.block_size {
             if self.stopped() {
                 return Ok(Fill::Stopped);
@@ -277,8 +280,21 @@ impl Capture {
                     filled += n;
                     *errors = 0;
                     *timeouts = 0;
+                    empty_overflows = 0;
                 }
-                Err(e) if e.code == ErrorCode::Overflow => return Ok(Fill::Overflowed),
+                Err(e) if e.code == ErrorCode::Overflow => {
+                    *overrun = true;
+                    if filled > 0 {
+                        block.truncate(filled);
+                        return Ok(Fill::Full);
+                    }
+                    empty_overflows += 1;
+                    anyhow::ensure!(
+                        empty_overflows < ERROR_BAILOUT,
+                        "{ERROR_BAILOUT} consecutive empty overflows; the device cannot keep up"
+                    );
+                    return Ok(Fill::Overflowed);
+                }
                 Err(e) => {
                     *errors += 1;
                     anyhow::ensure!(

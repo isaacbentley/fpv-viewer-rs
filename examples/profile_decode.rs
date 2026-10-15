@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     noise_sigma: 0.05,
                     dc_offset: 0.0,
                 },
-                8,
+                32,
                 0.0,
             );
             let plan = DecodePlan::new(

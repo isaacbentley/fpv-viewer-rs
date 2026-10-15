@@ -667,7 +667,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
     meta_path.set_extension("sigmf-meta");
 
     let mut sample_rate = args.sample_rate.unwrap_or(100_000_000);
-    let mut fm_deviation = args.fm_deviation.unwrap_or(17_000_000.0);
+    let mut fm_deviation = args.fm_deviation.unwrap_or(5_000_000.0);
     let mut rf_center_freq = 5_800_000_000.0_f64;
     let mut channels_to_spawn = Vec::new();
 
@@ -735,8 +735,12 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
     }
 
     if channels_to_spawn.is_empty() {
-        channels_to_spawn.push((None, -25_000_000.0, "Channel A".to_string()));
-        channels_to_spawn.push((None, 25_000_000.0, "Channel B".to_string()));
+        if sample_rate > 50_000_000 {
+            channels_to_spawn.push((None, -25_000_000.0, "Channel A".to_string()));
+            channels_to_spawn.push((None, 25_000_000.0, "Channel B".to_string()));
+        } else {
+            channels_to_spawn.push((None, 0.0, "Channel 1".to_string()));
+        }
     }
 
     println!(
@@ -765,12 +769,24 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
     }
 
     let mut file = File::open(&data_path)?;
-    let chunk_size = sample_rate as usize / 10;
+    let chunk_size = (sample_rate as usize / 10).max(1);
     let mut buf = vec![0u8; chunk_size * 8];
 
-    file.read_exact(&mut buf)?;
+    let mut initial_filled = 0usize;
+    while initial_filled < buf.len() {
+        match file.read(&mut buf[initial_filled..])? {
+            0 => break,
+            n => initial_filled += n,
+        }
+    }
+    if initial_filled < 8 {
+        anyhow::bail!(
+            "input IQ file {:?} contains fewer than 1 cf32 sample (8 bytes)",
+            data_path
+        );
+    }
 
-    let first_iq: Vec<Complex<f32>> = buf
+    let first_iq: Vec<Complex<f32>> = buf[..(initial_filled / 8) * 8]
         .as_chunks::<8>()
         .0
         .iter()
@@ -842,7 +858,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         tune_freq,
         frames_decoded.clone(),
         observed_timing_fields.clone(),
-        move |channel_txs, _exit_flag| {
+        move |channel_txs, exit_flag| {
             let _ = file.seek(SeekFrom::Start(0));
             let mut active_txs = channel_txs;
             // Looping playback wraps to the start on EOF, and the last
@@ -851,23 +867,33 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
             // difference across it as a frequency — the same spike a
             // dropped chunk produces, once per loop.
             let mut wrapped = false;
+            let mut rem = 0usize;
             loop {
-                if active_txs.is_empty() {
+                if active_txs.is_empty()
+                    || exit_flag.load(std::sync::atomic::Ordering::Relaxed) != 0
+                {
                     return;
                 }
-                match file.read(&mut buf) {
+                match file.read(&mut buf[rem..]) {
                     Ok(0) => {
                         let _ = file.seek(SeekFrom::Start(0));
+                        rem = 0;
                         wrapped = true;
                     }
                     Ok(bytes_read) => {
-                        let samples_read = bytes_read / 8;
+                        let total = rem + bytes_read;
+                        let samples_read = total / 8;
+                        if samples_read == 0 {
+                            rem = total;
+                            continue;
+                        }
+                        let consumed = samples_read * 8;
                         // Parse via from_le_bytes rather than
                         // bytemuck::cast_slice: cast_slice panics by
                         // contract if the Vec<u8> isn't 4-byte aligned,
                         // which the allocator happens to guarantee today
                         // but nothing requires.
-                        let iq_vec: Vec<Complex<f32>> = buf[..samples_read * 8]
+                        let iq_vec: Vec<Complex<f32>> = buf[..consumed]
                             .as_chunks::<8>()
                             .0
                             .iter()
@@ -877,6 +903,10 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                                 Complex::new(re, im)
                             })
                             .collect();
+                        rem = total - consumed;
+                        if rem > 0 {
+                            buf.copy_within(consumed..total, 0);
+                        }
                         let arc_chunk = Arc::new(sdr::IqBuffer::new_unpooled(iq_vec));
                         let breaks = std::mem::take(&mut wrapped);
                         active_txs.retain(|tx| {
@@ -903,8 +933,8 @@ pub enum RunLiveResult {
     UserExit,
     SignalLost,
     TooManyOverruns,
-    /// User pressed 'S' — skip this frequency and resume scanning.
-    SkipFrequency,
+    /// User pressed 'S' — skip this frequency (and any refined carrier frequency) and resume scanning.
+    SkipFrequency(Option<f64>),
     /// User pressed 'N' — find the next signal (resume scanning without blacklisting).
     NextChannel,
     /// User pressed 'C' + two-char channel name — tune to a specific channel.
@@ -1196,12 +1226,16 @@ fn run_live_soapy(args: SoapyArgs) -> anyhow::Result<()> {
                     break;
                 }
             }
-            RunLiveResult::SkipFrequency => {
+            RunLiveResult::SkipFrequency(refined) => {
                 skipped_freqs.insert(center_freq.round() as u64);
+                if let Some(r_hz) = refined {
+                    skipped_freqs.insert(r_hz.round() as u64);
+                }
+                let display_hz = refined.unwrap_or(center_freq);
                 println!(
                     "Skipped {:.3} MHz ({}). {} frequencies blacklisted.",
-                    center_freq / 1e6,
-                    get_fpv_channel_name(center_freq / 1e6).unwrap_or("Unknown"),
+                    display_hz / 1e6,
+                    get_fpv_channel_name(display_hz / 1e6).unwrap_or("Unknown"),
                     skipped_freqs.len()
                 );
                 if auto_scan {
@@ -1347,7 +1381,7 @@ fn scan_band_for_channel(
         scan_bands.label(),
         scan_bands.channel_freqs_hz().len(),
         hop_freqs.len(),
-        sample_rate * USABLE_SPAN_FRACTION / 1e6
+        sample_rate * USABLE_SPAN_FRACTION / 1e6,
     );
     let config = SourceConfig {
         sample_rate_hz: sample_rate,
@@ -1389,10 +1423,16 @@ fn scan_band_for_channel(
                     continue;
                 };
 
+                let pkt_sample_rate =
+                    if packet.sample_rate_hz.is_finite() && packet.sample_rate_hz >= 1.0 {
+                        packet.sample_rate_hz.round() as u32
+                    } else {
+                        sample_rate as u32
+                    };
                 let results = detector.detect_from_iq_integrated_with_probes(
                     &packet.samples,
                     rf_center,
-                    sample_rate as u32,
+                    pkt_sample_rate,
                     &mut sweep.integrator,
                     &mut probes,
                 );
@@ -1582,6 +1622,10 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         }
         // The picture window takes over from the scan window.
         sweep.ui = None;
+        let settle = match &transport {
+            Transport::Http { .. } => AARONIA_HTTP_TUNE_SETTLE,
+            Transport::Sdk { .. } => Duration::ZERO,
+        };
         match run_live(
             make_source(),
             live_rate,
@@ -1595,7 +1639,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
             live.temporal_window,
             Some(&sweep.band),
             OverrunPolicy::Tolerate,
-            AARONIA_HTTP_TUNE_SETTLE,
+            settle,
         )? {
             RunLiveResult::UserExit => break,
             r @ (RunLiveResult::SignalLost
@@ -1614,8 +1658,18 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
                     break;
                 }
             }
-            RunLiveResult::SkipFrequency => {
+            RunLiveResult::SkipFrequency(refined) => {
                 skipped_freqs.insert(center_freq.round() as u64);
+                if let Some(r_hz) = refined {
+                    skipped_freqs.insert(r_hz.round() as u64);
+                }
+                let display_hz = refined.unwrap_or(center_freq);
+                println!(
+                    "Skipped {:.3} MHz ({}). {} frequencies blacklisted.",
+                    display_hz / 1e6,
+                    get_fpv_channel_name(display_hz / 1e6).unwrap_or("Unknown"),
+                    skipped_freqs.len()
+                );
                 if auto_scan {
                     explicit_freq = None;
                 } else {
@@ -1662,8 +1716,8 @@ fn run_live(
     println!("Waiting for first IQ chunk from SDR...");
     let mut first_packet = handle
         .receiver
-        .recv()
-        .map_err(|_| anyhow::anyhow!("SDR source closed before delivering any samples"))?;
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| anyhow::anyhow!("SDR source failed to deliver initial samples within 5s"))?;
     // A source that keeps sending the previous centre's samples after the
     // retune is acknowledged would have the standard auto-detected on the
     // wrong channel (measured: a clean NTSC link read "ambiguous" and
@@ -1820,17 +1874,12 @@ fn run_live(
             // Aaronia link before crashing.
             let mut lock_integ = SpectralIntegrator::new(4);
             let detector = fpv_drone_analog::scanner::receiver_detector();
-            // Check cadence in wall time, not packets: a fixed 400-packet
-            // interval was 0.43 s at 61.44 MSPS but 1.3 s at HackRF's
-            // 20 MSPS, and the integrator's 4-batch memory plus the miss
-            // threshold multiply that into the time a dead channel holds
-            // the screen. ~2 Hz everywhere keeps loss detection near 3 s
-            // on every backend.
-            let check_every = ((sample_rate_u32 as f64 * 0.5) / first_samples.len().max(1) as f64)
-                .round()
-                .max(1.0) as usize;
+            // Check cadence in true wall time (~2 Hz = every 500 ms),
+            // regardless of packet size or partial overflow reads.
+            const LOCK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+            let mut last_lock_check = Instant::now();
 
-            let mut packets = 0;
+            let mut packets = 0usize;
             let mut lock = LockState::default();
             let mut frames_at_last_check: u64 = 0;
             // The channel this run is holding. Detections elsewhere in
@@ -1840,6 +1889,7 @@ fn run_live(
 
             let mut overrun_count = 0;
             let mut last_overrun_clear = Instant::now();
+            let mut last_pkt_at = Instant::now();
 
             // Send first chunk. The stream has just started, so
             // nothing precedes it to be continuous with — the decoder's
@@ -1863,9 +1913,10 @@ fn run_live(
                 if exit_flag.load(std::sync::atomic::Ordering::Relaxed) != 0 {
                     break;
                 }
-                match receiver.recv() {
+                match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(packet) => {
                         packets += 1;
+                        last_pkt_at = Instant::now();
 
                         // Check overruns
                         if packet.overrun {
@@ -1885,8 +1936,10 @@ fn run_live(
                             last_overrun_clear = Instant::now();
                         }
 
-                        // Check signal lock periodically (approx twice a second)
-                        if packets % check_every == 0 {
+                        // Check signal lock periodically (approx twice a second in wall time)
+                        let check_due = last_lock_check.elapsed() >= LOCK_CHECK_INTERVAL;
+                        if check_due {
+                            last_lock_check = Instant::now();
                             // The same sweep path that found the signal
                             // decides whether it is still there — not
                             // `detect_sync_pulses` on the raw full-rate
@@ -1949,9 +2002,6 @@ fn run_live(
                             }
                         }
 
-                        // A packet flagged overrun follows a gap in
-                        // the stream: its first sample is not adjacent
-                        // to the last one the decoder saw.
                         // A packet flagged overrun follows a gap in the
                         // stream: its first sample is not adjacent to
                         // the last one any decoder saw.
@@ -1982,14 +2032,20 @@ fn run_live(
                                 Err(mpsc::TrySendError::Disconnected(_)) => false, // UI closed
                             }
                         });
-                        if debug && packets % check_every == 0 && dropped_chunks > 0 {
+                        if debug && check_due && dropped_chunks > 0 {
                             eprintln!(
                                 "[DEBUG] dropped {} IQ chunks so far (decode worker behind)",
                                 dropped_chunks
                             );
                         }
                     }
-                    Err(_) => break, // SDR disconnected
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if last_pkt_at.elapsed() >= Duration::from_secs(5) {
+                            exit_flag.store(1, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break, // SDR disconnected
                 }
             }
         },
@@ -2041,6 +2097,8 @@ where
     let mut recycle_txs = Vec::new();
     let mut windows = Vec::new();
     let mut display_buffers = Vec::new();
+    let mut snap_handles = Vec::new();
+    let mut locked_display_hz: Option<f64> = None;
 
     for (sig_type, freq_offset, bandwidth_hz) in resolved_channels {
         let (iq_tx, iq_rx) = mpsc::sync_channel::<IqChunk>(10);
@@ -2124,6 +2182,9 @@ where
         let display_mhz = refined_carrier_hz
             .map(|hz| snap_to_nearest_fpv_channel(hz) / 1_000_000.0)
             .unwrap_or(absolute_freq_mhz);
+        if locked_display_hz.is_none() {
+            locked_display_hz = Some(display_mhz * 1_000_000.0);
+        }
         let channel_name = get_fpv_channel_name(display_mhz);
         if let Some(refined) = refined_carrier_hz
             && (display_mhz - absolute_freq_mhz).abs() > 0.5
@@ -2190,7 +2251,7 @@ where
         // snapshot is taken — so the saved image would misrepresent the
         // decode. The decode loop hands (path, rgb, w, h) here instead.
         let (snap_tx, snap_rx) = mpsc::channel::<(String, Vec<u8>, u32, u32)>();
-        thread::spawn(move || {
+        let snap_handle = thread::spawn(move || {
             while let Ok((path, rgb, w, h)) = snap_rx.recv() {
                 match image::save_buffer(&path, &rgb, w, h, image::ColorType::Rgb8) {
                     Ok(()) => eprintln!("[DEBUG] Saved {}", path),
@@ -2198,6 +2259,7 @@ where
                 }
             }
         });
+        snap_handles.push(snap_handle);
 
         let config = DecodeWorkerConfig {
             decoder: DecoderConfig {
@@ -2238,7 +2300,7 @@ where
     // so it survives a relock.
     let mut band = band;
     if let Some(b) = band.as_mut() {
-        b.set_lock(Some(rf_center_freq));
+        b.set_lock(locked_display_hz.or(Some(rf_center_freq)));
     }
     let mut panel_mode = PanelMode::load();
     let mut panel_toggle_requested = false;
@@ -2279,8 +2341,8 @@ where
                 continue;
             }
 
-            // S → skip this frequency (blacklist it), resume scanning
-            if matches!(ch_input, ChannelInputState::Idle) && window.is_key_down(Key::S) {
+            // S → skip this frequency (blacklist it), resume scanning (live SDR only)
+            if idle && band.is_some() && pressed.contains(&Key::S) {
                 exit_reason.store(3, std::sync::atomic::Ordering::Relaxed);
                 windows.clear();
                 frame_rxs.clear();
@@ -2298,8 +2360,8 @@ where
                 panel_toggle_requested = true;
             }
 
-            // N → find next channel (resume scanning without blacklisting)
-            if matches!(ch_input, ChannelInputState::Idle) && window.is_key_down(Key::N) {
+            // N → find next channel (resume scanning without blacklisting, live SDR only)
+            if idle && band.is_some() && pressed.contains(&Key::N) {
                 exit_reason.store(4, std::sync::atomic::Ordering::Relaxed);
                 windows.clear();
                 frame_rxs.clear();
@@ -2308,19 +2370,15 @@ where
                 break;
             }
 
-            // C → enter channel input mode
-            if matches!(ch_input, ChannelInputState::Idle) {
-                let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
-                if keys.contains(&Key::C) {
-                    ch_input = ChannelInputState::WaitingFirst;
-                }
+            // C → enter channel input mode (live SDR only)
+            if idle && band.is_some() && pressed.contains(&Key::C) {
+                ch_input = ChannelInputState::WaitingFirst;
             }
 
             // Channel input state machine
             match ch_input.clone() {
                 ChannelInputState::WaitingFirst => {
-                    let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
-                    for k in keys {
+                    for &k in &pressed {
                         if k == Key::C {
                             continue;
                         } // ignore the C that started us
@@ -2337,8 +2395,7 @@ where
                     }
                 }
                 ChannelInputState::Typing(mut name) => {
-                    let keys = window.get_keys_pressed(minifb::KeyRepeat::No);
-                    for key in keys {
+                    for &key in &pressed {
                         if key == Key::Escape {
                             ch_input = ChannelInputState::Idle;
                             break;
@@ -2444,13 +2501,13 @@ where
                     }
 
                     // Keybinding hints at the bottom of the picture. They
-                    // no longer have to dodge the panel. `B` is only
-                    // offered when there is a panel to cycle.
+                    // no longer have to dodge the panel. S/N/C/B are only
+                    // offered when running live with a band panel.
                     let hint_y = (*height).saturating_sub(20);
                     let hint = if band.is_some() {
                         "Q:Quit  S:Skip  N:Next  C:Channel  B:Band"
                     } else {
-                        "Q:Quit  S:Skip  N:Next  C:Channel"
+                        "Q:Quit"
                     };
                     draw_text_with_bg(
                         &mut display_buffers[i],
@@ -2542,10 +2599,19 @@ where
     }
 
     let final_reason = exit_reason.load(std::sync::atomic::Ordering::Relaxed);
+    if final_reason == 0 {
+        exit_reason.store(6, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(frame_rxs);
+    drop(recycle_txs);
+    for handle in snap_handles {
+        let _ = handle.join();
+    }
+
     match final_reason {
         1 => Ok(RunLiveResult::SignalLost),
         2 => Ok(RunLiveResult::TooManyOverruns),
-        3 => Ok(RunLiveResult::SkipFrequency),
+        3 => Ok(RunLiveResult::SkipFrequency(locked_display_hz)),
         4 => Ok(RunLiveResult::NextChannel),
         5 => {
             let freq = tune_freq.load(std::sync::atomic::Ordering::Relaxed);

@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "fpv-viewer"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2265,8 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "sdr-aaronia-rs"
-version = "0.11.2"
-source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.11.2#ae870f481ba8fecfcde89eac0d6129afd5972337"
+version = "0.13.2"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
