@@ -85,6 +85,7 @@ impl SdrSource for SoapySource {
         let stream = device
             .rx_stream::<Complex32>(&[channel])
             .context("opening the RX stream")?;
+        let mtu = stream.mtu().ok().filter(|&m| m > 0).unwrap_or(block_size);
 
         let depth = queue_depth(block_size);
         let (tx, receiver) = std::sync::mpsc::sync_channel::<IqPacket>(depth);
@@ -94,10 +95,12 @@ impl SdrSource for SoapySource {
             device,
             channel,
             stream,
+            mtu,
+            mtu_rem: 0,
             sample_rate,
             block_size,
             settle_samples: (sample_rate * settle.as_secs_f64()).round() as usize,
-            scratch: vec![Complex32::default(); block_size.min(65_536)],
+            scratch: vec![Complex32::default(); block_size.max(mtu).min(65_536)],
             channels_hz: config.channels_hz,
             dwell: config.dwell,
             tx,
@@ -120,6 +123,20 @@ struct Capture {
     device: Device,
     channel: usize,
     stream: RxStream<Complex32>,
+    /// Driver transfer buffer size (`getStreamMTU`), used to keep reads aligned
+    /// to driver ring-buffer entries across `deactivate`/`activate`.
+    mtu: usize,
+    /// Samples remaining in the driver's currently acquired MTU buffer.
+    ///
+    /// Drivers such as `SoapyHackRF` wrap `acquireReadBuffer`/`releaseReadBuffer`
+    /// in `readStream` using a `remainderHandle`/`remainderSamps` pair, and
+    /// `activateStream` resets `buf_count = 0` without resetting
+    /// `remainderHandle = -1`. If `deactivateStream` is called while
+    /// `remainderSamps > 0`, the first read after the next `activateStream`
+    /// finishes the stale remainder buffer and calls `releaseReadBuffer`,
+    /// underflowing `buf_count` from `0` to `-1` (`0xFFFFFFFF`) so the driver
+    /// spins through uninitialised ring buffers without waiting for hardware.
+    mtu_rem: usize,
     sample_rate: f64,
     block_size: usize,
     settle_samples: usize,
@@ -154,12 +171,13 @@ impl Capture {
             next = (next + 1) % self.channels_hz.len();
             let tuned = self.retune(commanded)?;
             let deadline = Instant::now() + self.dwell;
+            let mut delivered_on_hop = false;
 
             loop {
                 if self.stopped() {
                     break;
                 }
-                if hopping && Instant::now() >= deadline {
+                if hopping && delivered_on_hop && Instant::now() >= deadline {
                     break;
                 }
                 let mut block = self
@@ -185,6 +203,7 @@ impl Capture {
                     self.halt();
                     return Ok(());
                 }
+                delivered_on_hop = true;
             }
             if !hopping {
                 break;
@@ -200,6 +219,24 @@ impl Capture {
 
     fn halt(&mut self) {
         if self.stream.active() {
+            // Drain any in-hand MTU remainder buffer before deactivating so the
+            // driver releases `remainderHandle` while `buf_count >= 1`.
+            while self.mtu_rem > 0 {
+                let n = self.mtu_rem.min(self.scratch.len());
+                match read_aligned(
+                    &mut self.stream,
+                    self.mtu,
+                    &mut self.mtu_rem,
+                    &mut self.scratch[..n],
+                    Duration::ZERO,
+                ) {
+                    Ok(got) if got > 0 => {}
+                    _ => {
+                        self.mtu_rem = 0;
+                        break;
+                    }
+                }
+            }
             let _ = self.stream.deactivate(None);
         }
     }
@@ -224,10 +261,13 @@ impl Capture {
         let mut left = self.settle_samples;
         while left > 0 && !self.stopped() {
             let n = left.min(self.scratch.len());
-            match self
-                .stream
-                .read(&mut [&mut self.scratch[..n]], micros(READ_TIMEOUT))
-            {
+            match read_aligned(
+                &mut self.stream,
+                self.mtu,
+                &mut self.mtu_rem,
+                &mut self.scratch[..n],
+                READ_TIMEOUT,
+            ) {
                 Ok(0) => break,
                 Ok(got) => left = left.saturating_sub(got),
                 Err(e) if e.code == ErrorCode::Overflow => {}
@@ -255,9 +295,13 @@ impl Capture {
             if self.stopped() {
                 return Ok(Fill::Stopped);
             }
-            let read = self
-                .stream
-                .read(&mut [&mut block[filled..]], micros(READ_TIMEOUT));
+            let read = read_aligned(
+                &mut self.stream,
+                self.mtu,
+                &mut self.mtu_rem,
+                &mut block[filled..],
+                READ_TIMEOUT,
+            );
             // A driver may return nothing without calling it a timeout;
             // either way no samples came, and it counts toward the
             // silence bailout rather than looping on the spot.
@@ -310,6 +354,290 @@ impl Capture {
     }
 }
 
+/// Advance `mtu_rem` after a read of `got` samples against a driver MTU of `mtu`.
+fn advance_mtu_rem(mtu: usize, mtu_rem: usize, got: usize) -> usize {
+    if got == 0 || mtu == 0 {
+        return mtu_rem;
+    }
+    if mtu_rem > 0 {
+        mtu_rem.saturating_sub(got)
+    } else {
+        (mtu - (got % mtu)) % mtu
+    }
+}
+
+/// Read at most one driver MTU boundary worth of samples so a single
+/// `readStream` call never consumes a remainder buffer and acquires a
+/// new buffer in the same call.
+fn read_aligned(
+    stream: &mut RxStream<Complex32>,
+    mtu: usize,
+    mtu_rem: &mut usize,
+    dst: &mut [Complex32],
+    timeout: Duration,
+) -> Result<usize, soapysdr::Error> {
+    let step = if *mtu_rem > 0 { *mtu_rem } else { mtu.max(1) };
+    let n = dst.len().min(step);
+    match stream.read(&mut [&mut dst[..n]], micros(timeout)) {
+        Ok(got) => {
+            *mtu_rem = advance_mtu_rem(mtu, *mtu_rem, got);
+            Ok(got)
+        }
+        Err(e) => {
+            if e.code == ErrorCode::Overflow {
+                *mtu_rem = 0;
+            }
+            Err(e)
+        }
+    }
+}
+
 fn micros(d: Duration) -> i64 {
     d.as_micros() as i64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fpv_drone_analog::scanner::{ScanProgress, detect_packets_per_hop};
+
+    #[test]
+    fn mtu_remainder_tracks_hackrf_settle_and_blocks_exact() {
+        let mtu = 131_072;
+        let mut rem = 0;
+
+        // 2 ms settle at 20 MS/s = 40,000 samples -> leaves 91,072 in current MTU buffer.
+        rem = advance_mtu_rem(mtu, rem, 40_000);
+        assert_eq!(rem, 91_072);
+
+        // First 65,536-sample block takes 65,536 from the remainder -> leaves 25,536.
+        rem = advance_mtu_rem(mtu, rem, 65_536);
+        assert_eq!(rem, 25_536);
+
+        // Second 65,536-sample block is split by read_aligned into 25,536 (finishing
+        // the first MTU buffer) followed by 40,000 (from the second MTU buffer).
+        rem = advance_mtu_rem(mtu, rem, 25_536);
+        assert_eq!(rem, 0);
+        rem = advance_mtu_rem(mtu, rem, 40_000);
+        assert_eq!(rem, 91_072);
+
+        // Draining in 65,536-sample scratch chunks before deactivate reaches 0.
+        rem = advance_mtu_rem(mtu, rem, 65_536);
+        assert_eq!(rem, 25_536);
+        rem = advance_mtu_rem(mtu, rem, 25_536);
+        assert_eq!(rem, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a physical HackRF One connected via USB with SoapyHackRF"]
+    fn live_hackrf_soapy_qualification() {
+        let devs = soapysdr::enumerate("driver=hackrf").expect("enumerate SoapySDR hackrf");
+        assert!(
+            !devs.is_empty(),
+            "expected at least one HackRF via SoapySDR"
+        );
+        println!("Found {} SoapySDR HackRF device(s): {}", devs.len(), devs[0]);
+
+        let device = Device::new("driver=hackrf").expect("open driver=hackrf");
+        let hw = device.hardware_key().expect("hardware_key");
+        let drv = device.driver_key().expect("driver_key");
+        let max_rate = max_sample_rate(&device, 0).expect("max_sample_rate");
+        let gains = device.list_gains(Direction::Rx, 0).expect("list_gains");
+        let antennas = device.antennas(Direction::Rx, 0).expect("antennas");
+        let bw = device.bandwidth(Direction::Rx, 0).unwrap_or(0.0);
+        println!(
+            "Opened {hw} ({drv}), max_rate = {:.2} MS/s, bw = {:.2} MHz, gains = {gains:?}, antennas = {antennas:?}",
+            max_rate / 1e6,
+            bw / 1e6
+        );
+        assert_eq!(max_rate, 20_000_000.0);
+
+        // Configure gains and bias-tee off
+        device.write_setting("bias_tx", "false").expect("bias_tx=false");
+        device.set_gain_element(Direction::Rx, 0, "AMP", 0.0).expect("AMP=0");
+        device.set_gain_element(Direction::Rx, 0, "LNA", 16.0).expect("LNA=16");
+        device.set_gain_element(Direction::Rx, 0, "VGA", 20.0).expect("VGA=20");
+
+        let actual_rate = apply_sample_rate(&device, 0, 20_000_000.0).expect("apply 20 MS/s");
+        assert_eq!(actual_rate, 20_000_000.0);
+
+        // 1. Single-channel hold test (1 second at 20 MS/s)
+        let source = Box::new(SoapySource {
+            device: device.clone(),
+            channel: 0,
+            block_size: 65_536,
+            settle: Duration::from_millis(2),
+        });
+        let t0 = Instant::now();
+        let handle = source
+            .start(SourceConfig::hold(20_000_000.0, 5_800_000_000.0))
+            .expect("start single-channel SoapySource");
+
+        let first = handle
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first packet");
+        let ttfp = t0.elapsed();
+        assert_eq!(first.samples.len(), 65_536);
+        assert!((first.center_frequency_hz - 5_800_000_000.0).abs() < 1e3);
+        assert_eq!(first.sample_rate_hz, 20_000_000.0);
+        let power: f32 =
+            first.samples.iter().map(|c| c.norm_sqr()).sum::<f32>() / first.samples.len() as f32;
+        println!(
+            "[1/3] Single-channel hold: TTFB = {:?}, first packet len = {}, mean power = {:.6}",
+            ttfp,
+            first.samples.len(),
+            power
+        );
+        assert!(power > 0.0 && power.is_finite());
+
+        let stream_start = Instant::now();
+        let mut pkt_count = 1usize;
+        let mut overruns = usize::from(first.overrun);
+        while stream_start.elapsed() < Duration::from_secs(1) {
+            let pkt = handle
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("sustained packet");
+            pkt_count += 1;
+            if pkt.overrun {
+                overruns += 1;
+            }
+        }
+        let elapsed = stream_start.elapsed();
+        handle.stop();
+        let msps = (pkt_count as f64 * 65_536.0) / elapsed.as_secs_f64() / 1e6;
+        println!(
+            "[1/3] Sustained 1s: {} packets ({:.2} MS/s), overruns = {}",
+            pkt_count, msps, overruns
+        );
+        assert!(msps > 18.0 && msps < 22.0, "expected ~20 MS/s, got {msps:.2} MS/s");
+
+        // 2. Full 16-hop 5.8 GHz FPV band scan on the SAME cloned device
+        let hops = crate::build_scan_hops(20_000_000.0, crate::ScanBands::Band58);
+        assert_eq!(hops.len(), 16);
+        let budget_pkts = detect_packets_per_hop(20_000_000.0);
+        println!(
+            "[2/3] Testing full 16-hop 5.8 GHz scan (budget = {} pkts/hop, dwell = 20 ms)...",
+            budget_pkts
+        );
+        let source2 = Box::new(SoapySource {
+            device: device.clone(),
+            channel: 0,
+            block_size: 65_536,
+            settle: Duration::from_millis(2),
+        });
+        let handle2 = source2
+            .start(SourceConfig {
+                sample_rate_hz: 20_000_000.0,
+                channels_hz: hops.clone(),
+                dwell: Duration::from_millis(20),
+            })
+            .expect("start 16-hop SoapySource");
+
+        let mut progress = ScanProgress::new(&hops, budget_pkts);
+        let mut hop_runs: Vec<(u64, usize, Duration)> = Vec::new();
+        let mut cur_freq: Option<u64> = None;
+        let mut cur_count = 0usize;
+        let mut hop_start = Instant::now();
+        let mut sweep_completed_at: Option<(usize, Duration)> = None;
+        let sweep_t0 = Instant::now();
+
+        for i in 0..(hops.len() * 8) {
+            let pkt = handle2
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("hop packet");
+            let f = crate::snap_to_nearest_hop(pkt.center_frequency_hz, &hops);
+            if cur_freq != Some(f) {
+                if let Some(prev) = cur_freq {
+                    hop_runs.push((prev, cur_count, hop_start.elapsed()));
+                }
+                cur_freq = Some(f);
+                cur_count = 0;
+                hop_start = Instant::now();
+            }
+            cur_count += 1;
+            if let Some(obs) = progress.observe(f)
+                && obs.sweep_complete
+            {
+                sweep_completed_at = Some((i + 1, sweep_t0.elapsed()));
+                hop_runs.push((f, cur_count, hop_start.elapsed()));
+                break;
+            }
+        }
+        handle2.stop();
+
+        println!(
+            "[2/3] 16-hop scan completed at: {:?} ({} hop runs recorded)",
+            sweep_completed_at,
+            hop_runs.len()
+        );
+        assert_eq!(hop_runs.len(), 16, "expected all 16 hops in one sweep pass");
+        assert!(
+            sweep_completed_at.is_some(),
+            "16-hop 5.8 GHz sweep at 20 MS/s must complete in one pass"
+        );
+        for &(freq, count, dur) in &hop_runs {
+            assert!(
+                count >= budget_pkts,
+                "hop {freq} delivered only {count} packets (< budget {budget_pkts})"
+            );
+            assert!(
+                dur >= Duration::from_millis(15),
+                "hop {freq} delivered {count} packets in {dur:?} (faster than hardware clock!)"
+            );
+        }
+
+        // 3. Test 16 MS/s (stepped-down rate) + live detector pass
+        let short_hops = hops[..4].to_vec();
+        let rate_16m = apply_sample_rate(&device, 0, 16_000_000.0).expect("apply 16 MS/s");
+        assert_eq!(rate_16m, 16_000_000.0);
+        let source3 = Box::new(SoapySource {
+            device: device.clone(),
+            channel: 0,
+            block_size: 65_536,
+            settle: Duration::from_millis(2),
+        });
+        let handle3 = source3
+            .start(SourceConfig {
+                sample_rate_hz: 16_000_000.0,
+                channels_hz: short_hops.clone(),
+                dwell: Duration::from_millis(20),
+            })
+            .expect("start 16 MS/s SoapySource");
+
+        let mut progress16 = ScanProgress::new(&short_hops, budget_pkts);
+        let mut completed16 = false;
+        let detector = fpv_drone_analog::scanner::receiver_detector();
+        let mut integrator = fpv_drone_analog::detector::SpectralIntegrator::new(4);
+        let mut probes = Vec::new();
+
+        for _ in 0..32 {
+            let pkt = handle3
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("16 MS/s hop packet");
+            assert!(pkt.samples.iter().all(|c| c.re.is_finite() && c.im.is_finite()));
+            let f = crate::snap_to_nearest_hop(pkt.center_frequency_hz, &short_hops);
+            if let Some(obs) = progress16.observe(f) {
+                let _hits = detector.detect_from_iq_integrated_with_probes(
+                    &pkt.samples,
+                    f,
+                    pkt.sample_rate_hz.round() as u32,
+                    &mut integrator,
+                    &mut probes,
+                );
+                assert!(!probes.is_empty(), "detector should populate probe energies");
+                if obs.sweep_complete {
+                    completed16 = true;
+                    break;
+                }
+            }
+        }
+        handle3.stop();
+        println!("[3/3] 16 MS/s 4-hop detector integration completed = {}", completed16);
+        assert!(completed16, "16 MS/s 4-hop sweep must complete");
+    }
+}
+
