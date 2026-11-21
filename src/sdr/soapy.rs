@@ -436,7 +436,11 @@ mod tests {
             !devs.is_empty(),
             "expected at least one HackRF via SoapySDR"
         );
-        println!("Found {} SoapySDR HackRF device(s): {}", devs.len(), devs[0]);
+        println!(
+            "Found {} SoapySDR HackRF device(s): {}",
+            devs.len(),
+            devs[0]
+        );
 
         let device = Device::new("driver=hackrf").expect("open driver=hackrf");
         let hw = device.hardware_key().expect("hardware_key");
@@ -453,10 +457,18 @@ mod tests {
         assert_eq!(max_rate, 20_000_000.0);
 
         // Configure gains and bias-tee off
-        device.write_setting("bias_tx", "false").expect("bias_tx=false");
-        device.set_gain_element(Direction::Rx, 0, "AMP", 0.0).expect("AMP=0");
-        device.set_gain_element(Direction::Rx, 0, "LNA", 16.0).expect("LNA=16");
-        device.set_gain_element(Direction::Rx, 0, "VGA", 20.0).expect("VGA=20");
+        device
+            .write_setting("bias_tx", "false")
+            .expect("bias_tx=false");
+        device
+            .set_gain_element(Direction::Rx, 0, "AMP", 0.0)
+            .expect("AMP=0");
+        device
+            .set_gain_element(Direction::Rx, 0, "LNA", 16.0)
+            .expect("LNA=16");
+        device
+            .set_gain_element(Direction::Rx, 0, "VGA", 20.0)
+            .expect("VGA=20");
 
         let actual_rate = apply_sample_rate(&device, 0, 20_000_000.0).expect("apply 20 MS/s");
         assert_eq!(actual_rate, 20_000_000.0);
@@ -511,7 +523,10 @@ mod tests {
             "[1/3] Sustained 1s: {} packets ({:.2} MS/s), overruns = {}",
             pkt_count, msps, overruns
         );
-        assert!(msps > 18.0 && msps < 22.0, "expected ~20 MS/s, got {msps:.2} MS/s");
+        assert!(
+            msps > 18.0 && msps < 22.0,
+            "expected ~20 MS/s, got {msps:.2} MS/s"
+        );
 
         // 2. Full 16-hop 5.8 GHz FPV band scan on the SAME cloned device
         let hops = crate::build_scan_hops(20_000_000.0, crate::ScanBands::Band58);
@@ -618,7 +633,11 @@ mod tests {
                 .receiver
                 .recv_timeout(Duration::from_secs(2))
                 .expect("16 MS/s hop packet");
-            assert!(pkt.samples.iter().all(|c| c.re.is_finite() && c.im.is_finite()));
+            assert!(
+                pkt.samples
+                    .iter()
+                    .all(|c| c.re.is_finite() && c.im.is_finite())
+            );
             let f = crate::snap_to_nearest_hop(pkt.center_frequency_hz, &short_hops);
             if let Some(obs) = progress16.observe(f) {
                 let _hits = detector.detect_from_iq_integrated_with_probes(
@@ -628,7 +647,10 @@ mod tests {
                     &mut integrator,
                     &mut probes,
                 );
-                assert!(!probes.is_empty(), "detector should populate probe energies");
+                assert!(
+                    !probes.is_empty(),
+                    "detector should populate probe energies"
+                );
                 if obs.sweep_complete {
                     completed16 = true;
                     break;
@@ -636,8 +658,10 @@ mod tests {
             }
         }
         handle3.stop();
-        println!("[3/3] 16 MS/s 4-hop detector integration completed = {}", completed16);
+        println!(
+            "[3/3] 16 MS/s 4-hop detector integration completed = {}",
+            completed16
+        );
         assert!(completed16, "16 MS/s 4-hop sweep must complete");
     }
 }
-

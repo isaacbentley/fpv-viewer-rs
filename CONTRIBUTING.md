@@ -46,6 +46,25 @@ for each of those combinations, not only the default.
 
 To co-develop against a local checkout of `sdr-aaronia-rs`, add the
 `[patch]` block shown in the comment above its entry in `Cargo.toml`.
+Take it out again before committing `Cargo.lock`: a lockfile written
+under the patch has no `source` for `sdr-aaronia-rs`, and every
+`--locked` build in CI and the release workflow fails on it.
+
+### Hardware tests
+
+Tests that need a radio are `#[ignore]`d, so `cargo test` and CI skip
+them. With a HackRF One attached and SoapyHackRF installed, run the
+SoapySDR qualification test after any change to `src/sdr/soapy.rs`:
+
+```bash
+cargo test --release -- --ignored live_hackrf_soapy_qualification --nocapture
+```
+
+It sets the HackRF's bias-tee off and its gains to AMP 0, LNA 16 and
+VGA 20 dB, then holds one channel at 20 MSPS for a second, sweeps the
+16 tunes of the 5.8 GHz band (every hop must deliver its packet budget
+and take at least 15 ms), and runs a 4-tune sweep at 16 MSPS through
+the detector.
 
 ## Adding features or fixing bugs
 

@@ -1,6 +1,6 @@
 [package]
 name = "fpv-viewer"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2024"
 rust-version = "1.89"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
