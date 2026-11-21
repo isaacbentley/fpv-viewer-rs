@@ -12,7 +12,7 @@ license = "GPL-3.0-or-later"
 # package is still published under the old name, so it is renamed on
 # import — `use fpv_drone_analog::...` — and moving to the Specola
 # package later is a matter of dropping `package =`.
-fpv-drone-analog = { package = "orecchiette-fpv-drone-analog-rs", git = "https://github.com/isaacbentley/fpv-drone-analog-rs.git", tag = "v0.9.1" }
+fpv-drone-analog = { package = "orecchiette-fpv-drone-analog-rs", git = "https://github.com/isaacbentley/fpv-drone-analog-rs.git", tag = "v0.10.0" }
 # SoapySDR: links the system libSoapySDR (found via pkg-config); the
 # device itself is reached through whichever SoapySDR module drives it
 # (SoapyHackRF, SoapyUHD, ...), installed separately.
@@ -22,7 +22,7 @@ soapysdr = { version = "0.5.1", optional = true }
 # sibling checkout, add:
 #   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
 #   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
-sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.14.0", default-features = false, features = [
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.15.0", default-features = false, features = [
     "http",
     "file",
     "native-sdk",

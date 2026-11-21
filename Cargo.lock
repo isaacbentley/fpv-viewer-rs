@@ -1016,19 +1016,19 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
-version = "0.7.4"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
- "winapi",
+ "windows-link",
 ]
 
 [[package]]
 name = "libloading"
-version = "0.8.9"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -1235,8 +1235,8 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
-version = "0.9.1"
-source = "git+https://github.com/isaacbentley/fpv-drone-analog-rs.git?tag=v0.9.1#0eab7da0be16c40658d4da6e3a494af3f8b5631c"
+version = "0.10.0"
+source = "git+https://github.com/isaacbentley/fpv-drone-analog-rs.git?tag=v0.10.0#3b82e0053a35d3eadd3d37850362331c1c452a5f"
 dependencies = [
  "bytemuck",
  "log",
@@ -1721,15 +1721,15 @@ dependencies = [
 
 [[package]]
 name = "sdr-aaronia-rs"
-version = "0.14.0"
-source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.14.0#c628c8b0f62291482f0f6ddc59456a3b92040f40"
+version = "0.15.0"
+source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.15.0#c02a65a5c4e248f60cd0fd56fad5d45edc6fd339"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
  "bytes",
  "futures",
  "half",
- "libloading 0.7.4",
+ "libloading 0.9.1",
  "num-complex",
  "reqwest",
  "serde",
