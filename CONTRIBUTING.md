@@ -21,8 +21,7 @@ the system package manager. There is no Windows job: the SoapySDR
 backend links `libSoapySDR`, and the runners have no unattended
 SoapySDR install.
 
-The crate declares `rust-version = "1.89"`, set by `wide` and
-`safe_arch` in the dependency tree.
+The crate declares `rust-version = "1.100"`.
 
 ### The backend features
 

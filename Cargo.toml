@@ -2,7 +2,7 @@
 name = "fpv-viewer"
 version = "0.15.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.100"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
 license = "GPL-3.0-or-later"
 
@@ -30,9 +30,9 @@ sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", t
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
 anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 num-complex = "0.4"
-minifb = "0.28"
+minifb = "0.29"
 image = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
