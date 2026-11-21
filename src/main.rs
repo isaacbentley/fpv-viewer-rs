@@ -70,8 +70,12 @@ enum SourceCmd {
 struct FileArgs {
     /// Path to the SigMF `.sigmf-data` / `.sigmf-meta` or raw IQ file.
     input: PathBuf,
+    /// Sample rate (Hz). Overrides the SigMF sidecar's
+    /// `core:sample_rate`; with neither, 100 MSPS.
     #[arg(long)]
     sample_rate: Option<u32>,
+    /// FM deviation (Hz). Overrides the SigMF sidecar's
+    /// `fpv:fm_deviation`; with neither, 5 MHz.
     #[arg(long)]
     fm_deviation: Option<f32>,
     /// Video deemphasis time constant in seconds, undoing the VTX's
@@ -253,16 +257,29 @@ const AARONIA_SENSITIVE_EVERY: u32 = 4;
 #[cfg(feature = "aaronia")]
 const AARONIA_SENSITIVE_DWELL: Duration = Duration::from_millis(60);
 
+/// Samples per packet the Aaronia capture delivers.
+#[cfg(feature = "aaronia")]
+const AARONIA_BLOCK_SIZE: usize = 65_536;
+
 /// Aaronia's measured tuning costs, supplied to the shared sweep policy.
+///
+/// The dwell is then stretched, where it has to be, to the budget's own
+/// airtime: a hop only counts once it delivers its whole budget in one
+/// visit, and at narrow rates the policy pairs the fast dwell with the
+/// six-packet budget. Six [`AARONIA_BLOCK_SIZE`] packets are 12.8 ms at
+/// 30.72 MSPS, inside the 25 ms dwell, but 51.2 ms at 7.68 MSPS, where
+/// 25 ms delivers three and no sweep would ever complete.
 #[cfg(feature = "aaronia")]
 fn aaronia_sweep_budget(n: u32, sample_rate_hz: f64) -> SweepBudget {
-    fpv_drone_analog::scanner::SweepPolicy {
+    let budget = fpv_drone_analog::scanner::SweepPolicy {
         fast: SweepBudget::flat(AARONIA_SCAN_DWELL, DETECT_PACKETS_PER_HOP),
         sensitive: SweepBudget::flat(AARONIA_SENSITIVE_DWELL, DETECT_PACKETS_NARROW),
         sensitive_every: AARONIA_SENSITIVE_EVERY,
         narrow_capture_max_rate_hz: fpv_drone_analog::scanner::NARROW_CAPTURE_MAX_RATE_HZ,
     }
-    .budget(n, sample_rate_hz)
+    .budget(n, sample_rate_hz);
+    let airtime = packet_airtime(budget.packets_per_hop, AARONIA_BLOCK_SIZE, sample_rate_hz);
+    SweepBudget::flat(budget.dwell.max(airtime), budget.packets_per_hop)
 }
 
 /// The rate to capture a *locked* channel at, once the sweep has found
@@ -661,76 +678,145 @@ fn main() -> anyhow::Result<()> {
 //  FILE MODE — unchanged from before, now behind `file` subcommand
 // ═══════════════════════════════════════════════════════════════════
 
+/// The SigMF `core:sample_rate` from a sidecar's `global` object, or
+/// `None` when it has none.
+///
+/// SigMF defines the field as a double, so `20000000.0` is as valid as
+/// `20000000`. A value that is present but not a positive rate is an
+/// error rather than a fallback: decoding at the wrong rate produces a
+/// picture of noise with nothing to say why.
+fn sigmf_sample_rate(global: &serde_json::Value) -> anyhow::Result<Option<u32>> {
+    let Some(value) = global.get("core:sample_rate") else {
+        return Ok(None);
+    };
+    let Some(rate) = value.as_f64().filter(|r| r.is_finite() && *r > 0.0) else {
+        anyhow::bail!(
+            "SigMF core:sample_rate {value} is not a positive sample rate; pass --sample-rate to override it"
+        );
+    };
+    let rate = rate.round();
+    anyhow::ensure!(
+        rate <= u32::MAX as f64,
+        "SigMF core:sample_rate {value} is beyond the {} Hz the decoder takes",
+        u32::MAX
+    );
+    Ok(Some(rate as u32))
+}
+
+/// Where a SigMF annotation's channel sits relative to the capture
+/// centre, in Hz.
+///
+/// SigMF gives `core:freq_lower_edge` and `core:freq_upper_edge` as
+/// absolute RF frequencies when the capture has a `core:frequency`,
+/// while the decoder crate's `make_reference_capture` writes them
+/// relative to the centre (± half the channel). A midpoint inside the
+/// capture's ±`sample_rate`/2 can only be relative, since an absolute one
+/// would sit at the RF frequency, far outside it; a midpoint outside
+/// it is taken as absolute and moved to the capture centre, when the
+/// centre is known.
+fn annotation_offset_hz(
+    lower_edge_hz: f64,
+    upper_edge_hz: f64,
+    sample_rate_hz: f64,
+    capture_center_hz: Option<f64>,
+) -> f64 {
+    let midpoint = (lower_edge_hz + upper_edge_hz) / 2.0;
+    match capture_center_hz {
+        Some(center) if midpoint.abs() > sample_rate_hz / 2.0 => midpoint - center,
+        _ => midpoint,
+    }
+}
+
 fn run_file(args: FileArgs) -> anyhow::Result<()> {
     // Attempt to load SigMF metadata
     let mut meta_path = args.input.clone();
     meta_path.set_extension("sigmf-meta");
 
-    let mut sample_rate = args.sample_rate.unwrap_or(100_000_000);
-    let mut fm_deviation = args.fm_deviation.unwrap_or(5_000_000.0);
-    let mut rf_center_freq = 5_800_000_000.0_f64;
-    let mut channels_to_spawn = Vec::new();
-
-    if meta_path.exists() {
+    let meta_json: Option<serde_json::Value> = if meta_path.exists() {
         println!("Found SigMF metadata: {:?}", meta_path);
         let meta_str = std::fs::read_to_string(&meta_path)?;
-        let meta_json: serde_json::Value = serde_json::from_str(&meta_str)?;
+        Some(serde_json::from_str(&meta_str)?)
+    } else {
+        None
+    };
+    let global = meta_json.as_ref().and_then(|m| m.get("global"));
 
-        if let Some(global) = meta_json.get("global") {
-            if let Some(sr) = global.get("core:sample_rate").and_then(|v| v.as_u64()) {
-                sample_rate = sr as u32;
-            }
-            if let Some(dev) = global.get("fpv:fm_deviation").and_then(|v| v.as_f64()) {
-                fm_deviation = dev as f32;
-            }
-            // The parser below reads interleaved little-endian f32 IQ
-            // pairs unconditionally; any other recorded datatype would
-            // silently decode as garbage, so reject it loudly instead.
-            match global.get("core:datatype").and_then(|v| v.as_str()) {
-                Some("cf32_le") | None => {}
-                Some(other) => anyhow::bail!(
-                    "unsupported SigMF core:datatype '{}'; only cf32_le (interleaved little-endian f32 IQ) is supported",
-                    other
-                ),
-            }
+    // The parser below reads interleaved little-endian f32 IQ pairs
+    // unconditionally; any other recorded datatype would silently
+    // decode as garbage, so reject it loudly instead.
+    if let Some(global) = global {
+        match global.get("core:datatype").and_then(|v| v.as_str()) {
+            Some("cf32_le") | None => {}
+            Some(other) => anyhow::bail!(
+                "unsupported SigMF core:datatype '{}'; only cf32_le (interleaved little-endian f32 IQ) is supported",
+                other
+            ),
         }
+    }
 
-        if let Some(captures) = meta_json.get("captures").and_then(|v| v.as_array())
-            && let Some(first_cap) = captures.first()
-            && let Some(freq) = first_cap.get("core:frequency").and_then(|v| v.as_f64())
-        {
-            rf_center_freq = freq;
-        }
+    // An explicit flag wins over the sidecar, which wins over the
+    // default: the flag is how an operator corrects a wrong sidecar.
+    let sample_rate = match args.sample_rate {
+        Some(sr) => sr,
+        None => global
+            .map(sigmf_sample_rate)
+            .transpose()?
+            .flatten()
+            .unwrap_or(100_000_000),
+    };
+    let fm_deviation = args
+        .fm_deviation
+        .or_else(|| {
+            global
+                .and_then(|g| g.get("fpv:fm_deviation"))
+                .and_then(|v| v.as_f64())
+                .map(|dev| dev as f32)
+        })
+        .unwrap_or(5_000_000.0);
 
-        if let Some(annotations) = meta_json.get("annotations").and_then(|v| v.as_array()) {
-            for ann in annotations {
-                let lower = ann
-                    .get("core:freq_lower_edge")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let upper = ann
-                    .get("core:freq_upper_edge")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let label = ann
-                    .get("core:label")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
+    let capture_center_hz = meta_json
+        .as_ref()
+        .and_then(|m| m.get("captures"))
+        .and_then(|v| v.as_array())
+        .and_then(|captures| captures.first())
+        .and_then(|first_cap| first_cap.get("core:frequency"))
+        .and_then(|v| v.as_f64());
+    let rf_center_freq = capture_center_hz.unwrap_or(5_800_000_000.0);
+    let mut channels_to_spawn = Vec::new();
 
-                let freq_offset = (lower + upper) / 2.0;
-                let label_upper = label.to_uppercase();
-                let sig_type = if label_upper.contains("PAL") {
-                    Some(SignalType::AnalogVideoPal)
-                } else if label_upper.contains("NTSC") {
-                    Some(SignalType::AnalogVideoNtsc)
-                } else if label_upper.contains("ANALOG") || label_upper.contains("VIDEO") {
-                    None
-                } else {
-                    continue;
-                };
+    if let Some(annotations) = meta_json
+        .as_ref()
+        .and_then(|m| m.get("annotations"))
+        .and_then(|v| v.as_array())
+    {
+        for ann in annotations {
+            let lower = ann
+                .get("core:freq_lower_edge")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let upper = ann
+                .get("core:freq_upper_edge")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let label = ann
+                .get("core:label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown");
 
-                channels_to_spawn.push((sig_type, freq_offset as f32, label.to_string()));
-            }
+            let freq_offset =
+                annotation_offset_hz(lower, upper, sample_rate as f64, capture_center_hz);
+            let label_upper = label.to_uppercase();
+            let sig_type = if label_upper.contains("PAL") {
+                Some(SignalType::AnalogVideoPal)
+            } else if label_upper.contains("NTSC") {
+                Some(SignalType::AnalogVideoNtsc)
+            } else if label_upper.contains("ANALOG") || label_upper.contains("VIDEO") {
+                None
+            } else {
+                continue;
+            };
+
+            channels_to_spawn.push((sig_type, freq_offset as f32, label.to_string()));
         }
     }
 
@@ -1011,6 +1097,57 @@ const SOAPY_DEFAULT_RATE_HZ: f64 = 25_000_000.0;
 #[cfg(feature = "soapy")]
 const SOAPY_MIN_STEP_DOWN_RATE_HZ: f64 = 16_000_000.0;
 
+/// Samples per packet the SoapySDR capture delivers.
+#[cfg(feature = "soapy")]
+const SOAPY_BLOCK_SIZE: usize = 65_536;
+
+/// The SoapySDR sweep dwell never drops below this, however fast the
+/// rate fills the packet budget.
+#[cfg(feature = "soapy")]
+const SOAPY_MIN_SCAN_DWELL: Duration = Duration::from_millis(20);
+
+/// Slack on top of the packet budget's own airtime, for USB transfers
+/// that arrive in bursts rather than evenly.
+#[cfg(feature = "soapy")]
+const SOAPY_SCAN_DWELL_MARGIN: Duration = Duration::from_millis(5);
+
+/// The SoapySDR sweep's per-hop budget: the detector's packet count for
+/// `sample_rate_hz`, and a dwell long enough to deliver it.
+///
+/// The capture checks its deadline before each blocking fill, and a hop
+/// only counts once it delivers the whole budget in one visit, so a
+/// dwell shorter than the budget's airtime never completes a sweep. Six
+/// [`SOAPY_BLOCK_SIZE`] packets are 15.7 ms at 25 MSPS but 39.3 ms at
+/// 10 MSPS and 196.6 ms at 2, so the dwell scales with the rate: the
+/// airtime plus [`SOAPY_SCAN_DWELL_MARGIN`], and never below
+/// [`SOAPY_MIN_SCAN_DWELL`]. The stream restart each hop costs is taken
+/// before the dwell clock starts, so it is not part of this.
+///
+/// Adaptive dwell stays off: a longer look neither promotes confidence
+/// on a strong signal (it plateaus at 0.80 from the second packet) nor
+/// recovers a weak one (the sigma cliff sits between 1.0 and 1.5 and
+/// does not move with 12x the dwell).
+#[cfg(feature = "soapy")]
+fn soapy_sweep_budget(sample_rate_hz: f64) -> SweepBudget {
+    let packets = detect_packets_per_hop(sample_rate_hz);
+    let dwell = packet_airtime(packets, SOAPY_BLOCK_SIZE, sample_rate_hz)
+        .saturating_add(SOAPY_SCAN_DWELL_MARGIN)
+        .max(SOAPY_MIN_SCAN_DWELL);
+    SweepBudget::flat(dwell, packets)
+}
+
+/// How long `packets` packets of `block_size` samples take to arrive at
+/// `sample_rate_hz`; zero for a rate that is not a positive number.
+#[cfg(any(feature = "soapy", feature = "aaronia"))]
+fn packet_airtime(packets: usize, block_size: usize, sample_rate_hz: f64) -> Duration {
+    if sample_rate_hz.is_finite() && sample_rate_hz > 0.0 {
+        Duration::try_from_secs_f64(packets as f64 * block_size as f64 / sample_rate_hz)
+            .unwrap_or(Duration::ZERO)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Open and configure the SoapySDR device once for the whole session;
 /// every scan and live capture after that opens its own stream on it.
 #[cfg(feature = "soapy")]
@@ -1094,7 +1231,7 @@ fn run_live_soapy(args: SoapyArgs) -> anyhow::Result<()> {
         Box::new(SoapySource {
             device: device.clone(),
             channel: ch,
-            block_size: 65_536,
+            block_size: SOAPY_BLOCK_SIZE,
             settle: Duration::from_millis(args.retune_settle_ms),
         })
     };
@@ -1153,19 +1290,9 @@ fn run_live_soapy(args: SoapyArgs) -> anyhow::Result<()> {
                 "SoapySDR",
                 sample_rate,
                 args.live.scan_bands,
-                // Long enough to deliver the per-hop packet budget:
-                // 65,536-sample packets are 2.6 ms at 25 MSPS and 3.3 ms
-                // at 20, and the stream restart each hop costs is taken
-                // before the dwell clock starts. Adaptive dwell stays
-                // off: a longer look neither promotes confidence on a
-                // strong signal (it plateaus at 0.80 from the second
-                // packet) nor recovers a weak one (the sigma cliff sits
-                // between 1.0 and 1.5 and does not move with 12x the
-                // dwell).
-                SweepBudget::flat(
-                    Duration::from_millis(20),
-                    detect_packets_per_hop(sample_rate),
-                ),
+                // Recomputed every sweep, because an overrun can step
+                // the rate down and the dwell has to follow it.
+                soapy_sweep_budget(sample_rate),
                 &skipped_freqs,
                 &mut sweep,
             )? {
@@ -1337,6 +1464,28 @@ const AARONIA_HTTP_TUNE_SETTLE: Duration = Duration::from_millis(400);
 /// whatever was gathered.
 const STANDARD_DETECT_PATIENCE: Duration = Duration::from_millis(1500);
 
+/// How far a packet's centre may sit from the first packet's during
+/// standard detection and still count as the same tune: far above a
+/// synthesiser's reported fractional offset (a Spectran V6 ECO reads up
+/// to 4.71 kHz off at 5.93 GHz), far below the megahertz between FPV
+/// channels.
+const ACQUISITION_CENTER_TOLERANCE_HZ: f64 = 100_000.0;
+
+/// How far a packet's sample rate may sit from the first packet's,
+/// relative to it, during standard detection and still count as the
+/// same capture. sdr-aaronia-rs infers an HTTP stream's rate from packet
+/// timestamps, so it jitters (61,439,951.213 Hz for 61.44 MSPS, under
+/// 1 ppm), while the Spectran's rates are a factor of two apart. A
+/// SoapySDR capture reports the one rate it set for every packet.
+const ACQUISITION_RATE_TOLERANCE: f64 = 0.01;
+
+/// Whether a packet at `rate_hz` / `center_hz` belongs to the capture
+/// standard detection started on, at `ref_rate_hz` / `ref_center_hz`.
+fn same_capture(rate_hz: f64, center_hz: f64, ref_rate_hz: f64, ref_center_hz: f64) -> bool {
+    (center_hz - ref_center_hz).abs() <= ACQUISITION_CENTER_TOLERANCE_HZ
+        && (rate_hz - ref_rate_hz).abs() <= ACQUISITION_RATE_TOLERANCE * ref_rate_hz.abs()
+}
+
 /// What a coarse sweep came back with.
 enum ScanOutcome {
     /// A channel to tune to, and what the sweep classified it as.
@@ -1476,10 +1625,22 @@ fn scan_band_for_channel(
                     return Ok(outcome(selector.best()));
                 }
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 // SDR went quiet — return whatever we found this sweep.
                 handle.stop();
                 return Ok(outcome(selector.best()));
+            }
+            // A sweep's capture only ends by being stopped, so this is
+            // the capture thread giving up after its own retries (it
+            // logged why). It is an error, like a capture that fails to
+            // start: taken as an empty pass, the caller would start
+            // another capture at once that fails the same way, in a
+            // tight loop that never pumps the scan window.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                handle.stop();
+                anyhow::bail!(
+                    "the {backend_label} capture ended during the band sweep (its error is logged above)"
+                );
             }
         }
     }
@@ -1521,7 +1682,7 @@ fn run_live_aaronia(cmd: AaroniaCmd) -> anyhow::Result<()> {
         Box::new(AaroniaSource {
             transport: transport.clone(),
             reference_level_dbm: ref_level,
-            block_size: 65_536,
+            block_size: AARONIA_BLOCK_SIZE,
         })
     };
 
@@ -1712,12 +1873,26 @@ fn run_live(
     let handle = source.start(SourceConfig::hold(sample_rate, center_freq))?;
     let sample_rate_u32 = sample_rate as u32;
 
-    // Receive the first chunk for auto-detection
+    // Receive the first chunk for auto-detection. A capture that cannot
+    // deliver one is a lost channel, not a failed session: auto-scan
+    // goes back to sweeping, and explicit-channel mode exits the way it
+    // does when the signal goes mid-decode.
     println!("Waiting for first IQ chunk from SDR...");
-    let mut first_packet = handle
-        .receiver
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|_| anyhow::anyhow!("SDR source failed to deliver initial samples within 5s"))?;
+    let mut first_packet = match handle.receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(p) => p,
+        Err(e) => {
+            println!(
+                "{}; treating the channel as lost.",
+                match e {
+                    mpsc::RecvTimeoutError::Timeout => "No samples from the SDR within 5 s",
+                    mpsc::RecvTimeoutError::Disconnected =>
+                        "The SDR capture ended before delivering samples (its error is logged above)",
+                }
+            );
+            handle.stop();
+            return Ok(RunLiveResult::SignalLost);
+        }
+    };
     // A source that keeps sending the previous centre's samples after the
     // retune is acknowledged would have the standard auto-detected on the
     // wrong channel (measured: a clean NTSC link read "ambiguous" and
@@ -1778,11 +1953,22 @@ fn run_live(
                 let left = STANDARD_DETECT_PATIENCE.saturating_sub(t0.elapsed());
                 match handle.receiver.recv_timeout(left) {
                     Ok(p) => {
-                        if p.sample_rate_hz as u32 != sample_rate_u32
-                            || (p.center_frequency_hz - actual_center).abs() > 1.0
-                        {
+                        if !same_capture(
+                            p.sample_rate_hz as f64,
+                            p.center_frequency_hz,
+                            sample_rate_u32 as f64,
+                            actual_center,
+                        ) {
+                            println!(
+                                "SDR moved to {:.3} MSPS at {:.3} MHz during channel acquisition \
+                                 (from {:.3} MSPS at {:.3} MHz); treating the channel as lost.",
+                                p.sample_rate_hz as f64 / 1e6,
+                                p.center_frequency_hz / 1e6,
+                                sample_rate_u32 as f64 / 1e6,
+                                actual_center / 1e6
+                            );
                             handle.stop();
-                            anyhow::bail!("SDR rate or centre changed during channel acquisition");
+                            return Ok(RunLiveResult::SignalLost);
                         }
                         record.push(&p.samples, p.overrun);
                         first_packet = p;
@@ -2045,7 +2231,20 @@ fn run_live(
                             break;
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break, // SDR disconnected
+                    // The capture thread has ended: it gave up on the
+                    // device (and logged why). That is the channel lost,
+                    // as with the silence above, so auto-scan sweeps
+                    // again rather than leaving the window on its last
+                    // frame. An exit the UI already chose stands.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = exit_flag.compare_exchange(
+                            0,
+                            1,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        break;
+                    }
                 }
             }
         },
@@ -2443,8 +2642,34 @@ where
             }
 
             // Drain the wakeup tokens — the frame itself is in the
-            // slot, and there is only ever the newest one there.
-            while frame_rxs[i].try_recv().is_ok() {}
+            // slot, and there is only ever the newest one there. A
+            // disconnected channel means the decode worker has exited,
+            // because its IQ stream ended or it failed, and this window
+            // will never get another frame: close it, and once no
+            // window is left, the channel is lost.
+            let worker_gone = loop {
+                match frame_rxs[i].try_recv() {
+                    Ok(()) => {}
+                    Err(mpsc::TryRecvError::Empty) => break false,
+                    Err(mpsc::TryRecvError::Disconnected) => break true,
+                }
+            };
+            if worker_gone {
+                windows.remove(i);
+                frame_rxs.remove(i);
+                frame_slots.remove(i);
+                recycle_txs.remove(i);
+                display_buffers.remove(i);
+                if windows.is_empty() {
+                    let _ = exit_reason.compare_exchange(
+                        0,
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                continue;
+            }
             let newest = lock_slot(&frame_slots[i]).take();
             if let Some(frame_u32) = newest {
                 // The buffer is taller than the picture now — the band
@@ -2886,11 +3111,36 @@ mod tests {
     #[cfg(feature = "aaronia")]
     #[test]
     fn a_narrow_capture_is_unaffected_by_the_cadence() {
+        let first = aaronia_sweep_budget(0, 15_360_000.0);
         for n in 0..AARONIA_SENSITIVE_EVERY * 2 {
             let b = aaronia_sweep_budget(n, 15_360_000.0);
             assert_eq!(b.packets_per_hop, DETECT_PACKETS_NARROW);
-            assert_eq!(b.dwell, AARONIA_SCAN_DWELL);
+            assert_eq!(b.dwell, first.dwell);
         }
+        // The fast dwell, stretched only to the six packets' airtime.
+        assert!(first.dwell >= AARONIA_SCAN_DWELL && first.dwell < AARONIA_SENSITIVE_DWELL);
+    }
+
+    /// Every Aaronia sweep dwell covers its own packet budget's airtime,
+    /// at every rate the analyzer runs, or no hop would ever complete.
+    #[cfg(feature = "aaronia")]
+    #[test]
+    fn the_aaronia_sweep_dwell_covers_its_packet_budget() {
+        for rate in [61.44e6, 30.72e6, 15.36e6, 7.68e6, 3.84e6, 1.92e6] {
+            for n in 0..AARONIA_SENSITIVE_EVERY {
+                let b = aaronia_sweep_budget(n, rate);
+                let airtime = packet_airtime(b.packets_per_hop, AARONIA_BLOCK_SIZE, rate);
+                assert!(
+                    b.dwell >= airtime,
+                    "{:.2} MSPS sweep {n}: {:?} dwell is shorter than {airtime:?} for {} packets",
+                    rate / 1e6,
+                    b.dwell,
+                    b.packets_per_hop
+                );
+            }
+        }
+        // Where the dwell already covers the budget it is left alone.
+        assert_eq!(aaronia_sweep_budget(0, 61.44e6).dwell, AARONIA_SCAN_DWELL);
     }
 
     /// The budget must fit the dwell, or the hop ends mid-budget and
@@ -2995,5 +3245,145 @@ mod tests {
         // Distant unexpected frequency is kept as-is
         let foreign = 2_400_000_000.0;
         assert_eq!(snap_to_nearest_hop(foreign, &hops), 2_400_000_000);
+    }
+
+    /// SigMF's `core:sample_rate` is a double; an integer is also a
+    /// valid JSON number for it.
+    #[test]
+    fn a_sigmf_sample_rate_reads_as_a_double_or_an_integer() {
+        let rate = |v: serde_json::Value| sigmf_sample_rate(&v).unwrap();
+        assert_eq!(
+            rate(serde_json::json!({ "core:sample_rate": 20000000.0 })),
+            Some(20_000_000)
+        );
+        assert_eq!(
+            rate(serde_json::json!({ "core:sample_rate": 15360000 })),
+            Some(15_360_000)
+        );
+        assert_eq!(
+            rate(serde_json::json!({ "core:sample_rate": 61439999.6 })),
+            Some(61_440_000)
+        );
+        assert_eq!(
+            rate(serde_json::json!({ "core:datatype": "cf32_le" })),
+            None
+        );
+    }
+
+    /// A sample rate that is there but unusable is an error, not a
+    /// silent fallback to some other rate.
+    #[test]
+    fn an_unusable_sigmf_sample_rate_is_rejected() {
+        for bad in [
+            serde_json::json!(0.0),
+            serde_json::json!(-20000000.0),
+            serde_json::json!("20000000"),
+            serde_json::json!(null),
+            serde_json::json!(1e12),
+        ] {
+            let global = serde_json::json!({ "core:sample_rate": bad });
+            assert!(
+                sigmf_sample_rate(&global).is_err(),
+                "{global} should be rejected"
+            );
+        }
+    }
+
+    /// The decoder crate's reference captures write edges relative to
+    /// the capture centre; those stay as they are.
+    #[test]
+    fn relative_annotation_edges_stay_relative() {
+        let offset = annotation_offset_hz(-5e6, 5e6, 15.36e6, Some(5.8e9));
+        assert_eq!(offset, 0.0);
+        let offset = annotation_offset_hz(15e6, 35e6, 100e6, Some(5.8e9));
+        assert_eq!(offset, 25e6);
+    }
+
+    /// Edges given as absolute RF frequencies, as SigMF defines them,
+    /// are moved to the capture centre.
+    #[test]
+    fn absolute_annotation_edges_are_made_relative_to_the_centre() {
+        let offset = annotation_offset_hz(5_858e6, 5_872e6, 20e6, Some(5_860e6));
+        assert_eq!(offset, 5e6);
+        let offset = annotation_offset_hz(5_793e6, 5_807e6, 20e6, Some(5_800e6));
+        assert_eq!(offset, 0.0);
+    }
+
+    /// Without a capture centre there is nothing to subtract.
+    #[test]
+    fn annotation_edges_without_a_capture_centre_stay_relative() {
+        let offset = annotation_offset_hz(5_858e6, 5_872e6, 20e6, None);
+        assert_eq!(offset, 5_865e6);
+    }
+
+    /// sdr-aaronia-rs's measured rate jitter and a synthesiser's
+    /// fractional offset are the same capture.
+    #[test]
+    fn measured_rate_jitter_is_the_same_capture() {
+        assert!(same_capture(
+            61_439_951.213,
+            5_864_995_294.0,
+            61_440_000.0,
+            5_865_000_000.0
+        ));
+        assert!(same_capture(
+            61_440_048.0,
+            5_865_000_000.0,
+            61_439_951.0,
+            5_865_000_000.0
+        ));
+    }
+
+    /// A rate step or a retune to another channel is not.
+    #[test]
+    fn a_rate_step_or_a_retune_is_a_different_capture() {
+        let (rate, center) = (61_440_000.0, 5_865_000_000.0);
+        assert!(!same_capture(30_720_000.0, center, rate, center));
+        assert!(!same_capture(rate * 1.02, center, rate, center));
+        assert!(!same_capture(rate, 5_845_000_000.0, rate, center));
+        assert!(!same_capture(rate, center + 1_000_000.0, rate, center));
+        assert!(!same_capture(f64::NAN, center, rate, center));
+    }
+
+    /// Every SoapySDR sweep dwell must deliver its own packet budget, or
+    /// no hop ever completes and the sweep never locks. The capture
+    /// starts another block whenever its deadline has not passed, so
+    /// blocks arriving back to back give `ceil(dwell / block)` packets.
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn the_soapy_sweep_dwell_covers_its_packet_budget() {
+        for rate in [2e6, 10e6, 15.36e6, 16e6, 20e6, 25e6, 30.72e6, 40e6] {
+            let budget = soapy_sweep_budget(rate);
+            let block = SOAPY_BLOCK_SIZE as f64 / rate;
+            let airtime = budget.packets_per_hop as f64 * block;
+            let dwell = budget.dwell.as_secs_f64();
+            assert!(
+                dwell >= airtime,
+                "{:.2} MSPS: {:?} dwell is shorter than {:.1} ms for {} packets",
+                rate / 1e6,
+                budget.dwell,
+                airtime * 1e3,
+                budget.packets_per_hop
+            );
+            let delivered = (dwell / block).ceil() as usize;
+            assert!(
+                delivered >= budget.packets_per_hop,
+                "{:.2} MSPS: {:?} dwell delivers {delivered} of {} packets",
+                rate / 1e6,
+                budget.dwell,
+                budget.packets_per_hop
+            );
+            assert!(budget.dwell >= SOAPY_MIN_SCAN_DWELL);
+        }
+    }
+
+    /// A rate the budget cannot be derived from keeps the floor rather
+    /// than a zero or unbounded dwell.
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn an_unusable_rate_keeps_the_soapy_dwell_floor() {
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(soapy_sweep_budget(rate).dwell, SOAPY_MIN_SCAN_DWELL);
+        }
     }
 }

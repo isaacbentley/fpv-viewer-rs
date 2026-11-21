@@ -261,21 +261,9 @@ impl Pump {
                         break;
                     }
                 };
-                if last_delivered.elapsed() >= SILENCE_BAILOUT {
-                    match last_rejected_hz {
-                        Some(hz) => anyhow::bail!(
-                            "no usable samples for {SILENCE_BAILOUT:?}: packets report {:.3} MHz, not the commanded {:.3} MHz \
-                             (check RTSA-Suite block config and /remoteconfig software license: https://aaronia.com/en/software-licence-remote-config)",
-                            hz / 1e6,
-                            channel / 1e6
-                        ),
-                        None => anyhow::bail!(
-                            "no samples for {SILENCE_BAILOUT:?}; is the analyzer running in RTSA-Suite?"
-                        ),
-                    }
-                }
                 if n == 0 {
                     let _ = self.pool_tx.try_send(buf);
+                    ensure_not_silent(last_delivered, last_rejected_hz, channel)?;
                     if hopping {
                         empty_reads += 1;
                         if empty_reads >= EMPTY_READ_BAILOUT {
@@ -303,9 +291,9 @@ impl Pump {
                 let Some(center) = packet_frequency(captured_hz, channel) else {
                     last_rejected_hz = Some(captured_hz);
                     let _ = self.pool_tx.try_send(buf);
+                    ensure_not_silent(last_delivered, last_rejected_hz, channel)?;
                     continue;
                 };
-                last_delivered = Instant::now();
                 last_rejected_hz = None;
                 let pkt = IqPacket {
                     samples: IqBuffer::new_pooled(buf, self.pool_tx.clone()),
@@ -319,6 +307,10 @@ impl Pump {
                 if !self.deliver(pkt).await {
                     return Ok(());
                 }
+                // Stamped once the viewer has taken the packet: time
+                // spent waiting on a full queue is the viewer's, not
+                // silence from the analyzer.
+                last_delivered = Instant::now();
             }
         }
         Ok(())
@@ -340,6 +332,30 @@ impl Pump {
                 }
             }
         }
+    }
+}
+
+/// End the capture once [`SILENCE_BAILOUT`] has passed since a packet
+/// was last delivered. Checked only on a read that produced nothing to
+/// deliver, so a packet in hand is never thrown away for it.
+fn ensure_not_silent(
+    last_delivered: Instant,
+    last_rejected_hz: Option<f64>,
+    channel_hz: f64,
+) -> anyhow::Result<()> {
+    if last_delivered.elapsed() < SILENCE_BAILOUT {
+        return Ok(());
+    }
+    match last_rejected_hz {
+        Some(hz) => anyhow::bail!(
+            "no usable samples for {SILENCE_BAILOUT:?}: packets report {:.3} MHz, not the commanded {:.3} MHz \
+             (check RTSA-Suite block config and /remoteconfig software license: https://aaronia.com/en/software-licence-remote-config)",
+            hz / 1e6,
+            channel_hz / 1e6
+        ),
+        None => anyhow::bail!(
+            "no samples for {SILENCE_BAILOUT:?}; is the analyzer running in RTSA-Suite?"
+        ),
     }
 }
 

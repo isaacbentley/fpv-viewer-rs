@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "fpv-viewer"
-version = "0.14.2"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1618,13 +1618,12 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
-version = "0.9.0"
-source = "git+https://github.com/isaacbentley/fpv-drone-analog-rs.git?rev=459eb948b0719b8fc62e40da379a056097582809#459eb948b0719b8fc62e40da379a056097582809"
+version = "0.9.1"
+source = "git+https://github.com/isaacbentley/fpv-drone-analog-rs.git?tag=v0.9.1#0eab7da0be16c40658d4da6e3a494af3f8b5631c"
 dependencies = [
  "bytemuck",
  "log",
  "num-complex",
- "rand 0.10.4",
  "rayon",
  "rustfft",
  "serde",
@@ -2242,8 +2241,8 @@ dependencies = [
 
 [[package]]
 name = "sdr-aaronia-rs"
-version = "0.13.2"
-source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.13.2#a1da818be8e71ccec496faa622357e7c01146447"
+version = "0.14.0"
+source = "git+https://github.com/isaacbentley/sdr-aaronia-rs.git?tag=v0.14.0#c628c8b0f62291482f0f6ddc59456a3b92040f40"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
@@ -2523,7 +2522,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

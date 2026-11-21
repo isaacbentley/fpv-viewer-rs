@@ -1,6 +1,6 @@
 [package]
 name = "fpv-viewer"
-version = "0.14.2"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A real-time cross-SDR viewer for analog FPV drone video signals"
@@ -8,11 +8,11 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 # The decoder. Its repository is `fpv-drone-analog-rs` and its code now
-# lives on in Specola as `fpv-drone-analog`; this public repository is
-# frozen, and its package is still published under the old name, so it
-# is renamed on import — `use fpv_drone_analog::...` — and moving to the
-# Specola package later is a matter of dropping `package =`.
-fpv-drone-analog = { package = "orecchiette-fpv-drone-analog-rs", git = "https://github.com/isaacbentley/fpv-drone-analog-rs.git", rev = "459eb948b0719b8fc62e40da379a056097582809" }
+# lives on in Specola as `fpv-drone-analog`; this public repository's
+# package is still published under the old name, so it is renamed on
+# import — `use fpv_drone_analog::...` — and moving to the Specola
+# package later is a matter of dropping `package =`.
+fpv-drone-analog = { package = "orecchiette-fpv-drone-analog-rs", git = "https://github.com/isaacbentley/fpv-drone-analog-rs.git", tag = "v0.9.1" }
 # SoapySDR: links the system libSoapySDR (found via pkg-config); the
 # device itself is reached through whichever SoapySDR module drives it
 # (SoapyHackRF, SoapyUHD, ...), installed separately.
@@ -22,7 +22,7 @@ soapysdr = { version = "0.5.1", optional = true }
 # sibling checkout, add:
 #   [patch."https://github.com/isaacbentley/sdr-aaronia-rs.git"]
 #   sdr-aaronia-rs = { path = "../sdr-aaronia-rs" }
-sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.13.2", default-features = false, features = [
+sdr-aaronia-rs = { git = "https://github.com/isaacbentley/sdr-aaronia-rs.git", tag = "v0.14.0", default-features = false, features = [
     "http",
     "file",
     "native-sdk",

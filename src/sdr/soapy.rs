@@ -153,7 +153,11 @@ struct Capture {
 /// What filling one block came to.
 enum Fill {
     Full,
-    /// The stream lost samples part-way; the block was discarded.
+    /// An overflow cut the block short. Its samples are contiguous with
+    /// the previous block; the samples lost follow them.
+    Truncated,
+    /// An overflow before any samples arrived, or a stream error; the
+    /// block was discarded.
     Overflowed,
     Stopped,
 }
@@ -162,9 +166,14 @@ impl Capture {
     fn run(mut self) -> anyhow::Result<()> {
         let hopping = self.channels_hz.len() > 1;
         let mut next = 0usize;
+        // Samples were lost since the last delivered packet, so the next
+        // one does not follow on from it.
         let mut overrun = false;
         let mut errors = 0u32;
         let mut timeouts = 0u32;
+        // Across fills, because a fill ends on its first empty overflow:
+        // counted inside one, it could never reach the bailout.
+        let mut empty_overflows = 0u32;
 
         while !self.stopped() {
             let commanded = self.channels_hz[next];
@@ -184,20 +193,29 @@ impl Capture {
                     .pool_rx
                     .try_recv()
                     .unwrap_or_else(|_| Vec::with_capacity(self.block_size));
-                match self.fill(&mut block, &mut overrun, &mut errors, &mut timeouts)? {
+                let gap_follows = match self.fill(
+                    &mut block,
+                    &mut errors,
+                    &mut timeouts,
+                    &mut empty_overflows,
+                )? {
                     Fill::Stopped => break,
                     Fill::Overflowed => {
                         overrun = true;
                         let _ = self.pool_tx.try_send(block);
                         continue;
                     }
-                    Fill::Full => {}
-                }
+                    Fill::Full => false,
+                    Fill::Truncated => true,
+                };
+                // A truncated block still follows on from the previous
+                // packet, so it carries the flag any block here would;
+                // the gap it ended on belongs to the packet after it.
                 let pkt = IqPacket {
                     samples: IqBuffer::new_pooled(block, self.pool_tx.clone()),
                     center_frequency_hz: tuned,
                     sample_rate_hz: self.sample_rate as f32,
-                    overrun: std::mem::take(&mut overrun),
+                    overrun: std::mem::replace(&mut overrun, gap_follows),
                 };
                 if !deliver(&self.tx, pkt, &self.stop) {
                     self.halt();
@@ -278,19 +296,19 @@ impl Capture {
         Ok(tuned)
     }
 
-    /// Read until `block` holds `block_size` contiguous samples (or fewer if
-    /// an overflow interrupted a non-empty partial fill).
+    /// Read until `block` holds `block_size` contiguous samples, or fewer
+    /// ([`Fill::Truncated`]) if an overflow interrupted a non-empty
+    /// partial fill.
     fn fill(
         &mut self,
         block: &mut Vec<Complex32>,
-        overrun: &mut bool,
         errors: &mut u32,
         timeouts: &mut u32,
+        empty_overflows: &mut u32,
     ) -> anyhow::Result<Fill> {
         block.clear();
         block.resize(self.block_size, Complex32::default());
         let mut filled = 0;
-        let mut empty_overflows = 0u32;
         while filled < self.block_size {
             if self.stopped() {
                 return Ok(Fill::Stopped);
@@ -324,17 +342,16 @@ impl Capture {
                     filled += n;
                     *errors = 0;
                     *timeouts = 0;
-                    empty_overflows = 0;
+                    *empty_overflows = 0;
                 }
                 Err(e) if e.code == ErrorCode::Overflow => {
-                    *overrun = true;
                     if filled > 0 {
                         block.truncate(filled);
-                        return Ok(Fill::Full);
+                        return Ok(Fill::Truncated);
                     }
-                    empty_overflows += 1;
+                    *empty_overflows += 1;
                     anyhow::ensure!(
-                        empty_overflows < ERROR_BAILOUT,
+                        *empty_overflows < ERROR_BAILOUT,
                         "{ERROR_BAILOUT} consecutive empty overflows; the device cannot keep up"
                     );
                     return Ok(Fill::Overflowed);
@@ -399,7 +416,7 @@ fn micros(d: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fpv_drone_analog::scanner::{ScanProgress, detect_packets_per_hop};
+    use fpv_drone_analog::scanner::ScanProgress;
 
     #[test]
     fn mtu_remainder_tracks_hackrf_settle_and_blocks_exact() {
@@ -531,10 +548,11 @@ mod tests {
         // 2. Full 16-hop 5.8 GHz FPV band scan on the SAME cloned device
         let hops = crate::build_scan_hops(20_000_000.0, crate::ScanBands::Band58);
         assert_eq!(hops.len(), 16);
-        let budget_pkts = detect_packets_per_hop(20_000_000.0);
+        let budget = crate::soapy_sweep_budget(20_000_000.0);
+        let budget_pkts = budget.packets_per_hop;
         println!(
-            "[2/3] Testing full 16-hop 5.8 GHz scan (budget = {} pkts/hop, dwell = 20 ms)...",
-            budget_pkts
+            "[2/3] Testing full 16-hop 5.8 GHz scan (budget = {} pkts/hop, dwell = {:?})...",
+            budget_pkts, budget.dwell
         );
         let source2 = Box::new(SoapySource {
             device: device.clone(),
@@ -546,7 +564,7 @@ mod tests {
             .start(SourceConfig {
                 sample_rate_hz: 20_000_000.0,
                 channels_hz: hops.clone(),
-                dwell: Duration::from_millis(20),
+                dwell: budget.dwell,
             })
             .expect("start 16-hop SoapySource");
 
@@ -608,6 +626,7 @@ mod tests {
         let short_hops = hops[..4].to_vec();
         let rate_16m = apply_sample_rate(&device, 0, 16_000_000.0).expect("apply 16 MS/s");
         assert_eq!(rate_16m, 16_000_000.0);
+        let budget16 = crate::soapy_sweep_budget(16_000_000.0);
         let source3 = Box::new(SoapySource {
             device: device.clone(),
             channel: 0,
@@ -618,11 +637,11 @@ mod tests {
             .start(SourceConfig {
                 sample_rate_hz: 16_000_000.0,
                 channels_hz: short_hops.clone(),
-                dwell: Duration::from_millis(20),
+                dwell: budget16.dwell,
             })
             .expect("start 16 MS/s SoapySource");
 
-        let mut progress16 = ScanProgress::new(&short_hops, budget_pkts);
+        let mut progress16 = ScanProgress::new(&short_hops, budget16.packets_per_hop);
         let mut completed16 = false;
         let detector = fpv_drone_analog::scanner::receiver_detector();
         let mut integrator = fpv_drone_analog::detector::SpectralIntegrator::new(4);

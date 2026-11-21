@@ -72,7 +72,8 @@ frame recycling, windows and snapshots. The profiler calls the same
 ## Platform support
 
 - **Linux** — both backends and offline playback. Prebuilt release
-  binaries target aarch64 (Raspberry Pi 5 class).
+  binaries target aarch64 (Raspberry Pi 5 class) and are built on
+  Ubuntu 24.04 (glibc 2.39).
 - **macOS** — SoapySDR, offline playback, and Aaronia over the RTSA
   HTTP interface. Prebuilt release DMGs target Apple Silicon. Only the
   Aaronia native-SDK path (`aaronia sdk`) is unavailable on macOS.
@@ -201,6 +202,12 @@ present:
 cargo run --release -- file /path/to/capture.sigmf-data
 ```
 
+`--sample-rate` and `--fm-deviation`, when given, override the
+sidecar's `core:sample_rate` and `fpv:fm_deviation`. Annotation edges
+are read as offsets from the capture centre, or as absolute RF
+frequencies (SigMF's definition) when their midpoint lies outside the
+capture.
+
 Stream from an Aaronia Spectran V6:
 
 ```bash
@@ -210,8 +217,11 @@ cargo run --release -- aaronia sdk --channel E4
 Sweep the band from an RTSA HTTP server instead (no SDK needed):
 
 ```bash
-cargo run --release -- aaronia http http://atc.local:54664
+cargo run --release -- aaronia http http://atc.local:42664
 ```
+
+42664 is RTSA-Suite's current default HTTP Server port; a mission saved by an
+earlier RTSA-Suite still listens on 54664, so pass that port for it.
 
 > **Note:** Retuning an Aaronia RTSA-Suite HTTP server via `/remoteconfig` requires the [Aaronia Remote Config software license](https://aaronia.com/en/software-licence-remote-config) when the HTTP Server block sits downstream of a Spectran V6 hardware block; without it, `sdr-aaronia-rs` automatically falls back to `/control` where supported.
 
@@ -287,11 +297,10 @@ Channel names come from the shared catalog: A/B/E/F/R/L/D/U plus `N` (narrow
 channel-entry prompt, a prefix such as `S6` waits for a second digit; press
 Enter for S6 or continue typing S60–S64. Backspace edits the entry.
 
-The manifest pins the decoder crate to commit `459eb94` of `fpv-drone-analog-rs`,
-the head of that repository, which carries the SIMD DDC optimization (`a80d55f`, the
-first commit after `v0.9.0`). The repository is frozen: its development continues in
-Specola as the `fpv-drone-analog` package, while the package published here is still
-named `orecchiette-fpv-drone-analog-rs`, so `Cargo.toml` renames it on import. For local
+The manifest pins the decoder crate to tag `v0.9.1` of `fpv-drone-analog-rs`, and
+`sdr-aaronia-rs` to tag `v0.14.0`. The decoder's development continues in Specola as
+the `fpv-drone-analog` package, while the package published from that repository is
+still named `orecchiette-fpv-drone-analog-rs`, so `Cargo.toml` renames it on import. For local
 co-development, pass a Cargo command-line patch instead of committing a machine-specific
 path:
 
