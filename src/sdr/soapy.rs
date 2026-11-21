@@ -211,6 +211,9 @@ impl Capture {
                 // A truncated block still follows on from the previous
                 // packet, so it carries the flag any block here would;
                 // the gap it ended on belongs to the packet after it.
+                // Not every SoapySDR module is an ADC behind USB: a
+                // network one (SoapyRemote) hands over whatever it is sent.
+                super::sanitize_iq_in_place(&mut block);
                 let pkt = IqPacket {
                     samples: IqBuffer::new_pooled(block, self.pool_tx.clone()),
                     center_frequency_hz: tuned,

@@ -199,9 +199,139 @@ pub(crate) fn queue_depth(block_size: usize) -> usize {
     (64 * 1024 * 1024 / (block_size * std::mem::size_of::<Complex32>())).clamp(1, 64)
 }
 
+/// Largest I or Q magnitude let into the pipeline.
+///
+/// A finite sample can still be poison: the FM discriminator multiplies
+/// neighbouring samples, so anything past about 1.8e19 overflows `f32`
+/// to `inf - inf` and comes out NaN, which the filters with memory
+/// behind it (deemphasis, the detector's spectral averages) then hold.
+/// 1e9 is far above any real capture (a normalised stream peaks near 1,
+/// an unscaled 16-bit one at 32,768) and far below where squares and
+/// FIR sums overflow. No radio's ADC produces such a value, but a
+/// crafted file or a network peer can.
+pub const MAX_IQ_COMPONENT: f32 = 1.0e9;
+
+/// Whether `s` can go into the pipeline as it is. One test covers NaN,
+/// infinity and out-of-range, since every comparison with NaN is false.
+#[inline]
+pub fn iq_sample_is_sane(s: &Complex32) -> bool {
+    s.re.abs() <= MAX_IQ_COMPONENT && s.im.abs() <= MAX_IQ_COMPONENT
+}
+
+/// `s` made safe to process: a NaN or infinite part becomes zero, a
+/// finite one is clamped to ±[`MAX_IQ_COMPONENT`].
+#[inline]
+pub fn sanitize_iq_sample(s: Complex32) -> Complex32 {
+    let part = |v: f32| {
+        if v.is_finite() {
+            v.clamp(-MAX_IQ_COMPONENT, MAX_IQ_COMPONENT)
+        } else {
+            0.0
+        }
+    };
+    Complex32::new(part(s.re), part(s.im))
+}
+
+/// [`sanitize_iq_sample`] over a block, in place; `true` if anything
+/// had to change. Every source runs its samples through this (or the
+/// per-sample form) before they reach the detector or a decoder.
+pub fn sanitize_iq_in_place(iq: &mut [Complex32]) -> bool {
+    if iq.iter().all(iq_sample_is_sane) {
+        return false;
+    }
+    for s in iq.iter_mut() {
+        *s = sanitize_iq_sample(*s);
+    }
+    true
+}
+
+/// Whether a packet's reported sample rate can be the capture that was
+/// asked for: within a factor of two of it either way.
+///
+/// A device may run a nearby rate from its own grid, and the planner
+/// follows that. A rate far from the request is not this capture at
+/// all, and since it sizes buffers and filters downstream, a packet
+/// claiming one is dropped rather than believed.
+pub fn rate_is_plausible(reported_hz: f64, requested_hz: f64) -> bool {
+    reported_hz.is_finite()
+        && requested_hz.is_finite()
+        && requested_hz > 0.0
+        && reported_hz >= requested_hz * 0.5
+        && reported_hz <= requested_hz * 2.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_samples_are_left_alone() {
+        let mut iq = vec![
+            Complex32::new(0.5, -0.5),
+            Complex32::new(-32_768.0, 32_767.0),
+            Complex32::new(MAX_IQ_COMPONENT, -MAX_IQ_COMPONENT),
+        ];
+        let before = iq.clone();
+        assert!(!sanitize_iq_in_place(&mut iq));
+        assert_eq!(iq, before);
+        assert!(!sanitize_iq_in_place(&mut []));
+    }
+
+    #[test]
+    fn hostile_samples_are_zeroed_or_clamped() {
+        let mut iq = vec![
+            Complex32::new(1.0, 2.0),
+            Complex32::new(f32::NAN, 2.0),
+            Complex32::new(1.0, f32::INFINITY),
+            Complex32::new(f32::NEG_INFINITY, f32::NAN),
+            Complex32::new(3.0e38, -1.0e30),
+        ];
+        assert!(sanitize_iq_in_place(&mut iq));
+        assert_eq!(
+            iq,
+            vec![
+                Complex32::new(1.0, 2.0),
+                Complex32::new(0.0, 2.0),
+                Complex32::new(1.0, 0.0),
+                Complex32::new(0.0, 0.0),
+                Complex32::new(MAX_IQ_COMPONENT, -MAX_IQ_COMPONENT),
+            ]
+        );
+        // What the bound is for: the discriminator's product of two
+        // neighbouring samples stays finite, so its angle is a number.
+        let worst = Complex32::new(MAX_IQ_COMPONENT, MAX_IQ_COMPONENT);
+        assert!((worst * worst.conj()).arg().is_finite());
+        let unclamped = Complex32::new(1.0e30, 1.0e30);
+        assert!((unclamped * unclamped.conj()).arg().is_nan());
+    }
+
+    #[test]
+    fn a_rate_near_the_request_is_plausible() {
+        let asked = 61_440_000.0;
+        for reported in [61_440_000.0, 61_439_998.5, 30_720_000.0, 92_160_000.0] {
+            assert!(rate_is_plausible(reported, asked), "{reported}");
+        }
+        assert!(rate_is_plausible(20_000_000.0, 25_000_000.0));
+    }
+
+    #[test]
+    fn a_rate_far_from_the_request_is_not() {
+        let asked = 61_440_000.0;
+        for reported in [
+            1.0,
+            0.0,
+            -61_440_000.0,
+            15_360_000.0,
+            245_760_000.0,
+            f64::INFINITY,
+            f64::NAN,
+            u32::MAX as f64,
+        ] {
+            assert!(!rate_is_plausible(reported, asked), "{reported}");
+        }
+        assert!(!rate_is_plausible(1.0, 0.0));
+        assert!(!rate_is_plausible(1.0, f64::NAN));
+    }
 
     #[test]
     fn a_pooled_buffer_returns_to_its_pool() {

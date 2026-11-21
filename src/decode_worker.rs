@@ -18,6 +18,8 @@ pub struct IqChunk {
 pub struct DecodeWorkerConfig {
     pub decoder: DecoderConfig,
     pub display_mhz: f64,
+    /// Which of the run's windows this is; names its `--debug` snapshots.
+    pub channel_index: usize,
 }
 
 pub struct DecodeWorker {
@@ -94,20 +96,16 @@ impl DecodeWorker {
     }
 
     fn process_chunk(&mut self, chunk: IqChunk) -> bool {
-        let clean_chunk: Option<Vec<num_complex::Complex<f32>>> = chunk
-            .samples
-            .iter()
-            .any(|s| !s.re.is_finite() || !s.im.is_finite())
-            .then(|| {
+        // Every source sanitizes what it delivers; this is the decoder's
+        // own guard, so nothing reaches it non-finite or large enough to
+        // overflow in the discriminator whatever built the chunk.
+        let clean_chunk: Option<Vec<num_complex::Complex<f32>>> =
+            (!chunk.samples.iter().all(crate::sdr::iq_sample_is_sane)).then(|| {
                 chunk
                     .samples
                     .iter()
-                    .map(|s| {
-                        num_complex::Complex::new(
-                            if s.re.is_finite() { s.re } else { 0.0 },
-                            if s.im.is_finite() { s.im } else { 0.0 },
-                        )
-                    })
+                    .copied()
+                    .map(crate::sdr::sanitize_iq_sample)
                     .collect()
             });
         let iq_slice: &[num_complex::Complex<f32>] =
@@ -186,9 +184,10 @@ impl DecodeWorker {
             if self.config.decoder.debug
                 && (self.frame_count <= 3 || (30..=32).contains(&self.frame_count))
             {
-                let path = format!(
-                    "fpv_frame_{:.0}MHz_{}.png",
-                    self.config.display_mhz, self.frame_count
+                let name = crate::snapshot::file_name(
+                    self.config.channel_index,
+                    self.config.display_mhz,
+                    self.frame_count,
                 );
                 let mut rgb_buf = vec![0u8; width * height * 3];
                 for (i, &pixel) in self.frame_buf.iter().enumerate() {
@@ -198,7 +197,7 @@ impl DecodeWorker {
                 }
                 let _ = self
                     .snap_tx
-                    .send((path, rgb_buf, width as u32, height as u32));
+                    .send((name, rgb_buf, width as u32, height as u32));
             }
 
             let displaced =
@@ -247,6 +246,7 @@ mod tests {
                 debug: false,
             },
             display_mhz: 5865.0,
+            channel_index: 0,
         };
         let (frame_tx, frame_rx) = mpsc::sync_channel(1);
         let (_, recycle_rx) = mpsc::channel();
@@ -337,6 +337,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A sample can be finite and still overflow the discriminator's
+    /// product into NaN, which the deemphasis filter then holds: the
+    /// worker's own guard has to stop it, since the decoder crate the
+    /// viewer is pinned to checks nothing.
+    #[test]
+    fn hostile_samples_do_not_poison_the_decoder() {
+        let samples = iq(false, 2);
+        let (mut worker, _frame_rx) = worker(false, 2);
+        let mut hostile = samples[..65_536].to_vec();
+        hostile[1_000] = Complex::new(1.0e30, 1.0e30);
+        hostile[1_001] = Complex::new(3.0e38, -3.0e38);
+        hostile[2_000] = Complex::new(f32::NAN, 0.5);
+        hostile[3_000] = Complex::new(0.5, f32::INFINITY);
+        assert!(worker.process_chunk(chunk(&hostile, false)));
+        assert!(
+            worker
+                .decoder
+                .demodulated_chunk()
+                .iter()
+                .all(|v| v.is_finite()),
+            "hostile chunk produced non-finite demod"
+        );
+        for part in samples[65_536..].chunks(65_536) {
+            assert!(worker.process_chunk(chunk(part, false)));
+            assert!(
+                worker
+                    .decoder
+                    .demodulated_chunk()
+                    .iter()
+                    .all(|v| v.is_finite()),
+                "decoder state stayed poisoned after the hostile chunk"
+            );
+        }
+        assert!(
+            worker.worker_frames.load(Ordering::Relaxed) >= 2,
+            "the stream no longer decodes after the hostile chunk"
+        );
     }
 
     #[test]

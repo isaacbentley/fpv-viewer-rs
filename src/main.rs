@@ -8,6 +8,7 @@
 mod band_scan;
 mod decode_worker;
 mod sdr;
+mod snapshot;
 
 use band_scan::{BandScan, PanelMode, ScanWindow};
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -727,6 +728,69 @@ fn annotation_offset_hz(
     }
 }
 
+/// Most channels one file opens windows for.
+///
+/// Each channel is a window, a decode thread, a snapshot thread and a
+/// reconstructor with its field history, and a sidecar's annotation
+/// list is as long as whoever wrote the file made it. Eight is more
+/// analog channels than a capture can hold side by side: at 100 MSPS,
+/// eight 14 MHz channels are already wider than the capture.
+const MAX_FILE_CHANNELS: usize = 8;
+
+/// Largest SigMF sidecar read. A real one is a few kilobytes; the whole
+/// file is parsed into memory, so it is not read unbounded.
+const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a SigMF sidecar, refusing one over [`MAX_SIDECAR_BYTES`].
+fn read_sidecar(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    read_sidecar_capped(path, MAX_SIDECAR_BYTES)
+}
+
+fn read_sidecar_capped(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let mut text = String::new();
+    // One byte past the cap, so "exactly the cap" and "more" differ.
+    File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)?;
+    anyhow::ensure!(
+        text.len() as u64 <= max_bytes,
+        "SigMF metadata {path:?} is larger than the {max_bytes} bytes the viewer reads"
+    );
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// One channel a file asks for: the standard if its label names one,
+/// its offset from the capture centre in Hz, and its label.
+type FileChannel = (Option<SignalType>, f32, String);
+
+/// The channels to open for a file's annotations, in annotation order,
+/// with repeats of an offset already taken dropped and the list held to
+/// [`MAX_FILE_CHANNELS`]. Returns the list, how many repeats were
+/// dropped, and how many distinct channels were dropped for the cap.
+///
+/// Two annotations on one offset would decode the same signal twice, so
+/// the first one wins. Offsets are compared to the nearest hertz.
+fn plan_file_channels(candidates: Vec<FileChannel>) -> (Vec<FileChannel>, usize, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    let (mut repeats, mut over_cap) = (0usize, 0usize);
+    for candidate in candidates {
+        // NaN and the infinities each collapse to one key here; the
+        // decoder rejects such an offset by name later.
+        if !seen.insert(candidate.1.round() as i64) {
+            repeats += 1;
+        } else if kept.len() >= MAX_FILE_CHANNELS {
+            over_cap += 1;
+        } else {
+            kept.push(candidate);
+        }
+    }
+    (kept, repeats, over_cap)
+}
+
 fn run_file(args: FileArgs) -> anyhow::Result<()> {
     // Attempt to load SigMF metadata
     let mut meta_path = args.input.clone();
@@ -734,8 +798,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
 
     let meta_json: Option<serde_json::Value> = if meta_path.exists() {
         println!("Found SigMF metadata: {:?}", meta_path);
-        let meta_str = std::fs::read_to_string(&meta_path)?;
-        Some(serde_json::from_str(&meta_str)?)
+        Some(read_sidecar(&meta_path)?)
     } else {
         None
     };
@@ -819,6 +882,18 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
             channels_to_spawn.push((sig_type, freq_offset as f32, label.to_string()));
         }
     }
+    let (mut channels_to_spawn, repeats, over_cap) = plan_file_channels(channels_to_spawn);
+    if repeats > 0 {
+        println!(
+            "Ignoring {repeats} annotation(s) that repeat the frequency of a channel already listed."
+        );
+    }
+    if over_cap > 0 {
+        println!(
+            "The metadata annotates {} distinct video channels; opening the first {MAX_FILE_CHANNELS} and dropping the other {over_cap}.",
+            MAX_FILE_CHANNELS + over_cap
+        );
+    }
 
     if channels_to_spawn.is_empty() {
         if sample_rate > 50_000_000 {
@@ -879,7 +954,8 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
         .map(|chunk| {
             let re = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let im = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-            Complex::new(re, im)
+            // A file holds whatever bits its author put there.
+            sdr::sanitize_iq_sample(Complex::new(re, im))
         })
         .collect();
 
@@ -986,7 +1062,7 @@ fn run_file(args: FileArgs) -> anyhow::Result<()> {
                             .map(|c| {
                                 let re = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                                 let im = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-                                Complex::new(re, im)
+                                sdr::sanitize_iq_sample(Complex::new(re, im))
                             })
                             .collect();
                         rem = total - consumed;
@@ -1568,16 +1644,18 @@ fn scan_band_for_channel(
                 // loop *returns* once the sweep is complete rather than
                 // going round again, so a one-tune plan finishes on its
                 // first packet and can never sit draining.
+                // A packet claiming a rate that cannot be this capture's
+                // is not analysed and does not count towards its hop: the
+                // rate sizes the detector's probes, and a wrong one
+                // reports signals at frequencies nothing was received on.
+                if !sdr::rate_is_plausible(packet.sample_rate_hz as f64, sample_rate) {
+                    continue;
+                }
                 let Some(hop) = progress.observe(hop_center) else {
                     continue;
                 };
 
-                let pkt_sample_rate =
-                    if packet.sample_rate_hz.is_finite() && packet.sample_rate_hz >= 1.0 {
-                        packet.sample_rate_hz.round() as u32
-                    } else {
-                        sample_rate as u32
-                    };
+                let pkt_sample_rate = packet.sample_rate_hz.round() as u32;
                 let results = detector.detect_from_iq_integrated_with_probes(
                     &packet.samples,
                     rf_center,
@@ -1907,6 +1985,20 @@ fn run_live(
                 Err(_) => break,
             }
         }
+    }
+    // The rate a packet reports sizes everything downstream — the
+    // acquisition record, the decode plan, the filters — and with a
+    // network backend it is the peer's word. One that cannot be the
+    // capture that was asked for is a lost channel, not a rate to decode
+    // at.
+    if !sdr::rate_is_plausible(first_packet.sample_rate_hz as f64, sample_rate) {
+        println!(
+            "SDR reports {:.3} MSPS, too far from the requested {:.3} MSPS; treating the channel as lost.",
+            first_packet.sample_rate_hz as f64 / 1e6,
+            sample_rate / 1e6
+        );
+        handle.stop();
+        return Ok(RunLiveResult::SignalLost);
     }
     let actual_sample_rate = first_packet.sample_rate_hz as u32;
     let actual_center = first_packet.center_frequency_hz;
@@ -2451,10 +2543,11 @@ where
         // decode. The decode loop hands (path, rgb, w, h) here instead.
         let (snap_tx, snap_rx) = mpsc::channel::<(String, Vec<u8>, u32, u32)>();
         let snap_handle = thread::spawn(move || {
-            while let Ok((path, rgb, w, h)) = snap_rx.recv() {
-                match image::save_buffer(&path, &rgb, w, h, image::ColorType::Rgb8) {
-                    Ok(()) => eprintln!("[DEBUG] Saved {}", path),
-                    Err(e) => eprintln!("Failed to save {}: {}", path, e),
+            while let Ok((name, rgb, w, h)) = snap_rx.recv() {
+                let dir = snapshot::run_dir();
+                match snapshot::save_rgb(dir, &name, &rgb, w, h) {
+                    Ok(path) => eprintln!("[DEBUG] Saved {}", path.display()),
+                    Err(e) => eprintln!("Failed to save {}: {e}", dir.join(&name).display()),
                 }
             }
         });
@@ -2470,6 +2563,7 @@ where
                 debug,
             },
             display_mhz,
+            channel_index: snap_handles.len() - 1,
         };
 
         DecodeWorker::spawn(
@@ -3268,6 +3362,69 @@ mod tests {
             rate(serde_json::json!({ "core:datatype": "cf32_le" })),
             None
         );
+    }
+
+    fn candidate(offset: f32, label: &str) -> (Option<SignalType>, f32, String) {
+        (Some(SignalType::AnalogVideoPal), offset, label.to_string())
+    }
+
+    /// The annotations a real capture carries come through untouched and
+    /// in order.
+    #[test]
+    fn a_few_distinct_annotations_all_open() {
+        let input = vec![
+            candidate(-25e6, "PAL A"),
+            candidate(25e6, "PAL B"),
+            (None, 0.0, "analog".to_string()),
+        ];
+        let (kept, repeats, over_cap) = plan_file_channels(input.clone());
+        assert_eq!(kept, input);
+        assert_eq!((repeats, over_cap), (0, 0));
+        assert_eq!(plan_file_channels(Vec::new()), (Vec::new(), 0, 0));
+    }
+
+    /// A sidecar's annotation list is as long as its author made it, and
+    /// each channel opened costs a window and two threads.
+    #[test]
+    fn annotations_are_deduplicated_and_capped() {
+        // 10,000 annotations on one frequency are one channel.
+        let same: Vec<_> = (0..10_000).map(|_| candidate(1e6, "PAL")).collect();
+        let (kept, repeats, over_cap) = plan_file_channels(same);
+        assert_eq!(kept, vec![candidate(1e6, "PAL")]);
+        assert_eq!((repeats, over_cap), (9_999, 0));
+
+        // 20 distinct ones, each listed twice: the first eight open, in
+        // order, and both kinds of drop are counted.
+        let many: Vec<_> = (0..40)
+            .map(|i| candidate((i / 2) as f32 * 1e6, &format!("PAL {}", i / 2)))
+            .collect();
+        let (kept, repeats, over_cap) = plan_file_channels(many);
+        assert_eq!(kept.len(), MAX_FILE_CHANNELS);
+        for (i, channel) in kept.iter().enumerate() {
+            assert_eq!(channel.1, i as f32 * 1e6);
+        }
+        assert_eq!((repeats, over_cap), (20, 20 - MAX_FILE_CHANNELS));
+
+        // Non-finite offsets cannot multiply either.
+        let odd: Vec<_> = (0..100).map(|_| candidate(f32::NAN, "PAL")).collect();
+        assert_eq!(plan_file_channels(odd).0.len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_sidecar_is_refused() {
+        let path = std::env::temp_dir().join(format!(
+            "fpv-viewer-sidecar-test-{}.sigmf-meta",
+            std::process::id()
+        ));
+        let json = br#"{"global":{"core:sample_rate":20000000}}"#;
+        std::fs::write(&path, json).unwrap();
+        // Exactly at the cap is read; one byte under it is refused.
+        let read = read_sidecar_capped(&path, json.len() as u64).unwrap();
+        assert_eq!(read["global"]["core:sample_rate"], 20_000_000);
+        let err = read_sidecar_capped(&path, json.len() as u64 - 1).unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        assert!(read_sidecar(&path).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A sample rate that is there but unusable is an error, not a

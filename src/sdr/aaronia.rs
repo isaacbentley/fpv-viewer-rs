@@ -93,6 +93,7 @@ impl SdrSource for AaroniaSource {
             block_size,
             channels_hz: config.channels_hz,
             dwell: config.dwell,
+            requested_rate_hz: config.sample_rate_hz,
             tx,
             pool_tx,
             pool_rx,
@@ -130,6 +131,9 @@ struct Pump {
     block_size: usize,
     channels_hz: Vec<f64>,
     dwell: Duration,
+    /// The rate this capture asked for; a packet reporting one far from
+    /// it is dropped (see [`super::rate_is_plausible`]).
+    requested_rate_hz: f64,
     tx: SyncSender<IqPacket>,
     pool_tx: SyncSender<Vec<Complex32>>,
     pool_rx: Receiver<Vec<Complex32>>,
@@ -194,6 +198,8 @@ impl Pump {
         // last one rejected since, to say why if the silence runs out.
         let mut last_delivered = Instant::now();
         let mut last_rejected_hz: Option<f64> = None;
+        // The same for packets dropped over the sample rate they report.
+        let mut last_rejected_rate_hz: Option<f64> = None;
 
         while !self.stopped() {
             let channel = self.channels_hz[next];
@@ -263,7 +269,12 @@ impl Pump {
                 };
                 if n == 0 {
                     let _ = self.pool_tx.try_send(buf);
-                    ensure_not_silent(last_delivered, last_rejected_hz, channel)?;
+                    self.ensure_not_silent(
+                        last_delivered,
+                        last_rejected_hz,
+                        last_rejected_rate_hz,
+                        channel,
+                    )?;
                     if hopping {
                         empty_reads += 1;
                         if empty_reads >= EMPTY_READ_BAILOUT {
@@ -291,17 +302,40 @@ impl Pump {
                 let Some(center) = packet_frequency(captured_hz, channel) else {
                     last_rejected_hz = Some(captured_hz);
                     let _ = self.pool_tx.try_send(buf);
-                    ensure_not_silent(last_delivered, last_rejected_hz, channel)?;
+                    self.ensure_not_silent(
+                        last_delivered,
+                        last_rejected_hz,
+                        last_rejected_rate_hz,
+                        channel,
+                    )?;
                     continue;
                 };
                 last_rejected_hz = None;
+                // Read per packet: over HTTP the rate the device streams
+                // is only known once packets flow, and snaps to its
+                // decimation ladder. It also comes from the peer, and it
+                // sizes the detector's and decoder's buffers and filters,
+                // so one far from what was asked for is not believed.
+                let reported_rate_hz = source.capture_sample_rate_hz();
+                if !super::rate_is_plausible(reported_rate_hz, self.requested_rate_hz) {
+                    last_rejected_rate_hz = Some(reported_rate_hz);
+                    let _ = source.take_overrun();
+                    let _ = self.pool_tx.try_send(buf);
+                    self.ensure_not_silent(
+                        last_delivered,
+                        last_rejected_hz,
+                        last_rejected_rate_hz,
+                        channel,
+                    )?;
+                    continue;
+                }
+                last_rejected_rate_hz = None;
+                // A network peer can send any bit pattern as a sample.
+                super::sanitize_iq_in_place(&mut buf);
                 let pkt = IqPacket {
                     samples: IqBuffer::new_pooled(buf, self.pool_tx.clone()),
                     center_frequency_hz: center,
-                    // Read per packet: over HTTP the rate the device
-                    // streams is only known once packets flow, and snaps
-                    // to its decimation ladder.
-                    sample_rate_hz: (source.capture_sample_rate_hz() as f32).max(1.0),
+                    sample_rate_hz: reported_rate_hz as f32,
                     overrun: source.take_overrun(),
                 };
                 if !self.deliver(pkt).await {
@@ -333,18 +367,45 @@ impl Pump {
             }
         }
     }
+
+    /// See [`ensure_not_silent`].
+    fn ensure_not_silent(
+        &self,
+        last_delivered: Instant,
+        last_rejected_hz: Option<f64>,
+        last_rejected_rate_hz: Option<f64>,
+        channel_hz: f64,
+    ) -> anyhow::Result<()> {
+        ensure_not_silent(
+            last_delivered.elapsed(),
+            last_rejected_hz,
+            last_rejected_rate_hz,
+            channel_hz,
+            self.requested_rate_hz,
+        )
+    }
 }
 
 /// End the capture once [`SILENCE_BAILOUT`] has passed since a packet
 /// was last delivered. Checked only on a read that produced nothing to
 /// deliver, so a packet in hand is never thrown away for it.
 fn ensure_not_silent(
-    last_delivered: Instant,
+    since_delivered: Duration,
     last_rejected_hz: Option<f64>,
+    last_rejected_rate_hz: Option<f64>,
     channel_hz: f64,
+    requested_rate_hz: f64,
 ) -> anyhow::Result<()> {
-    if last_delivered.elapsed() < SILENCE_BAILOUT {
+    if since_delivered < SILENCE_BAILOUT {
         return Ok(());
+    }
+    if let Some(rate) = last_rejected_rate_hz {
+        anyhow::bail!(
+            "no usable samples for {SILENCE_BAILOUT:?}: packets report {:.3} MSPS, too far from the requested {:.3} MSPS \
+             (pass --sample-rate to match the rate the RTSA-Suite stream runs at)",
+            rate / 1e6,
+            requested_rate_hz / 1e6
+        );
     }
     match last_rejected_hz {
         Some(hz) => anyhow::bail!(
@@ -391,6 +452,20 @@ async fn drain(source: &mut SpectranSource, block_size: usize, settle: Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_packets_end_the_capture_only_after_the_silence_bailout() {
+        let (channel, asked) = (5_865_000_000.0, 61_440_000.0);
+        // Still inside the window: carry on, whatever was rejected.
+        assert!(ensure_not_silent(Duration::from_secs(1), None, Some(1.0), channel, asked).is_ok());
+        // Past it, the reason names what the packets claimed.
+        let late = SILENCE_BAILOUT + Duration::from_millis(1);
+        let rate = ensure_not_silent(late, None, Some(1.0), channel, asked).unwrap_err();
+        assert!(rate.to_string().contains("61.440 MSPS"), "{rate}");
+        let freq = ensure_not_silent(late, Some(5.8e9), None, channel, asked).unwrap_err();
+        assert!(freq.to_string().contains("5865.000 MHz"), "{freq}");
+        assert!(ensure_not_silent(late, None, None, channel, asked).is_err());
+    }
 
     #[test]
     fn a_packet_within_tolerance_keeps_its_reported_frequency() {

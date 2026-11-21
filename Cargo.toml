@@ -33,7 +33,10 @@ anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 num-complex = "0.4"
 minifb = "0.29"
-image = "0.25"
+# PNG only: the one thing the viewer does with `image` is write `--debug`
+# snapshots. The default features pull in a decoder for every format it
+# knows (AVIF, EXR, TIFF, WebP, ...) and their dependency trees.
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0"

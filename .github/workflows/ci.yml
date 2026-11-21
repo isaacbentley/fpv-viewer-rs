@@ -7,9 +7,15 @@ on:
     branches: ["master"]
   workflow_dispatch:
 
+# Least-privilege token: no job in this workflow writes to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# Every action is pinned to a full commit SHA, with the tag it corresponds
+# to in the trailing comment; Dependabot updates both together.
 jobs:
   test:
     name: Build & Test (${{ matrix.os }})
@@ -23,7 +29,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
@@ -35,9 +41,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install soapysdr
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Default features: `soapy` and `aaronia`. The AARTSAAPI SDK is
       # resolved at runtime, not link time, so the Aaronia backend builds
@@ -49,18 +57,19 @@ jobs:
     name: Clippy + Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libsoapysdr-dev cmake pkg-config libasound2-dev libiio-dev libfontconfig1-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -76,3 +85,16 @@ jobs:
           cargo clippy --locked --all-targets --no-default-features -- -D warnings
           cargo clippy --locked --all-targets --no-default-features --features soapy -- -D warnings
           cargo clippy --locked --all-targets --no-default-features --features aaronia -- -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Advisories (RUSTSEC), licences, bans and sources, per deny.toml.
+      # It reads Cargo.lock and the manifests only, so it needs none of
+      # the system libraries the build does.
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          command: check

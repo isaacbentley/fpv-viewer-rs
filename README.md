@@ -81,6 +81,12 @@ frame recycling, windows and snapshots. The profiler calls the same
   from PothosSDR or radioconda), or without it using
   `--no-default-features --features aaronia`. No prebuilt binaries.
 
+Each release carries a `SHA256SUMS` file covering its assets
+(`sha256sum -c SHA256SUMS`, or `shasum -a 256 -c SHA256SUMS` on macOS)
+and a signed build-provenance attestation, checked with
+`gh attestation verify <asset> --repo isaacbentley/fpv-viewer-rs`. The
+macOS DMG is not code-signed or notarized.
+
 ## Installation
 
 Building needs the SoapySDR library (found through `pkg-config`), and
@@ -208,6 +214,12 @@ are read as offsets from the capture centre, or as absolute RF
 frequencies (SigMF's definition) when their midpoint lies outside the
 capture.
 
+A file opens at most eight windows: annotations that repeat a frequency
+already listed are ignored, any distinct channels past the eighth are
+dropped, and the viewer prints how many of each. A sidecar over 16 MiB
+is refused. Samples that are NaN, infinite or beyond ±1e9 are zeroed or
+clamped on the way in, for files and live sources alike.
+
 Stream from an Aaronia Spectran V6:
 
 ```bash
@@ -245,7 +257,7 @@ subcommand:
 | Option | Description |
 | :--- | :--- |
 | `--scan-bands 5.8\|all` | Bands the auto-scan sweeps. `5.8` (default) covers 5,645–5,945 MHz; `all` includes L/D/U, both 1.2 GHz grids, 2.4 GHz and 3.3 GHz, at proportionally more tunes per sweep. |
-| `--sample-rate <hz>` | Override the capture rate. SoapySDR defaults to 25 MSPS, or the device's maximum where that is lower (20 MSPS on a HackRF), and uses the rate the device actually settles on. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default scan rate of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. Without an explicit override, Aaronia lowers the rate after lock to fit the channel and the hardware's usable span (30.72 MSPS for the default 5 MHz deviation). The RTSA server discards data once its outbound buffer passes 8 MB. Decimation reduces downstream DSP work, but wider capture still increases transport, conversion, and mixing costs. |
+| `--sample-rate <hz>` | Override the capture rate. A source whose packets report a rate outside half to twice the one requested is treated as a lost channel; over RTSA HTTP, pass the rate the stream actually runs at. SoapySDR defaults to 25 MSPS, or the device's maximum where that is lower (20 MSPS on a HackRF), and uses the rate the device actually settles on. Aaronia runs 61.44 MHz divided by powers of two (61.44, 30.72, 15.36, 7.68 MSPS and lower); a request maps to the nearest. The default scan rate of 61.44 MSPS is about 246 MB/s in `f16` and 492 in `f32`. Without an explicit override, Aaronia lowers the rate after lock to fit the channel and the hardware's usable span (30.72 MSPS for the default 5 MHz deviation). The RTSA server discards data once its outbound buffer passes 8 MB. Decimation reduces downstream DSP work, but wider capture still increases transport, conversion, and mixing costs. |
 | `--device <args>` | SoapySDR only: device arguments, e.g. `driver=hackrf` or `driver=uhd,type=b200`. Empty (default) opens the first device found. |
 | `--gain <db>`, `--gain-element <NAME=DB>`, `--agc` | SoapySDR only: overall gain, individual gain stages (repeatable; HackRF has `LNA`, `VGA` and `AMP`), or automatic gain control. With none, the driver's own gains stay. |
 | `--antenna <name>`, `--bandwidth <hz>`, `--setting <KEY=VALUE>` | SoapySDR only: antenna port, analog filter bandwidth, and driver settings (repeatable; a HackRF's bias-tee is `--setting bias_tx=true`). |
@@ -253,7 +265,7 @@ subcommand:
 | `--demod auto\|disc\|pll` | FM demodulator selection. `auto` uses the PLL at 25 MSPS and above, the discriminator below — measured against the *decode* rate, which is below the capture rate on a wide capture, so `auto` normally picks the discriminator. `pll` holds the decode rate at or above 25 MSPS instead. |
 | `--deemphasis-tau <s>` | Video deemphasis time constant, in seconds. Default 0.15 µs (`0.00000015`); `0` disables. It is a single pole, so its attenuation grows without limit: 0.15 µs costs 2.7 dB at 1 MHz and 11.1 dB at 4.2 MHz, where 0.75 µs costs 13.6 and 24.8 dB. NTSC luma runs to about 4.2 MHz, so a long time constant softens the picture badly — measured against a live transmitter, detail fell from 38.6 with it off to 1.6 at 0.75 µs. Lengthen it if your transmitter's pre-emphasis is strong and the picture looks noisy. |
 | `--temporal-window <n>` | Fields retained for temporal denoising and dropout repair. Default 5, giving roughly +7 dB on static scenes at about 83 ms latency; `1` disables temporal processing. |
-| `--debug` | Print per-frame decode metrics and save frames 1–3 and 30–32 as PNG files. |
+| `--debug` | Print per-frame decode metrics and save frames 1–3 and 30–32 of each window as PNG files. They go to `fpv_frames/run-<unix seconds>-<pid>/` under the working directory, named `fpv_frame_<sequence>_ch<window>_<MHz>MHz_<frame>.png`; a snapshot is only ever created, so a name that already exists is reported as a failure rather than overwritten. |
 
 ## Keyboard shortcuts
 

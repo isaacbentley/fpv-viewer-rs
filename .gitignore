@@ -1,7 +1,8 @@
 /target
 **/*.rs.bk
 
-# Frame dumps written by --debug into the working directory
+# Frame dumps written by --debug: one directory per run under fpv_frames/
+/fpv_frames/
 fpv_frame_*.png
 .DS_Store
 /analysis/

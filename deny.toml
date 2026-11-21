@@ -1,0 +1,34 @@
+# cargo-deny configuration. CI runs `cargo deny check` (advisories,
+# licenses, bans, sources) — see `.github/workflows/ci.yml`'s `deny` job.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# The viewer itself is GPL-3.0-or-later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "GPL-3.0-or-later",
+    "Zlib",
+    # soapysdr-sys (the SoapySDR bindings).
+    "BSL-1.0",
+    # webpki-root-certs (the CA bundle under the Aaronia HTTP client).
+    "CDLA-Permissive-2.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The decoder and the Aaronia driver, both pinned by tag in Cargo.toml
+# and by commit in Cargo.lock.
+allow-git = [
+    "https://github.com/isaacbentley/fpv-drone-analog-rs.git",
+    "https://github.com/isaacbentley/sdr-aaronia-rs.git",
+]

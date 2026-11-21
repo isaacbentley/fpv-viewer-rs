@@ -21,6 +21,18 @@ the system package manager. There is no Windows job: the SoapySDR
 backend links `libSoapySDR`, and the runners have no unattended
 SoapySDR install.
 
+A `cargo-deny` job runs `cargo deny check` against `deny.toml`: RUSTSEC
+advisories, licences, and sources (crates.io plus the two git
+dependencies named there). A new dependency under a licence not yet
+listed, or from another git repository, fails it until `deny.toml` says
+so.
+
+Every action in `.github/workflows/` is pinned to a full commit SHA, with
+the tag it corresponds to in a trailing comment. Dependabot keeps both in
+step; a hand edit has to as well, and `actionlint` should pass. The
+release workflow writes `SHA256SUMS` over the assets and attests their
+build provenance before publishing them.
+
 The crate declares `rust-version = "1.100"`.
 
 ### The backend features
